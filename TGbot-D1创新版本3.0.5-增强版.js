@@ -9,6 +9,10 @@
  * 追加（反应同步版）：转发时在 messages 表存消息配对（rxmap 索引），
  * 新增 message_reaction 处理，两侧反应经 setMessageReaction 双向镜像；
  * 需在 setWebhook 时用 allowed_updates 订阅 message_reaction 才有效。
+ * 追加（拉黑提醒版）：订阅 my_chat_member，用户在私聊拉黑/解除拉黑
+ * 机器人时在该用户话题内提醒（D1 标记去重）；管理员回复发送被
+ * 「bot was blocked」拒绝时走同一标记兜底提醒。需在 setWebhook 的
+ * allowed_updates 中包含 my_chat_member 才有事件提醒。
  * 追加（提示去重版）：同一条消息多次编辑时，先撤回上一条编辑提示
  * 再发新的，每条消息永远只保留最新的一条提示。
  * 追加（编辑提示版）：原地编辑成功后补一条一行小提示，
@@ -5032,6 +5036,33 @@ const topicId =
       error?.message || error
     );
 
+    if (isBotBlockedError(error)) {
+      const wasFlagged =
+        (await dbConfigGet(
+          `botblocked:${userId}`,
+          env
+        )) === '1';
+
+      await noteBotBlocked(userId, env);
+
+      if (wasFlagged) {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: env.ADMIN_GROUP_ID,
+            message_thread_id:
+              Number(topicId),
+            text:
+              '❌ 对方已拉黑机器人，' +
+              '这条消息未能送达。'
+          }
+        );
+      }
+
+      return;
+    }
+
     await telegramApi(
       env.BOT_TOKEN,
       'sendMessage',
@@ -6393,6 +6424,135 @@ async function handleCallbackQuery(
 /*                               Update 入口                                    */
 /* -------------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------- */
+/*                         拉黑 / 解除拉黑提醒（改版新增）                        */
+/* -------------------------------------------------------------------------- */
+
+function isBotBlockedError(error) {
+  return /blocked by the user/i.test(
+    String(error?.message || error)
+  );
+}
+
+async function noteBotBlocked(userId, env) {
+  const flagKey = `botblocked:${userId}`;
+
+  if (
+    (await dbConfigGet(flagKey, env)) ===
+    '1'
+  ) {
+    return;
+  }
+
+  await dbConfigPut(flagKey, '1', env);
+
+  const user =
+    await dbUserGetOrCreate(userId, env);
+
+  if (user.is_blocked || !user.topic_id) {
+    return;
+  }
+
+  try {
+    await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: env.ADMIN_GROUP_ID,
+        message_thread_id:
+          Number(user.topic_id),
+        text:
+          '🚫 对方已将机器人拉黑，' +
+          '后续消息将无法送达。'
+      }
+    );
+  } catch (error) {
+    console.error(
+      '发送拉黑提醒失败：',
+      error?.message || error
+    );
+  }
+}
+
+async function noteBotUnblocked(
+  userId,
+  env
+) {
+  const flagKey = `botblocked:${userId}`;
+
+  if (
+    (await dbConfigGet(flagKey, env)) !==
+    '1'
+  ) {
+    return;
+  }
+
+  await dbConfigDelete(flagKey, env);
+
+  const user =
+    await dbUserGetOrCreate(userId, env);
+
+  if (user.is_blocked || !user.topic_id) {
+    return;
+  }
+
+  try {
+    await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: env.ADMIN_GROUP_ID,
+        message_thread_id:
+          Number(user.topic_id),
+        text:
+          '✅ 对方已解除对机器人的拉黑，' +
+          '可以继续正常收发消息。'
+      }
+    );
+  } catch (error) {
+    console.error(
+      '发送解除拉黑提醒失败：',
+      error?.message || error
+    );
+  }
+}
+
+async function handleMyChatMember(
+  chatMember,
+  env
+) {
+  if (
+    !chatMember ||
+    chatMember.chat?.type !== 'private'
+  ) {
+    return;
+  }
+
+  const userId = String(chatMember.chat.id);
+
+  if (await isAdminUser(userId, env)) {
+    return;
+  }
+
+  const oldStatus =
+    chatMember.old_chat_member?.status;
+
+  const newStatus =
+    chatMember.new_chat_member?.status;
+
+  if (
+    newStatus === 'kicked' &&
+    oldStatus !== 'kicked'
+  ) {
+    await noteBotBlocked(userId, env);
+  } else if (
+    oldStatus === 'kicked' &&
+    newStatus === 'member'
+  ) {
+    await noteBotUnblocked(userId, env);
+  }
+}
+
 async function handleUpdate(
   update,
   env,
@@ -6461,6 +6621,15 @@ async function handleUpdate(
   if (update.message_reaction) {
     await handleMessageReaction(
       update.message_reaction,
+      env
+    );
+
+    return;
+  }
+
+  if (update.my_chat_member) {
+    await handleMyChatMember(
+      update.my_chat_member,
       env
     );
 
