@@ -1,6 +1,6 @@
-> **📌 Fork 增强版说明（非原作者内容）**
-> 本 Fork 在原版 3.0.5 基础上增加：Cloudflare Turnstile 人机验证、消息反应（表情回应）双向同步、消息编辑原地同步 + 一行编辑提示。
-> 增强版文件为 `TGbot-D1创新版本3.0.5-增强版.js`，部署差异与细节见 [README-增强版.md](README-增强版.md)。原版文件保持不动，可自由选用。
+> **📌 增强版说明（社区贡献）**
+> 本仓库另含增强版文件 `TGbot-D1创新版本3.0.5-增强版.js`（源自 realadmin 的 Fork）：在 3.0.5 基础上增加 Cloudflare Turnstile 人机验证、消息反应（表情回应）双向同步、消息编辑原地同步 + 一行编辑提示。
+> 部署差异与细节见 [README-增强版.md](README-增强版.md)。原版文件保持不动，可自由选用。
 
 ## 🚀 Telegram 双向机器人 Cloudflare Worker
 
