@@ -9,6 +9,10 @@
  * 追加（反应同步版）：转发时在 messages 表存消息配对（rxmap 索引），
  * 新增 message_reaction 处理，两侧反应经 setMessageReaction 双向镜像；
  * 需在 setWebhook 时用 allowed_updates 订阅 message_reaction 才有效。
+ * 追加（服务消息修复）：话题内的服务消息（关闭/重开/改名/置顶
+ * 通知等）不再被误当作管理员回复去转发——原版入口未排除这类
+ * 消息，copyMessage 必然被 Telegram 拒绝（the message can't
+ * be copied）并在话题里误报转发失败；现于话题回复入口静默忽略。
  * 追加（瘦身版）：行为不变的保守瘦身——网页接口的签名鉴权、
  * 页面响应、签名链接生成三处重复实现合并为共用helper，用户
  * 列表操作改走管理台的请求体解析helper，配置读取复用既有
@@ -4714,6 +4718,21 @@ async function handleAdminReply(
   }
 
   if (message.from?.is_bot) {
+    return;
+  }
+
+  // 话题服务消息（关闭/重开/改名/置顶通知等）不是管理员的
+  // 回复内容，且 Telegram 不允许复制，直接忽略，
+  // 避免误报「转发失败」。
+  if (
+    message.forum_topic_created ||
+    message.forum_topic_edited ||
+    message.forum_topic_closed ||
+    message.forum_topic_reopened ||
+    message.general_forum_topic_hidden ||
+    message.general_forum_topic_unhidden ||
+    message.pinned_message
+  ) {
     return;
   }
 
