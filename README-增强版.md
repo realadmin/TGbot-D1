@@ -52,6 +52,9 @@
     - 机器人会定期比对本仓库最新 Release，主菜单显示当前版本与更新状态；发现新版会私聊通知主管理员一次。主菜单有「🔄 检查更新」按钮，私聊命令 `/version` 也可查看。
     - 命令按作用域注册：私聊有 `/start`、`/help`、`/testverify`、`/version`，话题命令有 `/ban`、`/unban`、`/delete`、`/terminate`、`/card`、`/reverify`。
 
+12. **话题服务消息静默忽略**（v1.0.2 重新发布时折入）
+    - 管理员在话题里关闭/重开/改名话题或置顶消息时，Telegram 会在话题里生成服务消息；原版会把这类消息误当作管理员回复去转发，被 Telegram 拒绝（the message can't be copied）后又在话题里误报「转发失败」。现已在话题回复入口静默忽略这类服务消息。
+
 ## 与原版部署的差异
 
 除原版教程的变量（`BOT_TOKEN`、`ADMIN_IDS`、`ADMIN_GROUP_ID`、`WEBHOOK_SECRET` 与 D1 绑定 `TG_BOT_DB`）外：
