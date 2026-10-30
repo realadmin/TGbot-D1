@@ -1,191 +1,48 @@
-/* ============================================================================
- * 改版说明（2026-10-29，基于审计通过的 TGbot-D1 3.0.5）
- * 新增 Cloudflare Turnstile 小程序（Web App）人机验证：
- * - 配置项 verify_mode（管理菜单可切换 turnstile / quiz），默认 turnstile；
- * - 需在 Worker 变量中另加 TURNSTILE_SITE_KEY 与 TURNSTILE_SECRET_KEY，
- *   两者缺一时自动回退原静态问答验证，机器人不会因缺密钥不可用；
- * - 验证链接用 WEBHOOK_SECRET 做 HMAC-SHA256 签名，绑定用户 ID 与
- *   10 分钟有效期；确认接口在服务端调 siteverify 校验并核对 hostname。
- * 追加（反应同步版）：转发时在 messages 表存消息配对（rxmap 索引），
- * 新增 message_reaction 处理，两侧反应经 setMessageReaction 双向镜像；
- * 需在 setWebhook 时用 allowed_updates 订阅 message_reaction 才有效。
- * 追加（新手引导）：主菜单新增「📖 新手引导」网页按钮，
- * GET /guide 小白向使用手册（复用 usrlist 签名、仅主管理员）：
- * 项目说明、开始使用、验证、接待日常、命令速查、管理台、
- * 用户列表与统计、版本更新、常见问题九节，纯静态页。
- * 本版起版本号升至 v1.1.0（BOT_VERSION）。
- * 追加（连带删除版）：/delete 删除话题侧消息后，按 rxmap 配对
- * 连带删除客人私聊中的原消息（机器人可删私聊 incoming 消息、
- * 限发送未满 48 小时）；客人已自行删除视为已删、不提示，其余
- * 失败在话题里留一行说明；话题侧删除与墓碑行为不变。
- * 追加（去掉落点闪烁）：主人实测拼合版在 Chrome 与 Telegram
- * 应用内都有了平滑滚动与闪烁——应用内此前各种机制都「不动画」
- * 的真凶基本坐实是网页视图缓存着最早的旧页，no-store 让它
- * 终于读了新页，逐帧动画本身在应用内一直是能跑的。闪烁的
- * 诊断使命完成，按主人要求去掉（定义与调用一并移除），逐帧
- * 平滑与 no-store 保留。
- * 追加（指南页滚动定版拼合）：诊断版把跳转换成浏览器内置平滑后，
- * 主人实测连 Chrome 里的平滑也没了——原生平滑滚动在嵌套滚动
- * 环境（如 Telegram 网页版的内嵌框）里有已知的不稳定，脚本逐帧
- * 直接设位置则一直稳定（主人已在 Chrome 实测过平滑）。本版回到
- * 逐帧驱动（上一版 -rafanim 的机制），同时保留诊断版的两个
- * 净收益：签名页响应 Cache-Control: no-store、点击落点闪烁
- * 高亮（gFlash，既方便看清落点，也继续充当应用内脚本存活的
- * 指纹）。
- * 追加（指南页滚动改为脚本逐帧动画）：主人实测 Windows Telegram
- * 桌面版里章节跳转没有平滑滚动；其 Chrome 实测
- * prefers-reduced-motion 返回 false，系统信号无辜，问题出在
- * 桌面版内置网页视图的环境（自行上报减动效或原生平滑不生效，
- * 且无从开控制台分辨）。本版不再咨询 matchMedia、也不用原生
- * behavior:smooth：点章节后用 requestAnimationFrame 逐帧
- * scrollTo 自行驱动动画（easeOutCubic，时长随距离 220–600ms，
- * 落点照旧扣页眉补偿），滚轮 / 触摸立即打断。各端行为一致；
- * 代价是不再尊重减动效偏好——本页仅主管理员自用，主人知情。
- * CSS 的 scroll-behavior 媒体规则同步移除，避免与逐帧滚动
- * 双重平滑互相干扰。
- * 追加（菜单熔断说明补齐）：主人实测发现点主菜单按钮触发熔断时，
- * 选完时长后的确认（浮动提示 + 主菜单已暂停状态行）没有到期通知
- * 说明——说明此前只在选时长子菜单里。本版把说明补进主菜单的
- * 已暂停状态行：暂停期间每次打开主菜单都看得到，与命令确认口径
- * 一致。
- * 追加（熔断到期通知说明）：按主人要求，开启熔断的确认消息
- * （私聊 / 话题 / 菜单子菜单）、网页管理台提示与指南页都写明：
- * 到期不会立刻发通知，恢复通知在到期后第一条消息到来时一并
- * 送达；没人发消息时收不到通知是正常的，熔断其实已经结束。
- * 惰性到期行为本身不变（主人确认通知晚点到没关系）。
- * 追加（紧急熔断）：新增机器人紧急暂停——主管理员私聊或话题里
- * /pause [分钟]（不带数字默认 60，上限 10080）暂停服务，暂停期间
- * 访客的消息 / 编辑 / 反应在入口直接丢弃（管理员与群侧不受影响），
- * 到期由下一条更新惰性自动恢复并通知主管理员；/resume 随时恢复。
- * 主菜单带暂停状态与暂停 / 恢复按钮（时长子菜单），网页管理台
- * 新增「紧急熔断」区（状态、暂停 / 恢复、回复开关与语句）。
- * 熔断回复：暂停期间可给访客回一句可改的话（默认「请稍后再试」，
- * pause_reply_enabled / pause_reply_text 两项配置），每位访客每轮
- * 暂停最多一条（pausenote:<uid> 记本轮 episode）；已封禁者不回。
- * 闸门置于去重之前，轰炸时每条更新只多一次配置读。
- * 追加（指南平滑滚动）：章节按钮跳转改带平滑滚动动画
- * （scrollIntoView behavior:smooth，CSS 侧同步开启），
- * 系统开启减动效偏好时自动退回瞬时跳转。
- * 追加（指南顶栏防闪）：iPhone 的 Telegram 内置浏览器里点
- * 新手引导页章节按钮跳转时，置顶页眉闪烁（消失又出现）——
- * resize 事件里无条件重写 scrollPaddingTop、引发滚动中重
- * 排版是主因。页眉改为独立合成层（translateZ/will-change），
- * 补偿值只在实测高度变化时才写、resize 加防抖；章节按钮
- * 改由脚本接管跳转（scrollIntoView + replaceState），绕
- * 开原生锚点跳转在该浏览器里的重排路径。跳转后小节不被
- * 页眉遮挡的原有保证不变。
- * 追加（改名解耦与列表跳转）：修复「已有备注时重设新备注、
- * 话题名不跟着变」——原刷新流程把改名排在资料卡编辑之后，
- * 卡片编辑返回未修改（或失败）会提前结束、把改名吃掉；现
- * 改名拆为独立helper并在资料卡编辑之前先行同步，没有资料
- * 卡时也用存档资料直接改名。网页用户列表每行新增「💬 话
- * 题」按钮（/api/users 附带 topic_id 与群链接号），点按经
- * openTelegramLink 直达话题群里该用户的话题。
- * 追加（备注进标题版）：话题名改为「备注｜名字 (ID)」——备注
- * 非空时取其第一行非空内容（单独限长 40 字）放在话题名最前
- * 面，方便在话题列表侧边栏直接看到；无备注时与原格式一致。
- * 新建话题与资料卡刷新（含备注变更后的强制刷新）共用同一拼
- * 名，备注保存/删除即自动同步话题名。
- * 追加（管理台验证区调整）：基础配置里验证方式移到验证问题
- * 之前；选 Turnstile 时问题/答案两项整段隐藏（选静态问答才显示）。
- * 追加（列表页标签页）：网页用户列表改为「用户列表 / 数据统计」
- * 双标签页（默认列表页），统计不再把搜索与筛选结果挤出可视区。
- * 追加（管理员备注）：用户表新增 admin_note（ensureUserColumn
- * 迁移），资料卡展示备注；话题命令 /note 查看/设置、/notedelete
- * 删除（命令参数支持多行）；网页用户列表可查看/编辑/搜索备注，
- * 保存后自动刷新对应话题的资料卡。
- * 追加（引用转发）：转发时保留回复引用关系——按配对表把被
- * 引用消息换算到对侧 ID，以 reply_parameters 发出；客户端框选
- * 的部分引用（quote/quote_position/quote_entities）原样带过去。
- * 发送三级降级：带片段引用 → 整条引用 → 普通消息，保证引用
- * 对不上时消息本身不丢（另带 allow_sending_without_reply）。
- * 追加（服务消息修复）：话题内的服务消息（关闭/重开/改名/置顶
- * 通知等）不再被误当作管理员回复去转发——原版入口未排除这类
- * 消息，copyMessage 必然被 Telegram 拒绝（the message can't
- * be copied）并在话题里误报转发失败；现于话题回复入口静默忽略。
- * 追加（瘦身版）：行为不变的保守瘦身——网页接口的签名鉴权、
- * 页面响应、签名链接生成三处重复实现合并为共用helper，用户
- * 列表操作改走管理台的请求体解析helper，配置读取复用既有
- * getAuthorizedAdmins，并删除从未被读取的 LIMITS.block_threshold
- * 死字段；全部端点输出经哈希基线比对不变、回归 99/99。
- * 追加（管理台版）：管理面板全量网页化（主人方案一）——新增
- * /panel 网页管理台与 /api/config 系列接口（复用 usrlist 签名、
- * 仅主管理员；写入校验与原按钮版逐项一致），承接基础配置、类型
- * 过滤、屏蔽关键词、自动回复、协管员五块；Telegram 侧删除全部
- * config:* 配置菜单、列表页与待输入流程，主菜单只保留网页管理
- * 台/用户列表两个 web_app 入口与检查更新；旧消息上的 config 按
- * 钮点击只回迁移提示。话题资料卡按钮与 / 命令不受影响。
- * 追加（统计版）：网页版用户列表页顶部新增数据统计区——新接口
- * GET /api/stats（复用 usrlist 签名鉴权、仅主管理员）实时聚合：
- * 用户总览（总数/已验证/待验证/未开始/已封禁/已静音/已拉黑机器
- * 人，不含主管理员行）、新增与活跃（过去 24 小时/7 天/30 天滚动
- * 窗口，按 created_at/updated_at）、消息量（访客消息数 rxmap 的
- * t: 映射行、管理员回复数 admin: 路由行，按 date 统计、仅保留
- * 90 天，口径在页面明示）。全部 COUNT 查询，不新增存储。
- * 追加（自查修复版）：三遍深度自查（数据流/并发/契约）后的修复集——
- * 验证页 m 参数白名单+JSON 转义；Release 链接域名白名单；话题等待
- * 3s→10s；TTL 清理改为条件删除防竞态；活跃打卡只写时间戳；更新
- * 通知改为原子占用+全失败释放、失败不覆盖新鲜缓存；拉黑标记原子
- * 占用；消息配对单次 batch 写入；/delete 写墓碑行防已删内容被编辑
- * 回退通知重发；编辑提示竞态收尾；资料卡回调加管理员守卫且不为
- * 不存在用户建行；话题未知命令不再转发给访客；过期结果文案明示；
- * 删除用户连带清理其配对行；用户列表操作接口加 body 大小上限；
- * 私聊命令注册补 help。
- * 追加（命令下线版）：/finduser 命令与其 usrmgr 回调、搜索菜单
- * 一并移除，网页版用户列表完全平替；purgeManagedUser 保留，
- * 供网页版删除操作复用。
- * 追加（菜单精简版）：主菜单删除「用户搜索与删除」按钮（网页版
- * 用户列表已覆盖其用途）；/finduser 命令与既有回调处理保留，
- * 历史菜单消息上的旧按钮仍可正常打开说明页。
- * 追加（用户列表版）：主菜单新增「📋 用户列表（网页版）」Mini App
- * 入口——签名链接（usrlist 域、30 分钟、仅主管理员）打开 /users 页，
- * 列表一次拉取后在本地搜索/筛选/排序/翻页（无 Telegram 往返延迟），
- * 行内可重置验证或删除（可选连带话题），操作经 /api/users/action
- * 逐次验签并复用 purgeManagedUser 等既有守卫。
- * 追加（菜单检查版）：主菜单新增「🔄 检查更新」按钮（updchk 回调，
- * 仅主管理员），点按即手动检查并在菜单内展示结果（有更新时附
- * Release 页按钮），与 /version 命令共用同一套缓存与节流。
- * 追加（更新检查版）：自动检查 GitHub 仓库 realadmin/TGbot-D1 的
- * 最新 Release 与内置 BOT_VERSION 比较；结果缓存在 D1 config
- * （成功 6 小时 / 失败 30 分钟，手动 /version 有 5 分钟地板），
- * 由请求流 1% 概率顺带触发（与数据库清理同机制，无需 Cron）；
- * 发现未通知过的新版本时私聊通知主管理员一次；主菜单显示版本行。
- * 追加（命令菜单版）：ensureBotCommands 补注册改版命令——默认作用域
- * 加话题命令 reverify；另以 all_private_chats 作用域注册 start、
- * testverify、finduser（私聊菜单不再混入群命令）。部署后任意请求
- * 触发一次注册即全端生效。
- * 追加（不存正文版）：D1 不再保存任何消息正文——访客侧正文记录停写，
- * 管理员侧仅保留 text 为空的路由行（供编辑事件定位目标用户），编辑
- * 回退通知的原文位置显示占位符。正文只存在于 Telegram。存量正文行
- * 可由主人在 D1 控制台执行 DELETE FROM messages WHERE user_id !=
- * 'rxmap'; 立即清除，或等待原有 90 天清理。
- * 追加（用户管理版）：管理员私聊 /finduser 关键词 按 ID/用户名/名字
- * 搜索用户，结果可一键重置验证（保留话题映射，重验后回原话题）或
- * 删除记录（确认页可选连带删除话题，避免无主话题残留）；主菜单加
- * 「用户搜索与删除」入口。仅主管理员可用，管理员账号不可被操作。
- * 追加（超时清理版）：新增配置 verified_ttl_days（默认 0=关闭，
- * 「基础配置」菜单可改）：已验证/待验证用户超过该天数无活跃时，
- * 在日常清理中删除其 users 行与名下 messages 记录以回收空间；
- * 被屏蔽/静音（管理员处置）与管理员账号豁免。活跃时间按 users
- * 表 updated_at 计，访客发消息时至多每天打卡一次刷新。
- * 追加（验证调试版）：管理员私聊命令 /testverify 生成测试模式验证
- * 链接（独立签名域，确认成功只回测试结果、不改任何用户状态，仅限
- * 管理员），可反复打开 Turnstile 页调试；话题命令 /reverify 可把
- * 该用户重置为待验证状态，便于用测试号完整重走验证流程。
- * 追加（拉黑提醒版）：订阅 my_chat_member，用户在私聊拉黑/解除拉黑
- * 机器人时在该用户话题内提醒（D1 标记去重）；管理员回复发送被
- * 「bot was blocked」拒绝时走同一标记兜底提醒。需在 setWebhook 的
- * allowed_updates 中包含 my_chat_member 才有事件提醒。
- * 追加（提示去重版）：同一条消息多次编辑时，先撤回上一条编辑提示
- * 再发新的，每条消息永远只保留最新的一条提示。
- * 追加（编辑提示版）：原地编辑成功后补一条一行小提示，
- * 以「回复」形式关联到被改的那条消息（Bot API 编辑不带原生「已编辑」
- * 角标，此为替代标记）；编辑失败回退时仍用原详细通知，不再叠加提示。
- * 追加（原地编辑版）：消息编辑改为优先原地修改对侧对应消息
- * （editMessageText / editMessageCaption / editMessageMedia，
- * 客户端会自动显示「已编辑」），无配对或原地编辑失败时回退原通知方式。
- * 其余逻辑与原版保持一致。
- * ==========================================================================*/
+/* =====================================================================
+ * TGbot-D1 3.0.5 增强版（Fork 自 moistrr/TGbot-D1；单文件 Worker，
+ * 版本号见下方 BOT_VERSION 常量。逐版变更史见仓库 README-增强版.md
+ * 与各 Release 说明，本文件头只留部署与维护必须知道的事项。）
+ * =====================================================================
+ * 部署要点
+ * - 必填变量：BOT_TOKEN、ADMIN_IDS（逗号分隔，主管理员在前）、
+ *   ADMIN_GROUP_ID、WEBHOOK_SECRET；D1 绑定名必须为 TG_BOT_DB。
+ * - 可选变量：TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY，缺一即
+ *   自动回退静态问答验证，机器人不会因缺密钥不可用。
+ * - setWebhook 须带 secret_token，且 allowed_updates 含 message /
+ *   edited_message / callback_query / message_reaction /
+ *   my_chat_member 五类，缺类对应功能会静默失效。
+ * 安全模型
+ * - 出口只有 api.telegram.org、Turnstile siteverify 与 GitHub
+ *   Release 检查三处；无硬编码凭据；SQL 全参数化。
+ * - 验证链接用 WEBHOOK_SECRET 的 HMAC-SHA256 签名（绑用户、10 分
+ *   钟）；网页（指南 / 管理台 / 用户列表）复用 usrlist 签名（绑主
+ *   管理员、30 分钟），接口每次复核身份，后两页仅主管理员可用。
+ * - D1 不存消息正文：只存转发配对（rxmap）、状态与备注；配对类记
+ *   录 90 天清理；verified_ttl_days 到期删用户行与话题映射，回来
+ *   的人会新建话题。
+ * 功能清单（与仓库 README-增强版 条目对应）
+ * Turnstile / 问答双验证与回退；引用转发（含部分引用，三级降级）；
+ * 反应双向同步；原地编辑同步 + 回复关联的 ✏️ 提示（Bot API 编辑
+ * 无原生标记）；拉黑 / 取消拉黑提醒（my_chat_member + 403 兜底、
+ * 标记去重）；/delete 按配对连带删除私聊原消息（原生删除无机器人
+ * 事件、无法同步，属平台限制）；管理员备注 /note 同步到话题名
+ * 「备注｜名字 (ID)」；网页用户列表（搜索 / 筛选 / 分页 / 备注 /
+ * 跳话题）与数据统计（24h / 7d / 30d，统计口径 90 天）；网页管理
+ * 台（原按钮菜单已下线，旧按钮回迁移提示）；新手引导 /guide；
+ * 自动检查更新；紧急熔断 /pause /resume（手动触发，闸门在去重之
+ * 前；到期惰性恢复——由到期后第一条更新触发解除并通知，属刻意
+ * 设计；熔断回复每访客每轮最多一条，编辑 / 反应也触发，被封禁
+ * 者静默；管理台里关闭熔断回复时语句输入框自动隐藏）。
+ * 三页（指南 / 管理台 / 用户列表）约定
+ * - 页眉 position:fixed + 脚本实测高度补偿 body padding-top，
+ *   不要改回 sticky：iOS 上 sticky 在滚动中逐帧重定位会闪烁。
+ * - 滚动一律脚本逐帧驱动（requestAnimationFrame），不要改用原生
+ *   behavior:smooth 或 matchMedia 门控：原生平滑在 Telegram 内嵌
+ *   网页视图 / 嵌套滚动环境会退化为瞬移；签名页响应已加
+ *   Cache-Control: no-store 防网页视图缓存旧页，不要去掉。
+ * - 逐帧动画可被滚轮 / 触摸打断；指南与管理台带滚动定位高亮
+ *   （scrollspy），用户列表的标签 / 筛选切换带方向滑动动画。
+ */
 
 const USER_STATE = {
   NEW: 'new',
@@ -7446,12 +7303,13 @@ function buildGuidePage() {
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html { scroll-padding-top: 190px; }
   /* 章节跳转动画由脚本逐帧驱动，不用 CSS scroll-behavior 以免双重平滑互相干扰 */
-  body { font-family: -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #0f1a24; color: #dbe6f2; padding-bottom: 30px; }
-  header { position: sticky; top: 0; background: #13222f; padding: 12px 14px 10px; border-bottom: 1px solid #22374a; z-index: 3; transform: translateZ(0); will-change: transform; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #0f1a24; color: #dbe6f2; padding-top: 190px; padding-bottom: 30px; }
+  header { position: fixed; top: 0; left: 0; right: 0; background: #13222f; padding: 12px 14px 10px; border-bottom: 1px solid #22374a; z-index: 3; transform: translateZ(0); will-change: transform; }
   h1 { font-size: 19px; }
   .sub { color: #9db2c5; font-size: 12.5px; margin-top: 3px; line-height: 1.55; }
   .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 9px; }
   .chip { color: #b8cbdd; text-decoration: none; font-size: 12.5px; border: 1px solid #2b3a47; padding: 5px 10px; border-radius: 999px; }
+  .chip.on { background: #2b5278; color: #fff; border-color: #2b5278; }
   main { padding: 12px; max-width: 760px; margin: 0 auto; }
   section { background: #16242f; border: 1px solid #22374a; border-radius: 12px; padding: 14px 15px; margin-bottom: 12px; }
   h2 { font-size: 16px; margin-bottom: 9px; }
@@ -7605,10 +7463,12 @@ function buildGuidePage() {
   function gFixPad() {
     var hd = document.getElementById('ghead');
     if (!hd) return;
-    var v = hd.offsetHeight + 10;
+    var h = hd.offsetHeight;
+    var v = h + 10;
     if (v !== gPad) {
       gPad = v;
       document.documentElement.style.scrollPaddingTop = v + 'px';
+      document.body.style.paddingTop = h + 'px';
     }
   }
   var gPadTimer = 0;
@@ -7626,9 +7486,10 @@ function buildGuidePage() {
   function gScrollTo(target) {
     var pad = parseInt(window.getComputedStyle(document.documentElement).scrollPaddingTop, 10) || 0;
     var startY = window.pageYOffset || 0;
+    var startX = window.pageXOffset || 0;
     var endY = startY + target.getBoundingClientRect().top - pad;
     var dist = endY - startY;
-    if (!dist) return;
+    if (!dist && !startX) return;
     gStopAnim();
     var dur = Math.min(600, Math.max(220, Math.round(Math.abs(dist) * 0.35)));
     var t0 = 0;
@@ -7636,7 +7497,7 @@ function buildGuidePage() {
       if (!t0) t0 = ts;
       var p = Math.min(1, (ts - t0) / dur);
       var e = 1 - Math.pow(1 - p, 3);
-      window.scrollTo(0, Math.round(startY + dist * e));
+      window.scrollTo(Math.round(startX * (1 - e)), Math.round(startY + dist * e));
       gAnim = p < 1 ? requestAnimationFrame(gStep) : 0;
     }
     gAnim = requestAnimationFrame(gStep);
@@ -7653,6 +7514,27 @@ function buildGuidePage() {
       try { history.replaceState(null, '', id); } catch (e) {}
     });
   }
+  var gSecs = document.querySelectorAll('section[id]');
+  function gSpy() {
+    var line = (window.pageYOffset || 0) + (parseInt(window.getComputedStyle(document.documentElement).scrollPaddingTop, 10) || 0) + 4;
+    var atBottom = (window.pageYOffset || 0) + window.innerHeight >= document.documentElement.scrollHeight - 2;
+    var cur = null;
+    for (var i = 0; i < gSecs.length; i++) {
+      if (gSecs[i].offsetTop <= line) cur = gSecs[i];
+      else break;
+    }
+    if (atBottom && gSecs.length) cur = gSecs[gSecs.length - 1];
+    for (var j = 0; j < gChips.length; j++) {
+      gChips[j].classList.toggle('on', !!cur && gChips[j].getAttribute('href') === '#' + cur.id);
+    }
+  }
+  var gSpyTick = false;
+  window.addEventListener('scroll', function () {
+    if (gSpyTick) return;
+    gSpyTick = true;
+    requestAnimationFrame(function () { gSpyTick = false; gSpy(); });
+  }, { passive: true });
+  gSpy();
 </script>
 </body>
 </html>`;
@@ -7666,13 +7548,15 @@ function buildPanelPage() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>网页管理台</title>
 <style>
-  body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 0; background: #0f141a; color: #e8edf2; }
-  header { position: sticky; top: 0; background: #17212b; padding: 12px 14px; z-index: 2; }
+  body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 0; background: #0f141a; color: #e8edf2; padding-top: 104px; }
+  html { scroll-padding-top: 114px; }
+  header { position: fixed; top: 0; left: 0; right: 0; background: #17212b; padding: 12px 14px; z-index: 2; transform: translateZ(0); will-change: transform; }
   h1 { font-size: 17px; margin: 0 0 10px; }
   .chips { display: flex; gap: 6px; flex-wrap: wrap; }
   .chip { padding: 5px 12px; border-radius: 999px; border: 1px solid #2b3a47; color: #9db2c5; font-size: 13px; text-decoration: none; }
+  .chip.on { background: #2b5278; color: #fff; border-color: #2b5278; }
   main { padding: 12px 12px 34px; }
-  section { background: #17212b; border-radius: 12px; padding: 13px 14px; margin-bottom: 12px; scroll-margin-top: 108px; }
+  section { background: #17212b; border-radius: 12px; padding: 13px 14px; margin-bottom: 12px; }
   h2 { font-size: 15px; margin: 0 0 10px; }
   label { display: block; color: #9db2c5; font-size: 12.5px; margin: 12px 0 5px; }
   label:first-of-type { margin-top: 2px; }
@@ -7700,7 +7584,7 @@ function buildPanelPage() {
 </style>
 </head>
 <body>
-<header>
+<header id="phead">
   <h1>🛠 网页管理台</h1>
   <div class="chips">
     <a class="chip" href="#sec-base">基础配置</a>
@@ -7792,9 +7676,11 @@ function buildPanelPage() {
       <option value="false">关闭：完全静默</option>
     </select>
     <button class="save" data-k="pause_reply_enabled" data-t="f_pausereplymode">保存</button>
+    <div id="w_pausereply">
     <label>回复语句</label>
     <textarea id="f_pausereply" rows="2"></textarea>
     <button class="save" data-k="pause_reply_text" data-t="f_pausereply">保存</button>
+    </div>
     <div class="hint">暂停期间访客的消息、编辑与表情反应都会被丢弃、不转发，恢复后不会补送，请提醒对方重发重要内容。已被封禁的用户不会收到回复。暂停到期会自动恢复，也可随时恢复；到期时不会立刻发通知，恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的。</div>
   </section>
 </main>
@@ -7986,6 +7872,12 @@ document.getElementById('pause_resume').onclick = function () {
   });
 };
 
+function applyPauseReply() {
+  var on = document.getElementById('f_pausereplymode').value === 'true';
+  document.getElementById('w_pausereply').style.display = on ? '' : 'none';
+}
+document.getElementById('f_pausereplymode').addEventListener('change', applyPauseReply);
+
 function applyVmode() {
   var quiz = document.getElementById('f_verifymode').value === 'quiz';
   document.getElementById('w_verifq').style.display = quiz ? '' : 'none';
@@ -8013,6 +7905,7 @@ fetch('/api/config?' + qs.toString())
     document.getElementById('f_admins').value = (d.authorizedAdmins || []).join(', ');
     document.getElementById('f_pausereply').value = d.pause_reply_text || '请稍后再试';
     document.getElementById('f_pausereplymode').value = d.pause_reply_enabled ? 'true' : 'false';
+    applyPauseReply();
     renderPauseStatus(d.pause_state);
     KW = d.keywords || [];
     RP = d.autoReplies || [];
@@ -8021,11 +7914,87 @@ fetch('/api/config?' + qs.toString())
     renderRp();
     var secs = document.querySelectorAll('section');
     for (var j = 0; j < secs.length; j++) secs[j].hidden = false;
+    pSpy();
   })
   .catch(function () {
     document.getElementById('loading').className = 'loadfail';
     document.getElementById('loading').textContent = '加载失败，请回主菜单重新打开。';
   });
+var pPad = 0;
+function pFixPad() {
+  var hd = document.getElementById('phead');
+  if (!hd) return;
+  var h = hd.offsetHeight;
+  if (h && h !== pPad) {
+    pPad = h;
+    document.body.style.paddingTop = h + 'px';
+    document.documentElement.style.scrollPaddingTop = (h + 10) + 'px';
+  }
+}
+var pPadTimer = 0;
+window.addEventListener('resize', function () {
+  clearTimeout(pPadTimer);
+  pPadTimer = setTimeout(pFixPad, 120);
+});
+pFixPad();
+var pAnim = 0;
+function pStopAnim() {
+  if (pAnim) { cancelAnimationFrame(pAnim); pAnim = 0; }
+}
+window.addEventListener('wheel', pStopAnim, { passive: true });
+window.addEventListener('touchstart', pStopAnim, { passive: true });
+function pScrollToY(endY) {
+  var startY = window.pageYOffset || 0;
+  var startX = window.pageXOffset || 0;
+  var dy = endY - startY;
+  if (!dy && !startX) return;
+  pStopAnim();
+  var dist = Math.max(Math.abs(dy), Math.abs(startX));
+  var dur = Math.min(600, Math.max(220, Math.round(dist * 0.35)));
+  var t0 = 0;
+  function pStep(ts) {
+    if (!t0) t0 = ts;
+    var p = Math.min(1, (ts - t0) / dur);
+    var e = 1 - Math.pow(1 - p, 3);
+    window.scrollTo(Math.round(startX * (1 - e)), Math.round(startY + dy * e));
+    pAnim = p < 1 ? requestAnimationFrame(pStep) : 0;
+  }
+  pAnim = requestAnimationFrame(pStep);
+}
+var pChips = document.querySelectorAll('.chip');
+for (var pi = 0; pi < pChips.length; pi++) {
+  pChips[pi].addEventListener('click', function (ev) {
+    var id = this.getAttribute('href');
+    if (!id || id.charAt(0) !== '#') return;
+    var target = document.querySelector(id);
+    if (!target) return;
+    ev.preventDefault();
+    var pad = parseInt(window.getComputedStyle(document.documentElement).scrollPaddingTop, 10) || 0;
+    pScrollToY((window.pageYOffset || 0) + target.getBoundingClientRect().top - pad);
+    try { history.replaceState(null, '', id); } catch (e) {}
+  });
+}
+var pSecs = document.querySelectorAll('section[id]');
+function pSpy() {
+  var line = (window.pageYOffset || 0) + (parseInt(window.getComputedStyle(document.documentElement).scrollPaddingTop, 10) || 0) + 4;
+  var atBottom = (window.pageYOffset || 0) + window.innerHeight >= document.documentElement.scrollHeight - 2;
+  var cur = null;
+  for (var i = 0; i < pSecs.length; i++) {
+    if (pSecs[i].offsetParent === null) continue;
+    if (pSecs[i].offsetTop <= line) cur = pSecs[i];
+    else break;
+  }
+  if (atBottom && pSecs.length) cur = pSecs[pSecs.length - 1];
+  for (var j = 0; j < pChips.length; j++) {
+    pChips[j].classList.toggle('on', !!cur && pChips[j].getAttribute('href') === '#' + cur.id);
+  }
+}
+var pSpyTick = false;
+window.addEventListener('scroll', function () {
+  if (pSpyTick) return;
+  pSpyTick = true;
+  requestAnimationFrame(function () { pSpyTick = false; pSpy(); });
+}, { passive: true });
 </script>
 </body>
 </html>`;
@@ -8716,8 +8685,9 @@ function buildUserListPage() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>用户列表</title>
 <style>
-  body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 0; background: #0f141a; color: #e8edf2; }
-  header { position: sticky; top: 0; background: #17212b; padding: 12px 14px; z-index: 2; }
+  body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 0; background: #0f141a; color: #e8edf2; padding-top: 104px; }
+  html { scroll-padding-top: 114px; }
+  header { position: fixed; top: 0; left: 0; right: 0; background: #17212b; padding: 12px 14px; z-index: 2; transform: translateZ(0); will-change: transform; }
   h1 { font-size: 17px; margin: 0 0 10px; }
   input[type=search] { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px; border: 1px solid #2b3a47; background: #0f141a; color: #e8edf2; font-size: 15px; }
   .chips { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
@@ -8767,10 +8737,14 @@ function buildUserListPage() {
   .sl { color: #9db2c5; font-size: 11.5px; margin-top: 1px; }
   .snote { color: #5f7488; font-size: 11.5px; margin-top: 9px; line-height: 1.5; }
   .sloading { color: #9db2c5; font-size: 13px; padding: 6px 0; }
+  @keyframes slideFromRight { from { opacity: 0; transform: translateX(28px); } to { opacity: 1; transform: translateX(0); } }
+  @keyframes slideFromLeft { from { opacity: 0; transform: translateX(-28px); } to { opacity: 1; transform: translateX(0); } }
+  .in-r { animation: slideFromRight .32s ease; }
+  .in-l { animation: slideFromLeft .32s ease; }
 </style>
 </head>
 <body>
-<header>
+<header id="uhead">
   <h1>📋 用户列表 <span id="cnt" style="color:#9db2c5;font-size:13px"></span></h1>
   <div class="tabs">
     <button class="tab on" id="tabList">📋 用户列表</button>
@@ -9007,10 +8981,15 @@ document.getElementById('chips').addEventListener('click', function (e) {
   for (var i = 0; i < cs.length; i++) cs[i].className = 'chip' + (cs[i].dataset.f === filt ? ' on' : '');
   page = 1;
   render();
+  var order = ['all', 'verified', 'pending', 'blocked'];
+  var ni = order.indexOf(filt);
+  slideIn(document.getElementById('list'), ni >= prevFiltIdx ? 1 : -1);
+  prevFiltIdx = ni;
+  uScrollTop();
 });
-document.getElementById('sort').addEventListener('change', function () { page = 1; render(); });
-document.getElementById('prev').onclick = function () { if (page > 1) { page--; render(); } };
-document.getElementById('next').onclick = function () { page++; render(); };
+document.getElementById('sort').addEventListener('change', function () { page = 1; render(); uScrollTop(); });
+document.getElementById('prev').onclick = function () { if (page > 1) { page--; render(); uScrollTop(); } };
+document.getElementById('next').onclick = function () { page++; render(); uScrollTop(); };
 
 function showTab(which) {
   var isStats = which === 'stats';
@@ -9018,7 +8997,8 @@ function showTab(which) {
   document.getElementById('paneStats').style.display = isStats ? '' : 'none';
   document.getElementById('tabList').className = 'tab' + (isStats ? '' : ' on');
   document.getElementById('tabStats').className = 'tab' + (isStats ? ' on' : '');
-  window.scrollTo(0, 0);
+  slideIn(document.getElementById(isStats ? 'paneStats' : 'paneList'), isStats ? 1 : -1);
+  uScrollTop();
 }
 document.getElementById('tabList').onclick = function () { showTab('list'); };
 document.getElementById('tabStats').onclick = function () { showTab('stats'); };
@@ -9106,6 +9086,52 @@ fetch('/api/users?' + qs.toString())
   .catch(function () {
     document.getElementById('list').innerHTML = '<div class="empty">加载失败，请回主菜单重新打开。</div>';
   });
+var uPad = 0;
+function uFixPad() {
+  var hd = document.getElementById('uhead');
+  if (!hd) return;
+  var h = hd.offsetHeight;
+  if (h && h !== uPad) {
+    uPad = h;
+    document.body.style.paddingTop = h + 'px';
+  }
+}
+var uPadTimer = 0;
+window.addEventListener('resize', function () {
+  clearTimeout(uPadTimer);
+  uPadTimer = setTimeout(uFixPad, 120);
+});
+uFixPad();
+var uAnim = 0;
+function uStopAnim() {
+  if (uAnim) { cancelAnimationFrame(uAnim); uAnim = 0; }
+}
+window.addEventListener('wheel', uStopAnim, { passive: true });
+window.addEventListener('touchstart', uStopAnim, { passive: true });
+var prevFiltIdx = 0;
+function slideIn(el, dir) {
+  if (!el) return;
+  el.classList.remove('in-r', 'in-l');
+  void el.offsetWidth;
+  el.classList.add(dir >= 0 ? 'in-r' : 'in-l');
+}
+function uScrollTop() {
+  var startY = window.pageYOffset || 0;
+  var startX = window.pageXOffset || 0;
+  if (!startY && !startX) return;
+  uStopAnim();
+  var dist = Math.max(Math.abs(startY), Math.abs(startX));
+  var dur = Math.min(600, Math.max(220, Math.round(dist * 0.35)));
+  var t0 = 0;
+  function uStep(ts) {
+    if (!t0) t0 = ts;
+    var p = Math.min(1, (ts - t0) / dur);
+    var e = 1 - Math.pow(1 - p, 3);
+    window.scrollTo(Math.round(startX * (1 - e)), Math.round(startY * (1 - e)));
+    uAnim = p < 1 ? requestAnimationFrame(uStep) : 0;
+  }
+  uAnim = requestAnimationFrame(uStep);
+}
 </script>
 </body>
 </html>`;
