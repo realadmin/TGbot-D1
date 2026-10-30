@@ -18,6 +18,31 @@
  * 连带删除客人私聊中的原消息（机器人可删私聊 incoming 消息、
  * 限发送未满 48 小时）；客人已自行删除视为已删、不提示，其余
  * 失败在话题里留一行说明；话题侧删除与墓碑行为不变。
+ * 追加（去掉落点闪烁）：主人实测拼合版在 Chrome 与 Telegram
+ * 应用内都有了平滑滚动与闪烁——应用内此前各种机制都「不动画」
+ * 的真凶基本坐实是网页视图缓存着最早的旧页，no-store 让它
+ * 终于读了新页，逐帧动画本身在应用内一直是能跑的。闪烁的
+ * 诊断使命完成，按主人要求去掉（定义与调用一并移除），逐帧
+ * 平滑与 no-store 保留。
+ * 追加（指南页滚动定版拼合）：诊断版把跳转换成浏览器内置平滑后，
+ * 主人实测连 Chrome 里的平滑也没了——原生平滑滚动在嵌套滚动
+ * 环境（如 Telegram 网页版的内嵌框）里有已知的不稳定，脚本逐帧
+ * 直接设位置则一直稳定（主人已在 Chrome 实测过平滑）。本版回到
+ * 逐帧驱动（上一版 -rafanim 的机制），同时保留诊断版的两个
+ * 净收益：签名页响应 Cache-Control: no-store、点击落点闪烁
+ * 高亮（gFlash，既方便看清落点，也继续充当应用内脚本存活的
+ * 指纹）。
+ * 追加（指南页滚动改为脚本逐帧动画）：主人实测 Windows Telegram
+ * 桌面版里章节跳转没有平滑滚动；其 Chrome 实测
+ * prefers-reduced-motion 返回 false，系统信号无辜，问题出在
+ * 桌面版内置网页视图的环境（自行上报减动效或原生平滑不生效，
+ * 且无从开控制台分辨）。本版不再咨询 matchMedia、也不用原生
+ * behavior:smooth：点章节后用 requestAnimationFrame 逐帧
+ * scrollTo 自行驱动动画（easeOutCubic，时长随距离 220–600ms，
+ * 落点照旧扣页眉补偿），滚轮 / 触摸立即打断。各端行为一致；
+ * 代价是不再尊重减动效偏好——本页仅主管理员自用，主人知情。
+ * CSS 的 scroll-behavior 媒体规则同步移除，避免与逐帧滚动
+ * 双重平滑互相干扰。
  * 追加（菜单熔断说明补齐）：主人实测发现点主菜单按钮触发熔断时，
  * 选完时长后的确认（浮动提示 + 主菜单已暂停状态行）没有到期通知
  * 说明——说明此前只在选时长子菜单里。本版把说明补进主菜单的
@@ -7105,7 +7130,8 @@ async function signedPageResponse(
   return new Response(builder(), {
     status: 200,
     headers: {
-      'content-type': 'text/html; charset=utf-8'
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store'
     }
   });
 }
@@ -7419,7 +7445,7 @@ function buildGuidePage() {
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html { scroll-padding-top: 190px; }
-  @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+  /* 章节跳转动画由脚本逐帧驱动，不用 CSS scroll-behavior 以免双重平滑互相干扰 */
   body { font-family: -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #0f1a24; color: #dbe6f2; padding-bottom: 30px; }
   header { position: sticky; top: 0; background: #13222f; padding: 12px 14px 10px; border-bottom: 1px solid #22374a; z-index: 3; transform: translateZ(0); will-change: transform; }
   h1 { font-size: 19px; }
@@ -7591,8 +7617,30 @@ function buildGuidePage() {
     gPadTimer = setTimeout(gFixPad, 120);
   });
   gFixPad();
-  var gReduced = false;
-  try { gReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) {}
+  var gAnim = 0;
+  function gStopAnim() {
+    if (gAnim) { cancelAnimationFrame(gAnim); gAnim = 0; }
+  }
+  window.addEventListener('wheel', gStopAnim, { passive: true });
+  window.addEventListener('touchstart', gStopAnim, { passive: true });
+  function gScrollTo(target) {
+    var pad = parseInt(window.getComputedStyle(document.documentElement).scrollPaddingTop, 10) || 0;
+    var startY = window.pageYOffset || 0;
+    var endY = startY + target.getBoundingClientRect().top - pad;
+    var dist = endY - startY;
+    if (!dist) return;
+    gStopAnim();
+    var dur = Math.min(600, Math.max(220, Math.round(Math.abs(dist) * 0.35)));
+    var t0 = 0;
+    function gStep(ts) {
+      if (!t0) t0 = ts;
+      var p = Math.min(1, (ts - t0) / dur);
+      var e = 1 - Math.pow(1 - p, 3);
+      window.scrollTo(0, Math.round(startY + dist * e));
+      gAnim = p < 1 ? requestAnimationFrame(gStep) : 0;
+    }
+    gAnim = requestAnimationFrame(gStep);
+  }
   var gChips = document.querySelectorAll('.chip');
   for (var i = 0; i < gChips.length; i++) {
     gChips[i].addEventListener('click', function (ev) {
@@ -7601,7 +7649,7 @@ function buildGuidePage() {
       var target = document.querySelector(id);
       if (!target) return;
       ev.preventDefault();
-      target.scrollIntoView({ behavior: gReduced ? 'auto' : 'smooth', block: 'start' });
+      gScrollTo(target);
       try { history.replaceState(null, '', id); } catch (e) {}
     });
   }
