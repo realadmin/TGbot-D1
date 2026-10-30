@@ -18,6 +18,18 @@
  * 连带删除客人私聊中的原消息（机器人可删私聊 incoming 消息、
  * 限发送未满 48 小时）；客人已自行删除视为已删、不提示，其余
  * 失败在话题里留一行说明；话题侧删除与墓碑行为不变。
+ * 追加（改名解耦与列表跳转）：修复「已有备注时重设新备注、
+ * 话题名不跟着变」——原刷新流程把改名排在资料卡编辑之后，
+ * 卡片编辑返回未修改（或失败）会提前结束、把改名吃掉；现
+ * 改名拆为独立helper并在资料卡编辑之前先行同步，没有资料
+ * 卡时也用存档资料直接改名。网页用户列表每行新增「💬 话
+ * 题」按钮（/api/users 附带 topic_id 与群链接号），点按经
+ * openTelegramLink 直达话题群里该用户的话题。
+ * 追加（备注进标题版）：话题名改为「备注｜名字 (ID)」——备注
+ * 非空时取其第一行非空内容（单独限长 40 字）放在话题名最前
+ * 面，方便在话题列表侧边栏直接看到；无备注时与原格式一致。
+ * 新建话题与资料卡刷新（含备注变更后的强制刷新）共用同一拼
+ * 名，备注保存/删除即自动同步话题名。
  * 追加（管理台验证区调整）：基础配置里验证方式移到验证问题
  * 之前；选 Turnstile 时问题/答案两项整段隐藏（选静态问答才显示）。
  * 追加（列表页标签页）：网页用户列表改为「用户列表 / 数据统计」
@@ -1567,8 +1579,23 @@ function buildUserInfoPayload(
     ? `@${usernameRaw}`
     : '无';
 
+  // 话题名把备注放最前面，方便在话题列表侧边栏直接
+  // 看到：只取备注第一行非空内容并单独限长；无备注时
+  // 与原格式一致。总长仍守话题名的 128 字上限。
+  const noteTitleLine = String(adminNote || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line) || '';
+
+  const noteTitle =
+    noteTitleLine.length > 40
+      ? `${noteTitleLine.slice(0, 40)}…`
+      : noteTitleLine;
+
   const topicName = (
-    `${displayName} (${userId})`
+    noteTitle
+      ? `${noteTitle}｜${displayName} (${userId})`
+      : `${displayName} (${userId})`
   ).slice(0, 128);
 
   const clickableName =
@@ -1697,6 +1724,44 @@ function buildCardSignature(payload) {
   });
 }
 
+async function renameForumTopic(
+  topicId,
+  topicName,
+  env
+) {
+  try {
+    await telegramApi(
+      env.BOT_TOKEN,
+      'editForumTopic',
+      {
+        chat_id: env.ADMIN_GROUP_ID,
+        message_thread_id: Number(
+          topicId
+        ),
+        name: topicName
+      }
+    );
+  } catch (error) {
+    const message = String(
+      error?.message || error
+    );
+
+    if (
+      !message.includes(
+        'TOPIC_NOT_MODIFIED'
+      ) &&
+      !message.includes(
+        'topic is not modified'
+      )
+    ) {
+      console.error(
+        '更新话题名称失败：',
+        message
+      );
+    }
+  }
+}
+
 async function refreshUserInfoCard(
   userId,
   from,
@@ -1727,6 +1792,15 @@ async function refreshUserInfoCard(
     from,
     firstMessageDate,
     user.admin_note || ''
+  );
+
+  // 话题名先行同步：改名不依赖资料卡编辑的结果——
+  // 卡片内容未变（编辑返回未修改）或编辑失败时，
+  // 话题名也必须跟上（备注变更走的就是这条路径）。
+  await renameForumTopic(
+    user.topic_id,
+    payload.topicName,
+    env
   );
 
   const oldSignature = JSON.stringify({
@@ -1768,14 +1842,9 @@ async function refreshUserInfoCard(
       }
     );
   } catch (error) {
-    if (isMessageNotModifiedError(error)) {
-      return {
-        updated: false,
-        reason: 'not_modified'
-      };
+    if (!isMessageNotModifiedError(error)) {
+      throw error;
     }
-
-    throw error;
   }
 
 
@@ -1792,38 +1861,6 @@ async function refreshUserInfoCard(
     env
   );
 
-  try {
-    await telegramApi(
-      env.BOT_TOKEN,
-      'editForumTopic',
-      {
-        chat_id: env.ADMIN_GROUP_ID,
-        message_thread_id: Number(
-          user.topic_id
-        ),
-        name: payload.topicName
-      }
-    );
-  } catch (error) {
-    const message = String(
-      error?.message || error
-    );
-
-    if (
-      !message.includes(
-        'TOPIC_NOT_MODIFIED'
-      ) &&
-      !message.includes(
-        'topic is not modified'
-      )
-    ) {
-      console.error(
-        '更新话题名称失败：',
-        message
-      );
-    }
-  }
-
   return {
     updated: true,
     reason: 'updated'
@@ -1838,10 +1875,31 @@ async function refreshCardAfterNoteChange(
   try {
     const user = await dbUserGet(userId, env);
 
-    if (
-      !user?.topic_id ||
-      !user?.info_card_message_id
-    ) {
+    if (!user?.topic_id) {
+      return;
+    }
+
+    if (!user?.info_card_message_id) {
+      // 没有资料卡时资料卡刷新走不通，但话题名仍要
+      // 同步：用存档资料拼出话题名后直接改名。
+      const payload = buildUserInfoPayload(
+        {
+          id: Number(userId),
+          first_name:
+            user.user_info?.name || '未知用户',
+          username:
+            user.user_info?.username_raw || ''
+        },
+        null,
+        user.admin_note || ''
+      );
+
+      await renameForumTopic(
+        user.topic_id,
+        payload.topicName,
+        env
+      );
+
       return;
     }
 
@@ -6735,13 +6793,24 @@ async function handleUserListApi(request, env) {
           : String(user.user_state || ''),
         muted: Boolean(user.is_muted),
         topic: Boolean(user.topic_id),
+        topic_id: user.topic_id
+          ? String(user.topic_id)
+          : '', 
         created_at: user.created_at || 0,
         updated_at: user.updated_at || 0,
         note: user.admin_note || ''
       };
     });
 
-  return Response.json({ ok: true, users });
+  const groupLinkId = String(
+    env.ADMIN_GROUP_ID || ''
+  ).replace(/^-100/, '');
+
+  return Response.json({
+    ok: true,
+    group: groupLinkId,
+    users
+  });
 }
 
 async function countRows(env, sql, binds) {
@@ -7074,7 +7143,7 @@ function buildGuidePage() {
     <ul>
       <li><b class=\"k\">两个标签页：</b>「用户列表」和「数据统计」，默认打开列表页，点顶部标签切换。</li>
       <li><b class=\"k\">找人：</b>顶部搜索框可以按名字、用户名、数字 ID、甚至你写的备注来搜；下面的「全部 / 已验证 / 待验证 / 已屏蔽」是快速筛选；还能换排序顺序。</li>
-      <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「删除」（删掉他的记录，可勾选连话题一起删）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。</li>
+      <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（删掉他的记录，可勾选连话题一起删）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。</li>
       <li><b class=\"k\">统计页：</b>能看到用户总数、已验证 / 待验证人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
     </ul>
   </section>
@@ -8132,6 +8201,7 @@ function buildUserListPage() {
 var qs = new URLSearchParams(location.search);
 var AUTH = { u: qs.get('u'), e: qs.get('e'), s: qs.get('s') };
 var all = [], filt = 'all', query = '', page = 1;
+var GROUP_C = '';
 var PAGE = 15;
 var LABEL = { verified: '已验证', pending_verification: '待验证', blocked: '已屏蔽' };
 var CLS = { verified: 'b-ok', pending_verification: 'b-pend', blocked: 'b-ban' };
@@ -8271,6 +8341,17 @@ function render() {
     nb.textContent = '📝 备注';
     nb.onclick = function () { ta.value = u.note || ''; ne.className = 'ne open'; ta.focus(); };
     ops.appendChild(nb);
+    if (u.topic && u.topic_id && GROUP_C) {
+      var jb = document.createElement('button');
+      jb.className = 'ntb';
+      jb.textContent = '💬 话题';
+      jb.onclick = function () {
+        var url = 'https://t.me/c/' + GROUP_C + '/' + u.topic_id;
+        if (window.Telegram && Telegram.WebApp && Telegram.WebApp.openTelegramLink) Telegram.WebApp.openTelegramLink(url);
+        else window.open(url, '_blank');
+      };
+      ops.appendChild(jb);
+    }
     ops.appendChild(rb);
     var db = document.createElement('button');
     db.className = 'del';
@@ -8411,6 +8492,7 @@ fetch('/api/users?' + qs.toString())
       return;
     }
     all = d.users;
+    GROUP_C = d.group || '';
     render();
   })
   .catch(function () {
