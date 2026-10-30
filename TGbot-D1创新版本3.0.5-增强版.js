@@ -18,6 +18,17 @@
  * 连带删除客人私聊中的原消息（机器人可删私聊 incoming 消息、
  * 限发送未满 48 小时）；客人已自行删除视为已删、不提示，其余
  * 失败在话题里留一行说明；话题侧删除与墓碑行为不变。
+ * 追加（指南平滑滚动）：章节按钮跳转改带平滑滚动动画
+ * （scrollIntoView behavior:smooth，CSS 侧同步开启），
+ * 系统开启减动效偏好时自动退回瞬时跳转。
+ * 追加（指南顶栏防闪）：iPhone 的 Telegram 内置浏览器里点
+ * 新手引导页章节按钮跳转时，置顶页眉闪烁（消失又出现）——
+ * resize 事件里无条件重写 scrollPaddingTop、引发滚动中重
+ * 排版是主因。页眉改为独立合成层（translateZ/will-change），
+ * 补偿值只在实测高度变化时才写、resize 加防抖；章节按钮
+ * 改由脚本接管跳转（scrollIntoView + replaceState），绕
+ * 开原生锚点跳转在该浏览器里的重排路径。跳转后小节不被
+ * 页眉遮挡的原有保证不变。
  * 追加（改名解耦与列表跳转）：修复「已有备注时重设新备注、
  * 话题名不跟着变」——原刷新流程把改名排在资料卡编辑之后，
  * 卡片编辑返回未修改（或失败）会提前结束、把改名吃掉；现
@@ -7024,8 +7035,9 @@ function buildGuidePage() {
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html { scroll-padding-top: 190px; }
+  @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
   body { font-family: -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #0f1a24; color: #dbe6f2; padding-bottom: 30px; }
-  header { position: sticky; top: 0; background: #13222f; padding: 12px 14px 10px; border-bottom: 1px solid #22374a; z-index: 3; }
+  header { position: sticky; top: 0; background: #13222f; padding: 12px 14px 10px; border-bottom: 1px solid #22374a; z-index: 3; transform: translateZ(0); will-change: transform; }
   h1 { font-size: 19px; }
   .sub { color: #9db2c5; font-size: 12.5px; margin-top: 3px; line-height: 1.55; }
   .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 9px; }
@@ -7175,12 +7187,36 @@ function buildGuidePage() {
 
 </main>
 <script>
+  var gPad = 0;
   function gFixPad() {
     var hd = document.getElementById('ghead');
-    if (hd) document.documentElement.style.scrollPaddingTop = (hd.offsetHeight + 10) + 'px';
+    if (!hd) return;
+    var v = hd.offsetHeight + 10;
+    if (v !== gPad) {
+      gPad = v;
+      document.documentElement.style.scrollPaddingTop = v + 'px';
+    }
   }
-  window.addEventListener('resize', gFixPad);
+  var gPadTimer = 0;
+  window.addEventListener('resize', function () {
+    clearTimeout(gPadTimer);
+    gPadTimer = setTimeout(gFixPad, 120);
+  });
   gFixPad();
+  var gReduced = false;
+  try { gReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) {}
+  var gChips = document.querySelectorAll('.chip');
+  for (var i = 0; i < gChips.length; i++) {
+    gChips[i].addEventListener('click', function (ev) {
+      var id = this.getAttribute('href');
+      if (!id || id.charAt(0) !== '#') return;
+      var target = document.querySelector(id);
+      if (!target) return;
+      ev.preventDefault();
+      target.scrollIntoView({ behavior: gReduced ? 'auto' : 'smooth', block: 'start' });
+      try { history.replaceState(null, '', id); } catch (e) {}
+    });
+  }
 </script>
 </body>
 </html>`;
