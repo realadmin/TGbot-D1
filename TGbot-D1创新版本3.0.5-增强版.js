@@ -9,6 +9,11 @@
  * 追加（反应同步版）：转发时在 messages 表存消息配对（rxmap 索引），
  * 新增 message_reaction 处理，两侧反应经 setMessageReaction 双向镜像；
  * 需在 setWebhook 时用 allowed_updates 订阅 message_reaction 才有效。
+ * 追加（引用转发）：转发时保留回复引用关系——按配对表把被
+ * 引用消息换算到对侧 ID，以 reply_parameters 发出；客户端框选
+ * 的部分引用（quote/quote_position/quote_entities）原样带过去。
+ * 发送三级降级：带片段引用 → 整条引用 → 普通消息，保证引用
+ * 对不上时消息本身不丢（另带 allow_sending_without_reply）。
  * 追加（服务消息修复）：话题内的服务消息（关闭/重开/改名/置顶
  * 通知等）不再被误当作管理员回复去转发——原版入口未排除这类
  * 消息，copyMessage 必然被 Telegram 拒绝（the message can't
@@ -2220,6 +2225,102 @@ async function maybeAutoRefreshUserCard(
 /* -------------------------------------------------------------------------- */
 
 
+// 组装对侧引用参数：counterpartId 是被引用消息在目标会话
+// 里的 ID；message.quote 存在时把部分引用片段原样带上。
+function buildReplyParameters(
+  message,
+  counterpartId
+) {
+  const replyParameters = {
+    message_id: Number(counterpartId),
+    allow_sending_without_reply: true
+  };
+
+  const quote = message?.quote;
+
+  if (
+    quote &&
+    typeof quote.text === 'string' &&
+    quote.text
+  ) {
+    replyParameters.quote = quote.text;
+
+    if (Number.isFinite(quote.position)) {
+      replyParameters.quote_position =
+        quote.position;
+    }
+
+    if (
+      Array.isArray(quote.entities) &&
+      quote.entities.length
+    ) {
+      replyParameters.quote_entities =
+        quote.entities;
+    }
+  }
+
+  return replyParameters;
+}
+
+// 引用转发三级降级：带片段引用 → 整条引用 → 普通发送。
+// 只有带 reply_parameters 的尝试失败时才逐级重试，
+// 最后一级仍失败则把错误抛回调用方原有处理。
+async function copyMessageWithReplyFallback(
+  token,
+  params,
+  replyParameters
+) {
+  if (!replyParameters) {
+    return telegramApi(
+      token,
+      'copyMessage',
+      params
+    );
+  }
+
+  try {
+    return await telegramApi(
+      token,
+      'copyMessage',
+      {
+        ...params,
+        reply_parameters: replyParameters
+      }
+    );
+  } catch (firstError) {
+    if (!replyParameters.quote) {
+      return telegramApi(
+        token,
+        'copyMessage',
+        params
+      );
+    }
+
+    const wholeReply = { ...replyParameters };
+
+    delete wholeReply.quote;
+    delete wholeReply.quote_position;
+    delete wholeReply.quote_entities;
+
+    try {
+      return await telegramApi(
+        token,
+        'copyMessage',
+        {
+          ...params,
+          reply_parameters: wholeReply
+        }
+      );
+    } catch {
+      return telegramApi(
+        token,
+        'copyMessage',
+        params
+      );
+    }
+  }
+}
+
 async function relayUserMessageToTopic(
   message,
   user,
@@ -2259,12 +2360,37 @@ async function relayUserMessageToTopic(
     );
   }
 
+  // 若访客引用了某条机器人消息，把引用换算到话题侧 ID。
+  let replyParameters = null;
+
+  const visitorRepliedId =
+    message.reply_to_message?.message_id;
+
+  if (visitorRepliedId) {
+    const pair = await dbMessageDataGet(
+      REACTION_MAP_USER,
+      `p:${userId}:${visitorRepliedId}`,
+      env
+    );
+
+    const topicCounterpart = String(
+      pair?.text || ''
+    );
+
+    if (/^\d+$/.test(topicCounterpart)) {
+      replyParameters = buildReplyParameters(
+        message,
+        topicCounterpart
+      );
+    }
+  }
+
   let copiedMessageId = null;
 
   try {
-    const copyResult = await telegramApi(
+    const copyResult =
+      await copyMessageWithReplyFallback(
       env.BOT_TOKEN,
-      'copyMessage',
       {
         chat_id: env.ADMIN_GROUP_ID,
         message_thread_id:
@@ -2278,7 +2404,8 @@ async function relayUserMessageToTopic(
             freshUser.is_blocked ||
             freshUser.is_muted
           )
-      }
+      },
+      replyParameters
     );
 
     copiedMessageId =
@@ -2333,9 +2460,8 @@ async function relayUserMessageToTopic(
     }
 
     const retryCopyResult =
-      await telegramApi(
+      await copyMessageWithReplyFallback(
       env.BOT_TOKEN,
-      'copyMessage',
       {
         chat_id: env.ADMIN_GROUP_ID,
         message_thread_id:
@@ -2349,7 +2475,8 @@ async function relayUserMessageToTopic(
             newestUser.is_blocked ||
             newestUser.is_muted
           )
-      }
+      },
+      replyParameters
     );
 
     copiedMessageId =
@@ -2375,16 +2502,50 @@ async function relayAdminMessageToUser(
   userId,
   env
 ) {
-  const copyResult = await telegramApi(
-    env.BOT_TOKEN,
-    'copyMessage',
-    {
-      chat_id: String(userId),
-      from_chat_id:
-        String(message.chat.id),
-      message_id: message.message_id
+  // 若管理员引用了话题里的某条消息，把引用换算到访客
+  // 私聊侧的原始消息 ID（配对不存在或已墓碑时不带引用）。
+  let replyParameters = null;
+
+  const adminRepliedId =
+    message.reply_to_message?.message_id;
+
+  if (adminRepliedId) {
+    const pair = await dbMessageDataGet(
+      REACTION_MAP_USER,
+      `t:${adminRepliedId}`,
+      env
+    );
+
+    const pairText = String(pair?.text || '');
+
+    if (pairText && pairText !== 'gone') {
+      const [pairUserId, pairPrivateId] =
+        pairText.split(':');
+
+      if (
+        pairUserId === String(userId) &&
+        /^\d+$/.test(pairPrivateId || '')
+      ) {
+        replyParameters =
+          buildReplyParameters(
+            message,
+            pairPrivateId
+          );
+      }
     }
-  );
+  }
+
+  const copyResult =
+    await copyMessageWithReplyFallback(
+      env.BOT_TOKEN,
+      {
+        chat_id: String(userId),
+        from_chat_id:
+          String(message.chat.id),
+        message_id: message.message_id
+      },
+      replyParameters
+    );
 
   if (copyResult?.message_id) {
     await storeMessagePair(
