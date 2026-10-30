@@ -14,25 +14,25 @@
  * 安全模型
  * - 出口只有 api.telegram.org、Turnstile siteverify 与 GitHub
  *   Release 检查三处；无硬编码凭据；SQL 全参数化。
- * - 验证链接用 WEBHOOK_SECRET 的 HMAC-SHA256 签名（绑用户、10 分
- *   钟）；网页（指南 / 管理台 / 用户列表）复用 usrlist 签名（绑主
+ * - 验证链接用 WEBHOOK_SECRET 的 HMAC-SHA256 签名（绑访客、10 分
+ *   钟）；网页（指南 / 管理台 / 访客列表）复用 usrlist 签名（绑主
  *   管理员、30 分钟），接口每次复核身份，后两页仅主管理员可用。
  * - D1 不存消息正文：只存转发配对（rxmap）、状态与备注；配对类记
- *   录 90 天清理；verified_ttl_days 到期删用户行与话题映射，回来
+ *   录 90 天清理；verified_ttl_days 到期删访客行与话题映射，回来
  *   的人会新建话题。
  * 功能清单（与仓库 README-增强版 条目对应）
- * Turnstile / 问答双验证与回退；管理员一次性通行证（网页用户列表发放，机器人私聊送达，30 分钟有效、凭 Telegram 身份确认、用后即焚，救济怎么也过不了验证的用户）；验证提示、通行证与成功回执都会记录消息 ID 并自动清理：通过验证即撤回提示与未用通行证，成功回执在首条消息转发成功后撤回，过期通行证在用户下次互动时清扫，状态类消息只保留最新一条；用户列表会显示待验证用户的通行证状态（已发证剩余分钟），发证动作返回到期时间并即时刷新行内徽标；第三轮三路审计修复：删人/重置/超时清理连带作废通行证、Turnstile 确认补封禁检查、删证与发证改原子条件操作、熔断到期通知与熔断回复改原子占用、验证提示加 3 分钟节流、反应镜像补用户状态检查、初始化错误不外泄细节、节流标记在验证成功/删人/超时清理时一并清掉；引用转发（含部分引用，三级降级）；
+ * Turnstile / 问答双验证与回退；管理员一次性通行证（网页访客列表发放，机器人私聊送达，30 分钟有效、凭 Telegram 身份确认、用后即焚，救济怎么也过不了验证的访客）；验证提示、通行证与成功回执都会记录消息 ID 并自动清理：通过验证即撤回提示与未用通行证，成功回执在首条消息转发成功后撤回，过期通行证在访客下次互动时清扫，状态类消息只保留最新一条；访客列表会显示待验证访客的通行证状态（已发证剩余分钟），发证动作返回到期时间并即时刷新行内徽标；第三轮三路审计修复：删人/重置/超时清理连带作废通行证、Turnstile 确认补封禁检查、删证与发证改原子条件操作、熔断到期通知与熔断回复改原子占用、验证提示加 3 分钟节流、反应镜像补访客状态检查、初始化错误不外泄细节、节流标记在验证成功/删人/超时清理时一并清掉；引用转发（含部分引用，三级降级）；
  * 反应双向同步；原地编辑同步 + 回复关联的 ✏️ 提示（Bot API 编辑
  * 无原生标记）；拉黑 / 取消拉黑提醒（my_chat_member + 403 兜底、
  * 标记去重）；/delete 按配对连带删除私聊原消息（原生删除无机器人
  * 事件、无法同步，属平台限制）；管理员备注 /note 同步到话题名
- * 「备注｜名字 (ID)」；网页用户列表（搜索 / 筛选 / 分页 / 备注 /
+ * 「备注｜名字 (ID)」；网页访客列表（搜索 / 筛选 / 分页 / 备注 /
  * 跳话题）与数据统计（24h / 7d / 30d，统计口径 90 天）；网页管理
  * 台（原按钮菜单已下线，旧按钮回迁移提示）；新手引导 /guide；
  * 自动检查更新；服务熔断 /pause /resume（手动触发，闸门在去重之
  * 前；到期惰性恢复——由到期后第一条更新触发解除并通知，属刻意
  * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）。
- * 三页（指南 / 管理台 / 用户列表）约定
+ * 三页（指南 / 管理台 / 访客列表）约定
  * - 页眉 position:fixed + 脚本实测高度补偿 body padding-top，
  *   不要改回 sticky：iOS 上 sticky 在滚动中逐帧重定位会闪烁。
  * - 滚动一律脚本逐帧驱动（requestAnimationFrame），不要改用原生
@@ -40,7 +40,7 @@
  *   网页视图 / 嵌套滚动环境会退化为瞬移；签名页响应已加
  *   Cache-Control: no-store 防网页视图缓存旧页，不要去掉。
  * - 逐帧动画可被滚轮 / 触摸打断；指南与管理台带滚动定位高亮
- *   （scrollspy），用户列表的标签 / 筛选切换带方向滑动动画。
+ *   （scrollspy），访客列表的标签 / 筛选切换带方向滑动动画。
  */
 
 const USER_STATE = {
@@ -122,11 +122,11 @@ async function ensureBotCommands(env) {
         commands: [
           {
             command: 'ban',
-            description: '封禁当前话题用户'
+            description: '封禁当前话题访客'
           },
           {
             command: 'unban',
-            description: '解除当前话题用户封禁'
+            description: '解除当前话题访客封禁'
           },
           {
             command: 'delete',
@@ -134,23 +134,23 @@ async function ensureBotCommands(env) {
           },
           {
             command: 'terminate',
-            description: '删除当前用户话题'
+            description: '删除当前访客话题'
           },
           {
             command: 'card',
-            description: '重新创建当前用户资料卡'
+            description: '重新创建当前访客资料卡'
           },
           {
             command: 'reverify',
-            description: '让当前话题用户重新验证'
+            description: '让当前话题访客重新验证'
           },
           {
             command: 'note',
-            description: '给当前话题用户打备注（/note 内容）'
+            description: '给当前话题访客打备注（/note 内容）'
           },
           {
             command: 'notedelete',
-            description: '删除当前话题用户的备注'
+            description: '删除当前话题访客的备注'
           },
           {
             command: 'pause',
@@ -727,8 +727,8 @@ async function cleanupExpiredUsers(env, now) {
       continue;
     }
 
-    // 删除时复检全部条件，避免「选中后用户恰好回来活跃」
-    // 的竞态把活跃用户误删（TOCTOU）。
+    // 删除时复检全部条件，避免「选中后访客恰好回来活跃」
+    // 的竞态把活跃访客误删（TOCTOU）。
     const deleted =
       await env.TG_BOT_DB.prepare(
         'DELETE FROM users WHERE user_id = ? ' +
@@ -804,7 +804,7 @@ async function touchUserActivity(user, env) {
       .run();
   } catch (error) {
     console.error(
-      '刷新用户活跃时间失败：',
+      '刷新访客活跃时间失败：',
       error?.message || error
     );
   }
@@ -909,7 +909,7 @@ async function setConfig(key, value, env) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                用户数据库操作                                 */
+/*                                访客数据库操作                                 */
 /* -------------------------------------------------------------------------- */
 
 function normalizeUser(user) {
@@ -1516,7 +1516,7 @@ async function checkForwardFilters(message, env) {
   ) {
     return {
       ok: false,
-      reason: '当前不允许转发来自用户的消息。'
+      reason: '当前不允许转发来自访客的消息。'
     };
   }
 
@@ -1544,7 +1544,7 @@ async function checkForwardFilters(message, env) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                             用户资料卡与话题                                  */
+/*                             访客资料卡与话题                                  */
 /* -------------------------------------------------------------------------- */
 
 function buildUserInfoPayload(
@@ -1559,7 +1559,7 @@ function buildUserInfoPayload(
   const displayName = (
     `${firstName}` +
     `${lastName ? ` ${lastName}` : ''}`
-  ).trim() || '未知用户';
+  ).trim() || '未知访客';
 
   const usernameRaw = from.username || '';
 
@@ -1608,7 +1608,7 @@ function buildUserInfoPayload(
     : '';
 
   const infoCard = `
-👤 <b>用户资料卡</b>
+👤 <b>访客资料卡</b>
 <b>姓名:</b> ${clickableName}
 <b>用户名:</b> ${usernameText}
 <b>ID:</b> <code>${escapeHtml(userId)}</code>
@@ -1653,7 +1653,7 @@ function getInfoCardButtons(
       {
         text: isBlocked
           ? '✅ 解除屏蔽'
-          : '🚫 屏蔽用户',
+          : '🚫 屏蔽访客',
         callback_data:
           `${isBlocked ? 'unblock' : 'block'}:` +
           `${userId}`
@@ -1684,7 +1684,7 @@ function getInfoCardButtons(
     getProfileUrl(usernameRaw);
 
   /*
-   * 只有用户具有有效公开用户名时，
+   * 只有访客具有有效公开用户名时，
    * 才显示“查看资料”按钮。
    *
    * 不再使用 tg://user?id=... 作为按钮链接，
@@ -1874,7 +1874,7 @@ async function refreshCardAfterNoteChange(
         {
           id: Number(userId),
           first_name:
-            user.user_info?.name || '未知用户',
+            user.user_info?.name || '未知访客',
           username:
             user.user_info?.username_raw || ''
         },
@@ -2003,7 +2003,7 @@ async function ensureUserInfoCard(
         lastError = error;
 
         console.error(
-          `创建资料卡失败（${attempt}/3），用户 ${userId}：`,
+          `创建资料卡失败（${attempt}/3），访客 ${userId}：`,
           error?.message || error
         );
 
@@ -2014,7 +2014,7 @@ async function ensureUserInfoCard(
     }
 
     console.error(
-      `用户 ${userId} 的资料卡创建失败：`,
+      `访客 ${userId} 的资料卡创建失败：`,
       lastError?.message || lastError
     );
 
@@ -2052,7 +2052,7 @@ async function recreateUserInfoCard(
 
   const displayName =
     String(userInfo.name || '').trim() ||
-    `用户 ${normalizedUserId}`;
+    `访客 ${normalizedUserId}`;
 
   const usernameRaw =
     String(userInfo.username_raw || '').trim();
@@ -2128,7 +2128,7 @@ async function recreateUserInfoCard(
       );
     } catch (error) {
       console.warn(
-        `旧资料卡不存在或无法删除，用户 ${normalizedUserId}：`,
+        `旧资料卡不存在或无法删除，访客 ${normalizedUserId}：`,
         error?.message || error
       );
     }
@@ -2229,7 +2229,7 @@ if (user.topic_id) {
     }
 
     throw new Error(
-      '用户话题正在创建，请稍后重试'
+      '访客话题正在创建，请稍后重试'
     );
   }
 
@@ -2315,7 +2315,7 @@ async function maybeAutoRefreshUserCard(
     `${message.from.last_name
       ? ` ${message.from.last_name}`
       : ''}`
-  ).trim() || '未知用户';
+  ).trim() || '未知访客';
 
   const newUsernameRaw =
     message.from.username || '';
@@ -2449,7 +2449,7 @@ async function relayUserMessageToTopic(
 ) {
   const userId = String(message.from.id);
 
-  // 获取最新用户状态，防止并发请求使用过期数据。
+  // 获取最新访客状态，防止并发请求使用过期数据。
   let freshUser = await dbUserGetOrCreate(
     userId,
     env
@@ -2537,7 +2537,7 @@ async function relayUserMessageToTopic(
     }
 
     console.error(
-      '用户话题已失效，准备重建：',
+      '访客话题已失效，准备重建：',
       error?.message || error
     );
 
@@ -3423,7 +3423,7 @@ ${versionLine}${pauseLine}
 
     keyboard.push([
       {
-        text: '📋 用户列表',
+        text: '📋 访客列表',
         web_app: {
           url: await buildUserListUrl(
             listOrigin,
@@ -3589,7 +3589,7 @@ async function handleVerification(
     return false;
   }
 
-  // 先更新状态，再通知用户，避免用户快速发送消息时状态未保存。
+  // 先更新状态，再通知访客，避免访客快速发送消息时状态未保存。
   await dbUserUpdate(
     chatId,
     {
@@ -3844,7 +3844,7 @@ async function passRecordGet(userId, env) {
   }
 }
 
-// 静默删一条机器人自己的消息：已被用户删掉、超期删不动等一律忽略。
+// 静默删一条机器人自己的消息：已被访客删掉、超期删不动等一律忽略。
 async function quietDeleteMessage(env, chatId, messageId) {
   if (!messageId) {
     return;
@@ -3902,7 +3902,7 @@ async function clearSlotMessage(env, userId, column) {
   await quietDeleteMessage(env, userId, oldId);
 }
 
-// 作废某用户的未用通行证：删记录并删掉证消息。
+// 作废某访客的未用通行证：删记录并删掉证消息。
 // 删人、重置验证、验证成功联动都走这里，保证「重新来过」收得干净。
 async function voidUserPass(env, userId) {
   const rec = await passRecordGet(userId, env);
@@ -3928,7 +3928,7 @@ async function cleanupAfterVerified(env, userId) {
   await dbConfigDelete(`promptat:${userId}`, env);
 }
 
-// 过期通行证清扫：用户下次互动时顺手删掉过期通行证消息并清记录。
+// 过期通行证清扫：访客下次互动时顺手删掉过期通行证消息并清记录。
 // 删除用「值仍是读到的那份」的原子条件删：期间被重发的新证不受影响。
 async function sweepExpiredPass(env, userId) {
   const key = `pass:${userId}`;
@@ -3961,7 +3961,7 @@ async function sweepExpiredPass(env, userId) {
   }
 }
 
-// 验证提示节流：同一用户 3 分钟内只发一次提示，
+// 验证提示节流：同一访客 3 分钟内只发一次提示，
 // 挡住待验证访客刷消息放大 Telegram 调用与 D1 写入。
 const PROMPT_RESEND_MIN_MS = 180000;
 
@@ -3981,8 +3981,8 @@ async function markPromptSent(env, userId) {
   );
 }
 
-// 校验 Telegram Mini App initData 并返回打开者用户 ID：
-// 链接可以被转发，只有打开者本人与通行证绑定用户一致才算数。
+// 校验 Telegram Mini App initData 并返回打开者访客 ID：
+// 链接可以被转发，只有打开者本人与通行证绑定访客一致才算数。
 async function telegramInitDataUserId(initDataRaw, botToken) {
   try {
     const params = new URLSearchParams(String(initDataRaw || ''));
@@ -4114,7 +4114,7 @@ async function sendTestVerifyPrompt(
       text:
         '🧪 Turnstile 测试验证（测试模式）：' +
         '完成验证只会显示测试结果，' +
-        '不会修改任何用户的验证状态。' +
+        '不会修改任何访客的验证状态。' +
         '链接 10 分钟内有效，' +
         '需要新链接随时再发 /testverify。',
       reply_markup: {
@@ -4280,7 +4280,7 @@ function renderVerifyPage(env, params) {
 
       if (resp.ok && data.ok) {
         if (payload.m === 'test') {
-          setStatus('✅ 测试验证成功！这是测试模式，未修改任何用户的验证状态，可以关闭此页面。');
+          setStatus('✅ 测试验证成功！这是测试模式，未修改任何访客的验证状态，可以关闭此页面。');
         } else {
           setStatus('✅ 验证成功！可以关闭此页面，回到 Telegram 继续发送消息。');
         }
@@ -4495,7 +4495,7 @@ async function handlePassConfirm(request, env) {
       );
     } catch (error) {
       console.error(
-        '通行证通过后通知用户失败：',
+        '通行证通过后通知访客失败：',
         error?.message || error
       );
     }
@@ -4773,9 +4773,9 @@ async function handleVerifyConfirm(
         successSent?.message_id
       );
     } catch (error) {
-      // 状态已保存，通知失败只记日志，不让接口报 500 误导用户。
+      // 状态已保存，通知失败只记日志，不让接口报 500 误导访客。
       console.error(
-        '验证成功后通知用户失败：',
+        '验证成功后通知访客失败：',
         error?.message || error
       );
     }
@@ -4835,7 +4835,7 @@ async function handleBlockedKeyword(
   }
 
   console.log(
-    `用户 ${userId} 命中关键词：`,
+    `访客 ${userId} 命中关键词：`,
     hitKeyword
   );
 }
@@ -4899,7 +4899,7 @@ async function handlePrivateMessage(
         {
           chat_id: chatId,
           text:
-            '✅ 您是已授权协管员，可以在管理群用户话题中回复消息。'
+            '✅ 您是已授权协管员，可以在管理群访客话题中回复消息。'
         }
       );
 
@@ -5446,7 +5446,7 @@ async function handleAdminCommand(
       {
         chat_id: env.ADMIN_GROUP_ID,
         text:
-          '⚠️ 这些命令只能在用户话题中使用。'
+          '⚠️ 这些命令只能在访客话题中使用。'
       }
     );
 
@@ -5464,8 +5464,8 @@ async function handleAdminCommand(
     if (!userId) {
       await sendTopicNotice(
         message,
-        '❌ 找不到该话题对应的用户 ID。\n' +
-        '也可以使用：/reverify 用户ID',
+        '❌ 找不到该话题对应的访客 ID。\n' +
+        '也可以使用：/reverify 访客ID',
         env
       );
 
@@ -5484,7 +5484,7 @@ async function handleAdminCommand(
 
     await sendTopicNotice(
       message,
-      '🔄 已将该用户重置为待验证状态。\n' +
+      '🔄 已将该访客重置为待验证状态。\n' +
       '对方下次发送消息或 /start 时，' +
       '将重新进行人机验证。',
       env
@@ -5497,7 +5497,7 @@ async function handleAdminCommand(
     parsed.command === 'note' ||
     parsed.command === 'notedelete'
   ) {
-    // 备注命令只按话题定位用户，绝不把参数当作用户 ID
+    // 备注命令只按话题定位访客，绝不把参数当作访客 ID
     // （备注内容可能以数字开头）。
     const userId =
       await resolveTopicUserId(
@@ -5508,7 +5508,7 @@ async function handleAdminCommand(
     if (!userId) {
       await sendTopicNotice(
         message,
-        '❌ 找不到该话题对应的用户 ID。',
+        '❌ 找不到该话题对应的访客 ID。',
         env
       );
 
@@ -5605,8 +5605,8 @@ async function handleAdminCommand(
     if (!userId) {
       await sendTopicNotice(
         message,
-        '❌ 找不到该话题对应的用户 ID。\n' +
-        '也可以使用：/ban 用户ID',
+        '❌ 找不到该话题对应的访客 ID。\n' +
+        '也可以使用：/ban 访客ID',
         env
       );
 
@@ -5629,7 +5629,7 @@ async function handleAdminCommand(
 
     await sendTopicNotice(
       message,
-      `🚫 已封禁用户 ${userId}。`,
+      `🚫 已封禁访客 ${userId}。`,
       env
     );
 
@@ -5667,8 +5667,8 @@ async function handleAdminCommand(
     if (!userId) {
       await sendTopicNotice(
         message,
-        '❌ 找不到该话题对应的用户 ID。\n' +
-        '也可以使用：/unban 用户ID',
+        '❌ 找不到该话题对应的访客 ID。\n' +
+        '也可以使用：/unban 访客ID',
         env
       );
 
@@ -5686,7 +5686,7 @@ async function handleAdminCommand(
 
     await sendTopicNotice(
       message,
-      `✅ 已解除用户 ${userId} 的封禁。`,
+      `✅ 已解除访客 ${userId} 的封禁。`,
       env
     );
 
@@ -5807,8 +5807,8 @@ if (parsed.command === 'card') {
   if (!userId) {
     await sendTopicNotice(
       message,
-      '❌ 找不到当前话题对应的用户 ID。\n' +
-      '映射丢失时可以使用：/card 用户ID',
+      '❌ 找不到当前话题对应的访客 ID。\n' +
+      '映射丢失时可以使用：/card 访客ID',
       env
     );
 
@@ -5818,7 +5818,7 @@ if (parsed.command === 'card') {
   try {
     await dbUserGetOrCreate(userId, env);
 
-    // 指定用户 ID 时，将当前话题重新绑定给该用户。
+    // 指定访客 ID 时，将当前话题重新绑定给该访客。
     if (parsed.argument) {
       await env.TG_BOT_DB.prepare(`
         UPDATE users
@@ -5855,12 +5855,12 @@ if (parsed.command === 'card') {
 
     await sendTopicNotice(
       message,
-      `✅ 用户 ${userId} 的资料卡已重新创建。`,
+      `✅ 访客 ${userId} 的资料卡已重新创建。`,
       env
     );
   } catch (error) {
     console.error(
-      `重建用户 ${userId} 的资料卡失败：`,
+      `重建访客 ${userId} 的资料卡失败：`,
       error?.stack ||
       error?.message ||
       error
@@ -5888,8 +5888,8 @@ if (parsed.command === 'card') {
     if (!userId) {
       await sendTopicNotice(
         message,
-        '❌ 找不到该话题对应的用户 ID。\n' +
-        '也可以使用：/terminate 用户ID',
+        '❌ 找不到该话题对应的访客 ID。\n' +
+        '也可以使用：/terminate 访客ID',
         env
       );
 
@@ -6001,7 +6001,7 @@ if (
   if (parsedUnknown) {
     await sendTopicNotice(
       message,
-      `⚠️ 未识别的命令 /${parsedUnknown.command}，未转发给用户。`,
+      `⚠️ 未识别的命令 /${parsedUnknown.command}，未转发给访客。`,
       env
     );
 
@@ -6028,7 +6028,7 @@ const topicId =
         message_thread_id:
           Number(topicId),
         text:
-          '❌ 找不到该话题对应的用户 ID，无法转发消息。'
+          '❌ 找不到该话题对应的访客 ID，无法转发消息。'
       }
     );
 
@@ -6042,7 +6042,7 @@ const topicId =
       env
     );
 
-    // 改版：只写空正文的路由行，供管理员编辑事件定位目标用户，
+    // 改版：只写空正文的路由行，供管理员编辑事件定位目标访客，
     // 不保存消息正文（正文只存在于 Telegram）。
     await dbMessageDataPut(
       userId,
@@ -6097,7 +6097,7 @@ const topicId =
         message_thread_id:
           Number(topicId),
         text:
-          `❌ 转发消息给用户 ${userId} 失败：` +
+          `❌ 转发消息给访客 ${userId} 失败：` +
           `${error?.message || error}`
       }
     );
@@ -6205,7 +6205,7 @@ async function handleRelayEditedMessage(
     '[非文本或媒体内容]';
 
   const notificationText = `
-⚠️ <b>用户消息已修改</b>
+⚠️ <b>访客消息已修改</b>
 
 <b>原消息发送时间：</b>
 <code>${escapeHtml(originalDate)}</code>
@@ -6286,7 +6286,7 @@ ${escapeHtml(newContent)}
     );
   } catch (error) {
     console.error(
-      '处理用户编辑消息失败：',
+      '处理访客编辑消息失败：',
       error?.message || error
     );
   }
@@ -6718,7 +6718,7 @@ async function handleUserCardCallback(
     let toast = '✅ 操作成功。';
 
     if (action === 'block') {
-      toast = '🚫 已屏蔽该用户。';
+      toast = '🚫 已屏蔽该访客。';
     }
 
     if (action === 'unblock') {
@@ -7514,7 +7514,7 @@ async function handleUpdateCheckCallback(
 }
 
 /* -------------------------------------------------------------------------- */
-/*                         网页版用户列表（改版新增）                           */
+/*                         网页版访客列表（改版新增）                           */
 /* -------------------------------------------------------------------------- */
 
 const USERLIST_LINK_TTL_MS = 30 * 60 * 1000;
@@ -7681,7 +7681,7 @@ async function handleUserListPage(request, env) {
     request,
     env,
     buildUserListPage,
-    '链接无效或已过期，请回到机器人主菜单重新打开用户列表。'
+    '链接无效或已过期，请回到机器人主菜单重新打开访客列表。'
   );
 }
 
@@ -8007,7 +8007,7 @@ function buildGuidePage() {
     <a class=\"chip\" href=\"#g-chat\">接待日常</a>
     <a class=\"chip\" href=\"#g-cmd\">命令速查</a>
     <a class=\"chip\" href=\"#g-panel\">网页管理台</a>
-    <a class=\"chip\" href=\"#g-users\">用户列表</a>
+    <a class=\"chip\" href=\"#g-users\">访客列表</a>
     <a class=\"chip\" href=\"#g-update\">版本更新</a>
     <a class=\"chip\" href=\"#g-faq\">常见问题</a>
   </div>
@@ -8018,7 +8018,7 @@ function buildGuidePage() {
     <h2>🧭 项目说明</h2>
     <p>这是一个<b class=\"k\">双向客服机器人</b>。访客在私聊里给机器人发消息，消息会自动转到管理员群里一个属于他本人的专属「话题」；你在话题里打字回复，机器人再把话带回访客的私聊。一人一个话题，谁和谁的话分得清清楚楚，不会串线。</p>
     <ul>
-      <li>它是在开源项目 TGbot-D1（3.0.5）基础上增强的版本：真人验证、表情同步、消息编辑同步、拉黑提醒、网页管理台、用户列表与数据统计、自动检查更新，都包含在你现在用的这一版里。</li>
+      <li>它是在开源项目 TGbot-D1（3.0.5）基础上增强的版本：真人验证、表情同步、消息编辑同步、拉黑提醒、网页管理台、访客列表与数据统计、自动检查更新，都包含在你现在用的这一版里。</li>
       <li><b class=\"k\">隐私口径：</b>机器人只负责「搬运」消息，<b class=\"k\">不保存聊天正文</b>。数据库里只留转发所需的配对记录，并只保留 90 天。</li>
       <li><b class=\"k\">费用：</b>它跑在 Cloudflare 的免费额度上，日常使用量完全免费，不用绑卡。</li>
     </ul>
@@ -8027,7 +8027,7 @@ function buildGuidePage() {
   <section id=\"g-start\">
     <h2>🚀 开始使用</h2>
     <ol>
-      <li><b class=\"k\">打开主菜单：</b>在机器人私聊里发送 <code>/start</code>，网页管理台、用户列表和这本引导都在这里。</li>
+      <li><b class=\"k\">打开主菜单：</b>在机器人私聊里发送 <code>/start</code>，网页管理台、访客列表和这本引导都在这里。</li>
       <li><b class=\"k\">先定验证方式：</b>进「网页管理台 → 基础配置」，选一种验证方式（推荐 Turnstile，访客点一下就通过），顺便把欢迎消息改成你想对访客说的第一句话。</li>
       <li><b class=\"k\">把机器人发给访客：</b>访客打开私聊、完成验证之后给你发消息，你的群里就会自动多出一个以他名字命名的话题。</li>
       <li><b class=\"k\">在话题里直接回复：</b>不需要任何额外设置，在他的话题里打字、发图，就是发给他本人。</li>
@@ -8082,23 +8082,23 @@ function buildGuidePage() {
     <h2>🛠 网页管理台</h2>
     <p>从主菜单打开，<b class=\"k\">只有主管理员能进</b>。所有设置都集中在这里，改完点对应的「保存」立即生效：</p>
     <ul>
-      <li><b class=\"k\">基础配置：</b>欢迎消息、验证方式与题目、已验证超时清理。超时清理填一个天数（比如 90），长期没动静的用户会被自动清除并释放位置；填 0 表示永不自动清。注意：被清掉的人下次再来会新建一个话题，老话题会留着当存档。</li>
+      <li><b class=\"k\">基础配置：</b>欢迎消息、验证方式与题目、已验证超时清理。超时清理填一个天数（比如 90），长期没动静的访客会被自动清除并释放位置；填 0 表示永不自动清。注意：被清掉的人下次再来会新建一个话题，老话题会留着当存档。</li>
       <li><b class=\"k\">类型过滤：</b>不想转发的消息类型（贴纸、语音、视频等）在这里关掉，对方发了也不会过到对面去。</li>
       <li><b class=\"k\">屏蔽关键词：</b>访客的话里出现关键词会被拦下并记一次数，次数达到你设的阈值就自动封禁他。不会写正则表达式也没关系，直接填普通词句就行。</li>
       <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
-      <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到用户列表。</li>
+      <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到访客列表。</li>
       <li><b class=\"k\">服务熔断：</b>被消息轰炸时在这里一键暂停机器人（或用 /pause 命令），可设定暂停时长、到期自动恢复；还能设置暂停期间给访客的回复语句，或关掉回复保持完全静默。</li>
     </ul>
     <div class=\"tip\">管理台的网页链接 30 分钟过期；打开时提示过期，回主菜单重新点一次就行。</div>
   </section>
 
   <section id=\"g-users\">
-    <h2>📋 用户列表与数据统计</h2>
+    <h2>📋 访客列表与数据统计</h2>
     <ul>
-      <li><b class=\"k\">两个标签页：</b>「用户列表」和「数据统计」，默认打开列表页，点顶部标签切换。</li>
+      <li><b class=\"k\">两个标签页：</b>「访客列表」和「数据统计」，默认打开列表页，点顶部标签切换。</li>
       <li><b class=\"k\">找人：</b>顶部搜索框可以按名字、用户名、数字 ID、甚至你写的备注来搜；下面的「全部 / 已验证 / 待验证 / 已屏蔽」是快速筛选；还能换排序顺序。</li>
       <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（删掉他的记录，可勾选连话题一起删）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。</li>
-      <li><b class=\"k\">统计页：</b>能看到用户总数、已验证 / 待验证人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
+      <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
     </ul>
   </section>
 
@@ -8107,7 +8107,7 @@ function buildGuidePage() {
     <ul>
       <li>主菜单底部有一行当前版本号；有新版本时，那一行会变成可以点开的链接，机器人也会私聊通知主管理员一次（只通知一次，不刷屏）。</li>
       <li>想手动确认时，点主菜单的「🔄 检查更新」；查太勤会被限速（5 分钟最多查一次），这是故意的，防止白白消耗额度。</li>
-      <li>升级不丢东西：用户、配置、备注都存在数据库里，按项目仓库里的部署教程、换上新版文件重新部署即可。</li>
+      <li>升级不丢东西：访客、配置、备注都存在数据库里，按项目仓库里的部署教程、换上新版文件重新部署即可。</li>
     </ul>
   </section>
 
@@ -8124,7 +8124,7 @@ function buildGuidePage() {
     <p class=\"q\">访客说验证一直过不了，怎么办？</p>
     <p>先让他换个网络或重启 App 再试；你也可以发 /testverify 自己点一遍，看看验证页是否正常，或者在管理台临时把验证方式切成静态问答，让他先通过。</p>
     <p class=\"q\">网页打开提示「链接无效或已过期」？</p>
-    <p>管理台、用户列表和这本引导的链接都是 30 分钟有效的签名链接，回机器人主菜单重新打开即可。</p>
+    <p>管理台、访客列表和这本引导的链接都是 30 分钟有效的签名链接，回机器人主菜单重新打开即可。</p>
   </section>
 
 </main>
@@ -8292,7 +8292,7 @@ function buildPanelPage() {
     </div>
     <label>已验证超时清理（天，0 = 永不自动清理）</label>
     <input type="number" id="f_ttl" min="0" max="3650" step="1">
-    <div class="hint">超过该天数无活跃的已验证/待验证用户会被自动清除（含其话题映射，旧话题保留为无主存档）。</div>
+    <div class="hint">超过该天数无活跃的已验证/待验证访客会被自动清除（含其话题映射，旧话题保留为无主存档）。</div>
     <button class="save" data-k="verified_ttl_days" data-t="f_ttl">保存</button>
   </section>
 
@@ -8351,7 +8351,7 @@ function buildPanelPage() {
     <textarea id="f_pausereply" rows="2"></textarea>
     <button class="save" data-k="pause_reply_text" data-t="f_pausereply">保存</button>
     </div>
-    <div class="hint">暂停期间访客新发的消息会被删除、不转发，恢复后不会补送，请提醒对方重发重要内容；对已送达消息的编辑与表情反应照常同步，两边记录保持一致。已被封禁的用户不会收到回复。暂停到期会自动恢复，也可随时恢复；到期时不会立刻发通知，恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的。</div>
+    <div class="hint">暂停期间访客新发的消息会被删除、不转发，恢复后不会补送，请提醒对方重发重要内容；对已送达消息的编辑与表情反应照常同步，两边记录保持一致。已被封禁的访客不会收到回复。暂停到期会自动恢复，也可随时恢复；到期时不会立刻发通知，恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的。</div>
   </section>
 </main>
 <div id="toast"></div>
@@ -8364,7 +8364,7 @@ var FILTER_DEFS = [
   ['enable_text_forwarding', '文本'],
   ['enable_audio_forwarding', '音频/语音'],
   ['enable_sticker_forwarding', '贴纸/GIF'],
-  ['enable_user_forwarding', '用户转发'],
+  ['enable_user_forwarding', '访客转发'],
   ['enable_group_forwarding', '群组转发'],
   ['enable_channel_forwarding', '频道转发']
 ];
@@ -9454,7 +9454,7 @@ function buildUserListPage() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>用户列表</title>
+<title>访客列表</title>
 <style>
   body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 0; background: #0f141a; color: #e8edf2; padding-top: 104px; }
   html { scroll-padding-top: 114px; }
@@ -9517,9 +9517,9 @@ function buildUserListPage() {
 </head>
 <body>
 <header id="uhead">
-  <h1>📋 用户列表 <span id="cnt" style="color:#9db2c5;font-size:13px"></span></h1>
+  <h1>📋 访客列表 <span id="cnt" style="color:#9db2c5;font-size:13px"></span></h1>
   <div class="tabs">
-    <button class="tab on" id="tabList">📋 用户列表</button>
+    <button class="tab on" id="tabList">📋 访客列表</button>
     <button class="tab" id="tabStats">📊 数据统计</button>
   </div>
 </header>
@@ -9614,7 +9614,7 @@ function render() {
   if (!list.length) {
     var d = document.createElement('div');
     d.className = 'empty';
-    d.textContent = '没有符合条件的用户';
+    d.textContent = '没有符合条件的访客';
     box.appendChild(d);
     return;
   }
@@ -9659,7 +9659,7 @@ function render() {
     ne.className = 'ne';
     var ta = document.createElement('textarea');
     ta.maxLength = 500;
-    ta.placeholder = '给这个用户写点备注（仅管理员可见）…';
+    ta.placeholder = '给这个访客写点备注（仅管理员可见）…';
     ne.appendChild(ta);
     var nerow = document.createElement('div');
     nerow.className = 'row';
@@ -9835,7 +9835,7 @@ function statsFail() {
   box.textContent = '';
   var e = document.createElement('div');
   e.className = 'sloading';
-  e.textContent = '统计加载失败（不影响用户列表）';
+  e.textContent = '统计加载失败（不影响访客列表）';
   box.appendChild(e);
 }
 
@@ -9845,8 +9845,8 @@ fetch('/api/stats?' + qs.toString())
     if (!d.ok) { statsFail(); return; }
     var box = document.getElementById('sgrid');
     box.textContent = '';
-    box.appendChild(sgroup('用户总览', [
-      stile(d.users.total, '用户总数'),
+    box.appendChild(sgroup('访客总览', [
+      stile(d.users.total, '访客总数'),
       stile(d.users.verified, '已验证'),
       stile(d.users.pending, '待验证'),
       stile(d.users.fresh, '未开始'),
@@ -9854,12 +9854,12 @@ fetch('/api/stats?' + qs.toString())
       stile(d.users.muted, '已静音'),
       stile(d.users.botBlocked, '已拉黑机器人')
     ]));
-    box.appendChild(sgroup('新增用户', [
+    box.appendChild(sgroup('新增访客', [
       stile(d.growth.d1, '过去 24 小时'),
       stile(d.growth.d7, '过去 7 天'),
       stile(d.growth.d30, '过去 30 天')
     ]));
-    box.appendChild(sgroup('活跃用户', [
+    box.appendChild(sgroup('活跃访客', [
       stile(d.active.d1, '过去 24 小时'),
       stile(d.active.d7, '过去 7 天'),
       stile(d.active.d30, '过去 30 天')
