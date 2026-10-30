@@ -31,7 +31,7 @@
  * 台（原按钮菜单已下线，旧按钮回迁移提示）；新手引导 /guide；
  * 自动检查更新；服务熔断 /pause /resume（手动触发，闸门在去重之
  * 前；到期惰性恢复——由到期后第一条更新触发解除并通知，属刻意
- * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数。
+ * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）。
  * 三页（指南 / 管理台 / 访客列表）约定
  * - 页眉 position:fixed + 脚本实测高度补偿 body padding-top，
  *   不要改回 sticky：iOS 上 sticky 在滚动中逐帧重定位会闪烁。
@@ -5381,9 +5381,51 @@ async function sendTopicNotice(
   );
 }
 
+// 短暂通知：命令回执类提示看过即走，发出约 5 秒后自动删除，不在话题里留痕。
+// 删除任务挂在 ctx.waitUntil 上（尽力而为）；时长可用 EPHEMERAL_NOTICE_MS 覆盖。
+async function sendEphemeralTopicNotice(
+  message,
+  text,
+  env,
+  ctx
+) {
+  const sent =
+    await sendTopicNotice(message, text, env);
+
+  const noticeId = sent?.message_id;
+
+  if (!noticeId) {
+    return sent;
+  }
+
+  const delayMs =
+    Number(env?.EPHEMERAL_NOTICE_MS) > 0
+      ? Number(env.EPHEMERAL_NOTICE_MS)
+      : 5000;
+
+  const task = (async () => {
+    await sleep(delayMs);
+
+    await quietDeleteMessage(
+      env,
+      env.ADMIN_GROUP_ID,
+      noticeId
+    );
+  })();
+
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(task);
+  } else {
+    task.catch(() => {});
+  }
+
+  return sent;
+}
+
 async function handleAdminCommand(
   message,
-  env
+  env,
+  ctx = null
 ) {
   const parsed =
     parseAdminCommand(message.text);
@@ -5550,12 +5592,13 @@ async function handleAdminCommand(
 
     await voidUserPass(env, userId);
 
-    await sendTopicNotice(
+    await sendEphemeralTopicNotice(
       message,
       '🔄 已将该访客重置为待验证状态。\n' +
       '对方下次发送消息或 /start 时，' +
       '将重新进行人机验证。',
-      env
+      env,
+      ctx
     );
 
     return true;
@@ -5588,10 +5631,11 @@ async function handleAdminCommand(
 
     if (parsed.command === 'notedelete') {
       if (!target.admin_note) {
-        await sendTopicNotice(
+        await sendEphemeralTopicNotice(
           message,
           '📝 当前没有备注可删除。',
-          env
+          env,
+          ctx
         );
 
         return true;
@@ -5608,10 +5652,11 @@ async function handleAdminCommand(
         env
       );
 
-      await sendTopicNotice(
+      await sendEphemeralTopicNotice(
         message,
         '🗑 备注已删除。',
-        env
+        env,
+        ctx
       );
 
       return true;
@@ -5620,13 +5665,14 @@ async function handleAdminCommand(
     const noteText = parsed.argument;
 
     if (!noteText) {
-      await sendTopicNotice(
+      await sendEphemeralTopicNotice(
         message,
         target.admin_note
           ? `📝 当前备注：\n${target.admin_note}`
           : '📝 当前暂无备注。\n' +
             '用法：/note 备注内容',
-        env
+        env,
+        ctx
       );
 
       return true;
@@ -5653,10 +5699,11 @@ async function handleAdminCommand(
       env
     );
 
-    await sendTopicNotice(
+    await sendEphemeralTopicNotice(
       message,
       '📝 备注已保存。',
-      env
+      env,
+      ctx
     );
 
     return true;
@@ -5695,10 +5742,11 @@ async function handleAdminCommand(
       env
     );
 
-    await sendTopicNotice(
+    await sendEphemeralTopicNotice(
       message,
       `🚫 已封禁访客 ${userId}。`,
-      env
+      env,
+      ctx
     );
 
     if (!user.is_blocked) {
@@ -5752,10 +5800,11 @@ async function handleAdminCommand(
       env
     );
 
-    await sendTopicNotice(
+    await sendEphemeralTopicNotice(
       message,
       `✅ 已解除访客 ${userId} 的封禁。`,
-      env
+      env,
+      ctx
     );
 
     try {
@@ -6058,7 +6107,8 @@ if (parsed.command === 'card') {
 
 async function handleAdminReply(
   message,
-  env
+  env,
+  ctx = null
 ) {
   if (
     !message?.is_topic_message ||
@@ -6110,7 +6160,8 @@ if (
   const handled =
     await handleAdminCommand(
       message,
-      env
+      env,
+      ctx
     );
 
   if (handled) {
@@ -6123,10 +6174,11 @@ if (
     parseAdminCommand(message.text);
 
   if (parsedUnknown) {
-    await sendTopicNotice(
+    await sendEphemeralTopicNotice(
       message,
       `⚠️ 未识别的命令 /${parsedUnknown.command}，未转发给访客。`,
-      env
+      env,
+      ctx
     );
 
     return;
@@ -7002,8 +7054,10 @@ async function noteBotBlocked(userId, env) {
     return;
   }
 
+  let sent = null;
+
   try {
-    await telegramApi(
+    sent = await telegramApi(
       env.BOT_TOKEN,
       'sendMessage',
       {
@@ -7019,6 +7073,15 @@ async function noteBotBlocked(userId, env) {
     console.error(
       '发送拉黑提醒失败：',
       error?.message || error
+    );
+  }
+
+  // 记下这条 🚫 提醒的编号：对方解除拉黑、发出 ✅ 提醒时把它一并删掉。
+  if (sent?.message_id) {
+    await dbConfigPut(
+      `blocknotice:${userId}`,
+      String(sent.message_id),
+      env
     );
   }
 }
@@ -7045,8 +7108,10 @@ async function noteBotUnblocked(
     return;
   }
 
+  let sent = null;
+
   try {
-    await telegramApi(
+    sent = await telegramApi(
       env.BOT_TOKEN,
       'sendMessage',
       {
@@ -7063,6 +7128,27 @@ async function noteBotUnblocked(
       '发送解除拉黑提醒失败：',
       error?.message || error
     );
+  }
+
+  // ✅ 提醒发出后，把之前那条 🚫 拉黑提醒一并删掉（记账在 blocknotice:）。
+  if (sent?.message_id) {
+    const stored = await dbConfigGet(
+      `blocknotice:${userId}`,
+      env
+    );
+
+    if (stored) {
+      await quietDeleteMessage(
+        env,
+        env.ADMIN_GROUP_ID,
+        stored
+      );
+
+      await dbConfigDelete(
+        `blocknotice:${userId}`,
+        env
+      );
+    }
   }
 }
 
@@ -8481,7 +8567,8 @@ function buildGuidePage() {
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。注意：访客私聊那边的原消息只能删 48 小时以内的，超了删不掉时会在话题里留一行说明。</li>
       <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
-      <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在。</li>
+      <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在；发出 ✅ 提醒的同时，之前那条 🚫 提醒会被一并删掉，话题里只留最新状态。</li>
+      <li><b class=\"k\">命令回执不留痕：</b>/note 的查看与保存、/notedelete、/reverify、/ban、/unban 的结果提示，还有打错命令时的「未识别的命令」提示，都是短暂显示，约 5 秒后自动删除，话题里不会堆积这类回执。</li>
       <li><b class=\"k\">被轰炸时先开启服务熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客新发的消息会被机器人当场删除、不补送——消息发出去就消失，就是还在暂停的信号；对熔断前已送达消息的编辑和反应照常同步到话题副本，两边记录保持一致；开启服务熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息；恢复服务时，那条「请稍后再试」会自动改成「✅ 服务已恢复」，访客一看便知。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
     </ul>
   </section>
@@ -10781,7 +10868,8 @@ async function pauseGateDrops(update, env) {
 async function handleUpdate(
   update,
   env,
-  origin = ''
+  origin = '',
+  ctx = null
 ) {
   if (await pauseGateDrops(update, env)) {
     return;
@@ -10817,7 +10905,8 @@ async function handleUpdate(
     ) {
       await handleAdminReply(
         update.message,
-        env
+        env,
+        ctx
       );
     }
 
@@ -11126,7 +11215,8 @@ export default {
       handleUpdate(
         update,
         env,
-        requestUrl.origin
+        requestUrl.origin,
+        ctx
       ).catch(
         (error) => {
           console.error(
