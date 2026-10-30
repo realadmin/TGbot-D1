@@ -31,8 +31,7 @@
  * 台（原按钮菜单已下线，旧按钮回迁移提示）；新手引导 /guide；
  * 自动检查更新；服务熔断 /pause /resume（手动触发，闸门在去重之
  * 前；到期惰性恢复——由到期后第一条更新触发解除并通知，属刻意
- * 设计；服务熔断回复每访客每轮最多一条，编辑 / 反应也触发，被封禁
- * 者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏）。
+ * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）。
  * 三页（指南 / 管理台 / 用户列表）约定
  * - 页眉 position:fixed + 脚本实测高度补偿 body padding-top，
  *   不要改回 sticky：iOS 上 sticky 在滚动中逐帧重定位会闪烁。
@@ -770,6 +769,11 @@ async function cleanupExpiredUsers(env, now) {
 
     await dbConfigDelete(
       `pausenote:${userId}`,
+      env
+    );
+
+    await dbConfigDelete(
+      `pausemsg:${userId}`,
       env
     );
 
@@ -5073,7 +5077,7 @@ async function handlePrivateMessage(
                 chat_id: chatId,
                 text:
                   `⏸ 服务熔断已开启，${describePauseRemaining(fresh)}。\n` +
-                  '暂停期间访客的消息、编辑与反应都会被丢弃' +
+                  '暂停期间访客新发的消息会被删除（对已送达消息的编辑与反应照常同步）' +
                   (replyOn
                     ? '，每位访客会收到一条回复提醒'
                     : '，且不会收到任何回复') +
@@ -7032,6 +7036,11 @@ async function purgeManagedUser(
   );
 
   await dbConfigDelete(
+    `pausemsg:${userId}`,
+    env
+  );
+
+  await dbConfigDelete(
     `promptat:${userId}`,
     env
   );
@@ -7317,8 +7326,8 @@ async function handlePauseCallback(
       messageId,
       text:
         '⏸ <b>服务熔断</b>\n\n' +
-        '选择暂停时长。暂停期间访客的消息、编辑与反应' +
-        '都会被丢弃（管理员不受影响），到期自动恢复，' +
+        '选择暂停时长。暂停期间访客新发的消息' +
+        '会被删除（对已送达消息的编辑与反应照常同步，管理员不受影响），到期自动恢复，' +
         '也可随时在主菜单或用 /resume 提前恢复。\n' +
         'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，服务熔断其实已经结束。',
       reply_markup: {
@@ -8047,7 +8056,7 @@ function buildGuidePage() {
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
       <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在。</li>
-      <li><b class=\"k\">被轰炸时先开启服务熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客的消息、编辑、反应一律丢弃、不补送；开启服务熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
+      <li><b class=\"k\">被轰炸时先开启服务熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客新发的消息会被机器人当场删除、不补送——消息发出去就消失，就是还在暂停的信号；对熔断前已送达消息的编辑和反应照常同步到话题副本，两边记录保持一致；开启服务熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息；恢复服务时，那条「请稍后再试」会自动改成「✅ 服务已恢复」，访客一看便知。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
     </ul>
   </section>
 
@@ -8065,7 +8074,7 @@ function buildGuidePage() {
     <div class=\"cmd\"><code>/start</code><div>打开主菜单。</div></div>
     <div class=\"cmd\"><code>/testverify</code><div>拿一条验证页的测试链接，自己先体验一遍。</div></div>
     <div class=\"cmd\"><code>/version</code><div>查看当前版本，以及有没有新版本。</div></div>
-    <div class=\"cmd\"><code>/pause 60</code><div>开启服务熔断，暂停机器人 60 分钟（不写数字 = 60 分钟，话题里也能发）：期间访客消息一律丢弃，到期自动恢复。</div></div>
+    <div class=\"cmd\"><code>/pause 60</code><div>开启服务熔断，暂停机器人 60 分钟（不写数字 = 60 分钟，话题里也能发）：期间访客新发的消息会被删除、不送达（对已送达消息的编辑与反应照常同步），到期自动恢复。</div></div>
     <div class=\"cmd\"><code>/resume</code><div>立即恢复机器人服务（话题里也能发）。</div></div>
   </section>
 
@@ -8342,7 +8351,7 @@ function buildPanelPage() {
     <textarea id="f_pausereply" rows="2"></textarea>
     <button class="save" data-k="pause_reply_text" data-t="f_pausereply">保存</button>
     </div>
-    <div class="hint">暂停期间访客的消息、编辑与表情反应都会被丢弃、不转发，恢复后不会补送，请提醒对方重发重要内容。已被封禁的用户不会收到回复。暂停到期会自动恢复，也可随时恢复；到期时不会立刻发通知，恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的。</div>
+    <div class="hint">暂停期间访客新发的消息会被删除、不转发，恢复后不会补送，请提醒对方重发重要内容；对已送达消息的编辑与表情反应照常同步，两边记录保持一致。已被封禁的用户不会收到回复。暂停到期会自动恢复，也可随时恢复；到期时不会立刻发通知，恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的。</div>
   </section>
 </main>
 <div id="toast"></div>
@@ -10005,6 +10014,8 @@ async function getPauseState(env) {
         env,
         '⏰ 服务熔断时间已到，机器人已自动恢复服务。'
       );
+
+      await flipPauseCards(env);
     }
 
     return null;
@@ -10035,6 +10046,60 @@ async function startPause(env, minutes, byAdminId) {
 
 async function stopPause(env) {
   await dbConfigDelete(PAUSE_STATE_KEY, env);
+}
+
+// 恢复服务时把每位访客那张「请稍后再试」原地编辑成
+// 已恢复确认。翻牌记录 pausemsg:<uid> = 提示消息编号，
+// 熔断回复发送成功时写入。先删记录再翻牌，单次尽力
+// 而为：牌被访客自行删掉、机器人被拉黑等都静默跳过。
+async function flipPauseCards(env) {
+  let rows = [];
+
+  try {
+    const result = await env.TG_BOT_DB.prepare(
+      'SELECT key, value FROM config ' +
+        'WHERE key LIKE ?'
+    )
+      .bind('pausemsg:%')
+      .all();
+
+    rows = result?.results || [];
+  } catch (error) {
+    console.error(
+      '读取熔断提示记录失败：',
+      error?.message || error
+    );
+
+    return;
+  }
+
+  for (const row of rows) {
+    const key = String(row.key || '');
+
+    const userId = key.slice('pausemsg:'.length);
+
+    const messageId = Number(row.value);
+
+    await dbConfigDelete(key, env);
+
+    if (!userId || !messageId) {
+      continue;
+    }
+
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'editMessageText',
+        {
+          chat_id: userId,
+          message_id: messageId,
+          text: '✅ 服务已恢复，可以正常发送消息了。'
+        }
+      );
+    } catch {
+      /* 翻牌失败不打扰主流程 */
+    }
+  }
 }
 
 function describePauseRemaining(state) {
@@ -10070,7 +10135,7 @@ async function performPause(env, minutes, byAdminId) {
     env,
     '⏸ 机器人已开启服务熔断，' +
       `${describePauseRemaining(state)}。` +
-      '期间访客消息将被丢弃。',
+      '期间访客新发的消息将被删除。',
     byAdminId
   );
 
@@ -10079,6 +10144,8 @@ async function performPause(env, minutes, byAdminId) {
 
 async function performResume(env, byAdminId) {
   await stopPause(env);
+
+  await flipPauseCards(env);
 
   await notifyPrimaryAdmins(
     env,
@@ -10160,6 +10227,29 @@ async function pauseGateDrops(update, env) {
     return false;
   }
 
+  if (
+    kind === 'edited_message' ||
+    kind === 'reaction'
+  ) {
+    // 熔断只拦新消息：对熔断前已送达消息的编辑与反应
+    // 照常同步到对侧副本，否则恢复后两边记录对不上，
+    // 且编辑内容只在事件到达时存在、事后无从补回。
+    // 这两类也不发熔断回复——动作已经生效，
+    // 再发「请稍后再试」会误导访客。
+    return false;
+  }
+
+  if (kind === 'message') {
+    // 熔断期间访客新发的消息当场删除：消息消失本身
+    // 就是「仍在熔断」的信号。编辑不走这里——已在
+    // 上方放行同步，删了反而会与话题副本对不上。
+    await quietDeleteMessage(
+      env,
+      update.message.chat.id,
+      update.message.message_id
+    );
+  }
+
   if (kind === 'callback') {
     return true;
   }
@@ -10194,7 +10284,7 @@ async function pauseGateDrops(update, env) {
       );
 
       try {
-        await telegramApi(
+        const sent = await telegramApi(
           env.BOT_TOKEN,
           'sendMessage',
           {
@@ -10202,6 +10292,23 @@ async function pauseGateDrops(update, env) {
             text: replyText
           }
         );
+
+        // 记下这张「请稍后再试」的编号，
+        // 恢复服务时原地翻牌成「✅ 服务已恢复」。
+        if (sent?.message_id) {
+          try {
+            await dbConfigPut(
+              `pausemsg:${actorId}`,
+              String(sent.message_id),
+              env
+            );
+          } catch (error) {
+            console.error(
+              '记录熔断提示编号失败：',
+              error?.message || error
+            );
+          }
+        }
       } catch (error) {
         console.error(
           '发送服务熔断回复失败：',
