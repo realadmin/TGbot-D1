@@ -29,10 +29,10 @@
  * 「备注｜名字 (ID)」；网页用户列表（搜索 / 筛选 / 分页 / 备注 /
  * 跳话题）与数据统计（24h / 7d / 30d，统计口径 90 天）；网页管理
  * 台（原按钮菜单已下线，旧按钮回迁移提示）；新手引导 /guide；
- * 自动检查更新；紧急熔断 /pause /resume（手动触发，闸门在去重之
+ * 自动检查更新；服务熔断 /pause /resume（手动触发，闸门在去重之
  * 前；到期惰性恢复——由到期后第一条更新触发解除并通知，属刻意
- * 设计；熔断回复每访客每轮最多一条，编辑 / 反应也触发，被封禁
- * 者静默；管理台里关闭熔断回复时语句输入框自动隐藏）。
+ * 设计；服务熔断回复每访客每轮最多一条，编辑 / 反应也触发，被封禁
+ * 者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏）。
  * 三页（指南 / 管理台 / 用户列表）约定
  * - 页眉 position:fixed + 脚本实测高度补偿 body padding-top，
  *   不要改回 sticky：iOS 上 sticky 在滚动中逐帧重定位会闪烁。
@@ -153,7 +153,7 @@ async function ensureBotCommands(env) {
           },
           {
             command: 'pause',
-            description: '紧急暂停机器人（/pause 分钟）'
+            description: '服务熔断（/pause 分钟）'
           },
           {
             command: 'resume',
@@ -187,7 +187,7 @@ async function ensureBotCommands(env) {
           },
           {
             command: 'pause',
-            description: '紧急暂停机器人（可带分钟数）'
+            description: '服务熔断（可带分钟数）'
           },
           {
             command: 'resume',
@@ -3317,7 +3317,7 @@ async function showMainMenu(
   const pauseState = await getPauseState(env);
 
   const pauseLine = pauseState
-    ? `\n⏸ <b>已暂停服务</b>，${describePauseRemaining(pauseState)}\nℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，熔断其实已经结束。`
+    ? `\n⏸ <b>服务熔断中</b>，${describePauseRemaining(pauseState)}\nℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，服务熔断其实已经结束。`
     : '';
 
   const text = `
@@ -3391,7 +3391,7 @@ async function showMainMenu(
   } else {
     keyboard.push([
       {
-        text: '⏸ 紧急暂停',
+        text: '⏸ 服务熔断',
         callback_data: 'pause:menu'
       }
     ]);
@@ -4402,10 +4402,10 @@ async function handlePrivateMessage(
             {
               chat_id: chatId,
               text:
-                `⏸ 机器人正在暂停中，${describePauseRemaining(state)}。\n` +
+                `⏸ 服务熔断进行中，${describePauseRemaining(state)}。\n` +
                 '重新计时发送 /pause 分钟数，' +
                 '立即恢复发送 /resume。\n' +
-                'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；若一直没人发消息，收不到通知是正常的——熔断其实已经结束，只是没通知。'
+                'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；若一直没人发消息，收不到通知是正常的——服务熔断其实已经结束，只是没通知。'
             }
           );
         } else {
@@ -4449,13 +4449,13 @@ async function handlePrivateMessage(
               {
                 chat_id: chatId,
                 text:
-                  `⏸ 机器人已暂停服务，${describePauseRemaining(fresh)}。\n` +
+                  `⏸ 服务熔断已开启，${describePauseRemaining(fresh)}。\n` +
                   '暂停期间访客的消息、编辑与反应都会被丢弃' +
                   (replyOn
                     ? '，每位访客会收到一条回复提醒'
                     : '，且不会收到任何回复') +
                   '。恢复请发送 /resume。\n' +
-                  'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；若一直没人发消息，收不到通知是正常的——熔断其实已经结束，只是没通知。'
+                  'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；若一直没人发消息，收不到通知是正常的——服务熔断其实已经结束，只是没通知。'
               }
             );
           }
@@ -4728,7 +4728,7 @@ async function handleAdminCommand(
     if (!isPrimaryAdmin(senderId, env)) {
       await sendTopicNotice(
         message,
-        '⚠️ 熔断开关仅主管理员可操作。',
+        '⚠️ 服务熔断开关仅主管理员可操作。',
         env
       );
 
@@ -4763,7 +4763,7 @@ async function handleAdminCommand(
     if (!arg && state) {
       await sendTopicNotice(
         message,
-        `⏸ 机器人正在暂停中，${describePauseRemaining(state)}。\nℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，熔断其实已经结束。`,
+        `⏸ 服务熔断进行中，${describePauseRemaining(state)}。\nℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，服务熔断其实已经结束。`,
         env
       );
 
@@ -4797,7 +4797,7 @@ async function handleAdminCommand(
 
     await sendTopicNotice(
       message,
-      `⏸ 机器人已暂停服务，${describePauseRemaining(fresh)}。\nℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，熔断其实已经结束。`,
+      `⏸ 服务熔断已开启，${describePauseRemaining(fresh)}。\nℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，服务熔断其实已经结束。`,
       env
     );
 
@@ -6660,7 +6660,7 @@ async function handlePauseCallback(
     await answerCallback(
       callbackId,
       env,
-      '⚠️ 熔断开关仅主管理员可操作。',
+      '⚠️ 服务熔断开关仅主管理员可操作。',
       true
     );
 
@@ -6674,11 +6674,11 @@ async function handlePauseCallback(
       chatId: senderId,
       messageId,
       text:
-        '⏸ <b>紧急暂停</b>\n\n' +
+        '⏸ <b>服务熔断</b>\n\n' +
         '选择暂停时长。暂停期间访客的消息、编辑与反应' +
         '都会被丢弃（管理员不受影响），到期自动恢复，' +
         '也可随时在主菜单或用 /resume 提前恢复。\n' +
-        'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，熔断其实已经结束。',
+        'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，服务熔断其实已经结束。',
       reply_markup: {
         inline_keyboard: [
           [
@@ -7386,7 +7386,7 @@ function buildGuidePage() {
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
       <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在。</li>
-      <li><b class=\"k\">被轰炸时先熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客的消息、编辑、反应一律丢弃、不补送；开启熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
+      <li><b class=\"k\">被轰炸时先开启服务熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客的消息、编辑、反应一律丢弃、不补送；开启服务熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
     </ul>
   </section>
 
@@ -7404,7 +7404,7 @@ function buildGuidePage() {
     <div class=\"cmd\"><code>/start</code><div>打开主菜单。</div></div>
     <div class=\"cmd\"><code>/testverify</code><div>拿一条验证页的测试链接，自己先体验一遍。</div></div>
     <div class=\"cmd\"><code>/version</code><div>查看当前版本，以及有没有新版本。</div></div>
-    <div class=\"cmd\"><code>/pause 60</code><div>紧急暂停机器人 60 分钟（不写数字 = 60 分钟，话题里也能发）：期间访客消息一律丢弃，到期自动恢复。</div></div>
+    <div class=\"cmd\"><code>/pause 60</code><div>开启服务熔断，暂停机器人 60 分钟（不写数字 = 60 分钟，话题里也能发）：期间访客消息一律丢弃，到期自动恢复。</div></div>
     <div class=\"cmd\"><code>/resume</code><div>立即恢复机器人服务（话题里也能发）。</div></div>
   </section>
 
@@ -7417,7 +7417,7 @@ function buildGuidePage() {
       <li><b class=\"k\">屏蔽关键词：</b>访客的话里出现关键词会被拦下并记一次数，次数达到你设的阈值就自动封禁他。不会写正则表达式也没关系，直接填普通词句就行。</li>
       <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
       <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到用户列表。</li>
-      <li><b class=\"k\">紧急熔断：</b>被消息轰炸时在这里一键暂停机器人（或用 /pause 命令），可设定暂停时长、到期自动恢复；还能设置暂停期间给访客的回复语句，或关掉回复保持完全静默。</li>
+      <li><b class=\"k\">服务熔断：</b>被消息轰炸时在这里一键暂停机器人（或用 /pause 命令），可设定暂停时长、到期自动恢复；还能设置暂停期间给访客的回复语句，或关掉回复保持完全静默。</li>
     </ul>
     <div class=\"tip\">管理台的网页链接 30 分钟过期；打开时提示过期，回主菜单重新点一次就行。</div>
   </section>
@@ -7592,7 +7592,7 @@ function buildPanelPage() {
     <a class="chip" href="#sec-keyword">屏蔽关键词</a>
     <a class="chip" href="#sec-reply">自动回复</a>
     <a class="chip" href="#sec-admin">协管员</a>
-    <a class="chip" href="#sec-pause">紧急熔断</a>
+    <a class="chip" href="#sec-pause">服务熔断</a>
   </div>
 </header>
 <main id="main">
@@ -7664,13 +7664,13 @@ function buildPanelPage() {
     <button class="save danger" id="admins_clear">清空协管员</button>
   </section>
   <section id="sec-pause" hidden>
-    <h2>⏸ 紧急熔断（暂停服务）</h2>
+    <h2>⏸ 服务熔断</h2>
     <div class="hint" id="pause_status">读取中…</div>
     <label>暂停时长（分钟，1～10080）</label>
     <input type="number" id="f_pause_min" min="1" max="10080" step="1" value="60">
     <button class="save danger" id="pause_start">⏸ 暂停机器人</button>
     <button class="save" id="pause_resume">▶️ 恢复服务</button>
-    <label>熔断期间回复访客</label>
+    <label>服务熔断期间回复访客</label>
     <select id="f_pausereplymode">
       <option value="true">开启：每位访客每轮暂停最多收到一条</option>
       <option value="false">关闭：完全静默</option>
@@ -9138,7 +9138,7 @@ function uScrollTop() {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                            紧急熔断（改版新增）                              */
+/*                            服务熔断（改版新增）                              */
 /* -------------------------------------------------------------------------- */
 
 const PAUSE_STATE_KEY = 'sys:pause';
@@ -9204,7 +9204,7 @@ async function getPauseState(env) {
 
     await notifyPrimaryAdmins(
       env,
-      '⏰ 熔断时间已到，机器人已自动恢复服务。'
+      '⏰ 服务熔断时间已到，机器人已自动恢复服务。'
     );
 
     return null;
@@ -9268,7 +9268,7 @@ async function performPause(env, minutes, byAdminId) {
 
   await notifyPrimaryAdmins(
     env,
-    '⏸ 机器人已紧急暂停服务，' +
+    '⏸ 机器人已开启服务熔断，' +
       `${describePauseRemaining(state)}。` +
       '期间访客消息将被丢弃。',
     byAdminId
@@ -9401,7 +9401,7 @@ async function pauseGateDrops(update, env) {
         );
       } catch (error) {
         console.error(
-          '发送熔断回复失败：',
+          '发送服务熔断回复失败：',
           error?.message || error
         );
       }
