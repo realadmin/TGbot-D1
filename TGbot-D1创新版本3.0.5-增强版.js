@@ -9,6 +9,14 @@
  * 追加（反应同步版）：转发时在 messages 表存消息配对（rxmap 索引），
  * 新增 message_reaction 处理，两侧反应经 setMessageReaction 双向镜像；
  * 需在 setWebhook 时用 allowed_updates 订阅 message_reaction 才有效。
+ * 追加（管理台验证区调整）：基础配置里验证方式移到验证问题
+ * 之前；选 Turnstile 时问题/答案两项整段隐藏（选静态问答才显示）。
+ * 追加（列表页标签页）：网页用户列表改为「用户列表 / 数据统计」
+ * 双标签页（默认列表页），统计不再把搜索与筛选结果挤出可视区。
+ * 追加（管理员备注）：用户表新增 admin_note（ensureUserColumn
+ * 迁移），资料卡展示备注；话题命令 /note 查看/设置、/notedelete
+ * 删除（命令参数支持多行）；网页用户列表可查看/编辑/搜索备注，
+ * 保存后自动刷新对应话题的资料卡。
  * 追加（引用转发）：转发时保留回复引用关系——按配对表把被
  * 引用消息换算到对侧 ID，以 reply_parameters 发出；客户端框选
  * 的部分引用（quote/quote_position/quote_entities）原样带过去。
@@ -153,6 +161,7 @@ const USER_UPDATE_FIELDS = new Set([
   'topic_id',
   'info_card_message_id',
   'user_info_json',
+  'admin_note',
   'topic_creating',
   'topic_lock_at',
   'created_at',
@@ -196,6 +205,14 @@ async function ensureBotCommands(env) {
           {
             command: 'reverify',
             description: '让当前话题用户重新验证'
+          },
+          {
+            command: 'note',
+            description: '给当前话题用户打备注（/note 内容）'
+          },
+          {
+            command: 'notedelete',
+            description: '删除当前话题用户的备注'
           }
         ]
       }
@@ -593,6 +610,7 @@ async function dbMigrate(env) {
       topic_id TEXT,
       info_card_message_id TEXT,
       user_info_json TEXT,
+      admin_note TEXT NOT NULL DEFAULT '',
       topic_creating INTEGER NOT NULL DEFAULT 0,
       topic_lock_at INTEGER,
       created_at INTEGER,
@@ -645,6 +663,12 @@ async function dbMigrate(env) {
     env,
     'topic_lock_at',
     'INTEGER'
+  );
+
+  await ensureUserColumn(
+    env,
+    'admin_note',
+    "TEXT NOT NULL DEFAULT ''"
   );
 }
 
@@ -1516,7 +1540,8 @@ async function checkForwardFilters(message, env) {
 
 function buildUserInfoPayload(
   from,
-  firstMessageDate = null
+  firstMessageDate = null,
+  adminNote = ''
 ) {
   const userId = String(from.id);
   const firstName = from.first_name || '';
@@ -1554,12 +1579,16 @@ function buildUserInfoPayload(
       )}</code>`
     : '';
 
+  const noteText = adminNote
+    ? `\n<b>备注:</b> ${escapeHtml(adminNote)}`
+    : '';
+
   const infoCard = `
 👤 <b>用户资料卡</b>
 <b>姓名:</b> ${clickableName}
 <b>用户名:</b> ${usernameText}
 <b>ID:</b> <code>${escapeHtml(userId)}</code>
-${firstTimeText}
+${firstTimeText}${noteText}
   `.trim();
 
   return {
@@ -1687,7 +1716,8 @@ async function refreshUserInfoCard(
 
   const payload = buildUserInfoPayload(
     from,
-    firstMessageDate
+    firstMessageDate,
+    user.admin_note || ''
   );
 
   const oldSignature = JSON.stringify({
@@ -1791,6 +1821,41 @@ async function refreshUserInfoCard(
   };
 }
 
+// 备注变更后把话题里的资料卡原地刷新（无卡片时静默跳过）。
+async function refreshCardAfterNoteChange(
+  userId,
+  env
+) {
+  try {
+    const user = await dbUserGet(userId, env);
+
+    if (
+      !user?.topic_id ||
+      !user?.info_card_message_id
+    ) {
+      return;
+    }
+
+    const chatObject = await telegramApi(
+      env.BOT_TOKEN,
+      'getChat',
+      { chat_id: String(userId) }
+    );
+
+    await refreshUserInfoCard(
+      userId,
+      chatObject,
+      env,
+      true
+    );
+  } catch (error) {
+    console.error(
+      '备注变更后刷新资料卡失败：',
+      error?.message || error
+    );
+  }
+}
+
 async function createInfoCard(
   message,
   user,
@@ -1799,7 +1864,8 @@ async function createInfoCard(
 ) {
   const payload = buildUserInfoPayload(
     message.from,
-    message.date
+    message.date,
+    user.admin_note || ''
   );
 
   const sent = await telegramApi(
@@ -4410,7 +4476,7 @@ function parseAdminCommand(text) {
   const value = String(text || '').trim();
 
   const match = value.match(
-    /^\/([a-zA-Z_]+)(?:@\w+)?(?:\s+(.+))?$/
+    /^\/([a-zA-Z_]+)(?:@\w+)?(?:\s+([\s\S]+))?$/
   );
 
   if (!match) {
@@ -4484,7 +4550,9 @@ async function handleAdminCommand(
   'delete',
   'terminate',
   'card',
-  'reverify'
+  'reverify',
+  'note',
+  'notedelete'
 ]);
 
   if (!allowedCommands.has(parsed.command)) {
@@ -4551,6 +4619,107 @@ async function handleAdminCommand(
       '🔄 已将该用户重置为待验证状态。\n' +
       '对方下次发送消息或 /start 时，' +
       '将重新进行人机验证。',
+      env
+    );
+
+    return true;
+  }
+
+  if (
+    parsed.command === 'note' ||
+    parsed.command === 'notedelete'
+  ) {
+    // 备注命令只按话题定位用户，绝不把参数当作用户 ID
+    // （备注内容可能以数字开头）。
+    const userId =
+      await resolveTopicUserId(
+        message,
+        env
+      );
+
+    if (!userId) {
+      await sendTopicNotice(
+        message,
+        '❌ 找不到该话题对应的用户 ID。',
+        env
+      );
+
+      return true;
+    }
+
+    const target =
+      await dbUserGetOrCreate(userId, env);
+
+    if (parsed.command === 'notedelete') {
+      if (!target.admin_note) {
+        await sendTopicNotice(
+          message,
+          '📝 当前没有备注可删除。',
+          env
+        );
+
+        return true;
+      }
+
+      await dbUserUpdate(
+        userId,
+        { admin_note: '' },
+        env
+      );
+
+      await refreshCardAfterNoteChange(
+        userId,
+        env
+      );
+
+      await sendTopicNotice(
+        message,
+        '🗑 备注已删除。',
+        env
+      );
+
+      return true;
+    }
+
+    const noteText = parsed.argument;
+
+    if (!noteText) {
+      await sendTopicNotice(
+        message,
+        target.admin_note
+          ? `📝 当前备注：\n${target.admin_note}`
+          : '📝 当前暂无备注。\n' +
+            '用法：/note 备注内容',
+        env
+      );
+
+      return true;
+    }
+
+    if (noteText.length > 500) {
+      await sendTopicNotice(
+        message,
+        '⚠️ 备注太长（上限 500 字），未保存。',
+        env
+      );
+
+      return true;
+    }
+
+    await dbUserUpdate(
+      userId,
+      { admin_note: noteText },
+      env
+    );
+
+    await refreshCardAfterNoteChange(
+      userId,
+      env
+    );
+
+    await sendTopicNotice(
+      message,
+      '📝 备注已保存。',
       env
     );
 
@@ -6468,7 +6637,7 @@ async function handleUserListApi(request, env) {
   const result = await env.TG_BOT_DB.prepare(
     'SELECT user_id, user_state, is_blocked, ' +
     'is_muted, topic_id, created_at, updated_at, ' +
-    'user_info_json FROM users ' +
+    'user_info_json, admin_note FROM users ' +
     'ORDER BY updated_at DESC LIMIT 1000'
   )
     .all();
@@ -6492,7 +6661,8 @@ async function handleUserListApi(request, env) {
         muted: Boolean(user.is_muted),
         topic: Boolean(user.topic_id),
         created_at: user.created_at || 0,
-        updated_at: user.updated_at || 0
+        updated_at: user.updated_at || 0,
+        note: user.admin_note || ''
       };
     });
 
@@ -6751,12 +6921,6 @@ function buildPanelPage() {
     <label>欢迎消息</label>
     <textarea id="f_welcome" rows="4"></textarea>
     <button class="save" data-k="welcome_msg" data-t="f_welcome">保存</button>
-    <label>验证问题（静态问答模式）</label>
-    <textarea id="f_verifq" rows="3"></textarea>
-    <button class="save" data-k="verif_q" data-t="f_verifq">保存</button>
-    <label>验证答案（多个答案用 | 分隔）</label>
-    <input type="text" id="f_verifa">
-    <button class="save" data-k="verif_a" data-t="f_verifa">保存</button>
     <label>验证方式</label>
     <select id="f_verifymode">
       <option value="turnstile">Turnstile 小程序验证</option>
@@ -6764,6 +6928,16 @@ function buildPanelPage() {
     </select>
     <div class="hint" id="vmode_hint"></div>
     <button class="save" data-k="verify_mode" data-t="f_verifymode">保存</button>
+    <div id="w_verifq">
+    <label>验证问题（静态问答模式）</label>
+    <textarea id="f_verifq" rows="3"></textarea>
+    <button class="save" data-k="verif_q" data-t="f_verifq">保存</button>
+    </div>
+    <div id="w_verifa">
+    <label>验证答案（多个答案用 | 分隔）</label>
+    <input type="text" id="f_verifa">
+    <button class="save" data-k="verif_a" data-t="f_verifa">保存</button>
+    </div>
     <label>已验证超时清理（天，0 = 永不自动清理）</label>
     <input type="number" id="f_ttl" min="0" max="3650" step="1">
     <div class="hint">超过该天数无活跃的已验证/待验证用户会被自动清除（含其话题映射，旧话题保留为无主存档）。</div>
@@ -6972,6 +7146,13 @@ document.getElementById('admins_clear').onclick = function () {
   });
 };
 
+function applyVmode() {
+  var quiz = document.getElementById('f_verifymode').value === 'quiz';
+  document.getElementById('w_verifq').style.display = quiz ? '' : 'none';
+  document.getElementById('w_verifa').style.display = quiz ? '' : 'none';
+}
+document.getElementById('f_verifymode').addEventListener('change', applyVmode);
+
 fetch('/api/config?' + qs.toString())
   .then(function (r) { return r.json(); })
   .then(function (d) {
@@ -6985,6 +7166,7 @@ fetch('/api/config?' + qs.toString())
     document.getElementById('f_verifq').value = d.verif_q || '';
     document.getElementById('f_verifa').value = d.verif_a || '';
     document.getElementById('f_verifymode').value = d.verify_mode || 'turnstile';
+    applyVmode();
     document.getElementById('vmode_hint').textContent = d.turnstileReady ? '' : '提示：尚未配置 TURNSTILE 密钥，即使选择 Turnstile 也会自动回退为静态问答。';
     document.getElementById('f_ttl').value = d.verified_ttl_days;
     document.getElementById('f_threshold').value = d.block_threshold;
@@ -7548,6 +7730,35 @@ async function handleUserListAction(request, env) {
     return Response.json({ ok: true });
   }
 
+  if (action === 'note') {
+    const noteText = String(
+      body?.note ?? ''
+    ).trim();
+
+    if (noteText.length > 500) {
+      return Response.json(
+        {
+          ok: false,
+          error: '备注太长（上限 500 字）'
+        },
+        { status: 400 }
+      );
+    }
+
+    await dbUserUpdate(
+      targetId,
+      { admin_note: noteText },
+      env
+    );
+
+    await refreshCardAfterNoteChange(
+      targetId,
+      env
+    );
+
+    return Response.json({ ok: true });
+  }
+
   if (action === 'delete') {
     await purgeManagedUser(
       targetId,
@@ -7579,6 +7790,9 @@ function buildUserListPage() {
   .chips { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
   .chip { padding: 5px 12px; border-radius: 999px; border: 1px solid #2b3a47; background: transparent; color: #9db2c5; font-size: 13px; cursor: pointer; }
   .chip.on { background: #2b5278; color: #fff; border-color: #2b5278; }
+  .tabs { display: flex; gap: 8px; margin-top: 10px; }
+  .tab { flex: 1; padding: 8px 0; border-radius: 9px; border: 1px solid #2b3a47; background: transparent; color: #9db2c5; font-size: 14px; cursor: pointer; }
+  .tab.on { background: #2b5278; color: #fff; border-color: #2b5278; }
   select { margin-top: 10px; padding: 6px; border-radius: 8px; background: #0f141a; color: #e8edf2; border: 1px solid #2b3a47; }
   main { padding: 10px 12px 30px; }
   .card { background: #17212b; border-radius: 12px; padding: 11px 12px; margin-bottom: 9px; }
@@ -7598,6 +7812,14 @@ function buildUserListPage() {
   .cf .a { background: #8c2f2f; color: #fff; }
   .cf .b { background: #5c2222; color: #ffb4b4; }
   .cf .c { background: #2b3a47; color: #e8edf2; }
+  .note { margin-top: 8px; font-size: 13px; color: #b8c9d9; white-space: pre-wrap; word-break: break-word; }
+  .ntb { background: #2b3a47; color: #e8edf2; }
+  .ne { margin-top: 9px; display: none; }
+  .ne.open { display: block; }
+  .ne textarea { width: 100%; box-sizing: border-box; min-height: 62px; padding: 8px 10px; border-radius: 8px; border: 1px solid #2b3a47; background: #0f141a; color: #e8edf2; font-size: 14px; }
+  .ne .row { display: flex; gap: 8px; margin-top: 7px; }
+  .ne button { padding: 6px 13px; border-radius: 8px; border: 0; font-size: 13.5px; cursor: pointer; }
+  .ne .c { background: #2b3a47; color: #e8edf2; }
   .pager { display: flex; justify-content: space-between; align-items: center; padding: 6px 2px; }
   .pager button { padding: 7px 16px; border-radius: 8px; border: 1px solid #2b3a47; background: #17212b; color: #e8edf2; cursor: pointer; }
   .pager button:disabled { opacity: .4; }
@@ -7617,7 +7839,14 @@ function buildUserListPage() {
 <body>
 <header>
   <h1>📋 用户列表 <span id="cnt" style="color:#9db2c5;font-size:13px"></span></h1>
-  <input type="search" id="q" placeholder="搜索名字、用户名或 ID…">
+  <div class="tabs">
+    <button class="tab on" id="tabList">📋 用户列表</button>
+    <button class="tab" id="tabStats">📊 数据统计</button>
+  </div>
+</header>
+<main>
+  <section id="paneList">
+  <input type="search" id="q" placeholder="搜索名字、用户名、ID 或备注…">
   <div class="chips" id="chips">
     <button class="chip on" data-f="all">全部</button>
     <button class="chip" data-f="verified">已验证</button>
@@ -7629,19 +7858,18 @@ function buildUserListPage() {
     <option value="new">按最新注册</option>
     <option value="old">按最早注册</option>
   </select>
-</header>
-<main>
-  <section id="statsBox">
-    <div class="stitle">📊 数据统计</div>
-    <div id="sgrid"><div class="sloading">统计加载中…</div></div>
-    <div class="snote">消息量按同步映射记录统计（仅保留最近 90 天）；新增与活跃为滚动窗口（过去 24 小时 / 7 天 / 30 天）。</div>
-  </section>
   <div id="list"><div class="empty">加载中…</div></div>
   <div class="pager">
     <button id="prev">← 上一页</button>
     <span id="pinfo" style="color:#9db2c5;font-size:13px"></span>
     <button id="next">下一页 →</button>
   </div>
+  </section>
+  <section id="paneStats" style="display:none">
+    <div class="stitle">📊 数据统计</div>
+    <div id="sgrid"><div class="sloading">统计加载中…</div></div>
+    <div class="snote">消息量按同步映射记录统计（仅保留最近 90 天）；新增与活跃为滚动窗口（过去 24 小时 / 7 天 / 30 天）。</div>
+  </section>
 </main>
 <div id="toast"></div>
 <script>
@@ -7670,7 +7898,7 @@ function visible() {
     if (filt === 'pending' && u.state !== 'pending_verification') return false;
     if (filt === 'blocked' && u.state !== 'blocked') return false;
     if (query) {
-      var hay = (u.name + ' @' + u.username + ' ' + u.id).toLowerCase();
+      var hay = (u.name + ' @' + u.username + ' ' + u.id + ' ' + (u.note || '')).toLowerCase();
       if (hay.indexOf(query) === -1) return false;
     }
     return true;
@@ -7684,8 +7912,8 @@ function visible() {
   return list;
 }
 
-function act(id, action, delTopic) {
-  var body = { u: AUTH.u, e: AUTH.e, s: AUTH.s, action: action, userId: id, deleteTopic: !!delTopic };
+function act(id, action, delTopic, note) {
+  var body = { u: AUTH.u, e: AUTH.e, s: AUTH.s, action: action, userId: id, deleteTopic: !!delTopic, note: note };
   return fetch('/api/users/action', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -7735,6 +7963,40 @@ function render() {
     t.textContent = '最近活跃 ' + fmt(u.updated_at);
     sub2.appendChild(t);
     card.appendChild(sub2);
+    if (u.note) {
+      var nd = document.createElement('div');
+      nd.className = 'note';
+      nd.textContent = '📝 ' + u.note;
+      card.appendChild(nd);
+    }
+    var ne = document.createElement('div');
+    ne.className = 'ne';
+    var ta = document.createElement('textarea');
+    ta.maxLength = 500;
+    ta.placeholder = '给这个用户写点备注（仅管理员可见）…';
+    ne.appendChild(ta);
+    var nerow = document.createElement('div');
+    nerow.className = 'row';
+    var sv = document.createElement('button');
+    sv.className = 'rst';
+    sv.textContent = '保存备注';
+    sv.onclick = function () {
+      var v = ta.value.trim();
+      if (v.length > 500) { toast('备注太长（上限 500 字）'); return; }
+      sv.disabled = true;
+      act(u.id, 'note', false, v).then(function (d) {
+        sv.disabled = false;
+        if (d.ok) { u.note = v; toast(v ? '备注已保存' : '备注已清空'); render(); }
+        else toast('操作失败：' + (d.error || ''));
+      });
+    };
+    var cnb = document.createElement('button');
+    cnb.className = 'c';
+    cnb.textContent = '取消';
+    cnb.onclick = function () { ne.className = 'ne'; };
+    nerow.appendChild(sv);
+    nerow.appendChild(cnb);
+    ne.appendChild(nerow);
     var ops = document.createElement('div');
     ops.className = 'ops';
     var rb = document.createElement('button');
@@ -7748,6 +8010,11 @@ function render() {
         else toast('操作失败：' + (d.error || ''));
       });
     };
+    var nb = document.createElement('button');
+    nb.className = 'ntb';
+    nb.textContent = '📝 备注';
+    nb.onclick = function () { ta.value = u.note || ''; ne.className = 'ne open'; ta.focus(); };
+    ops.appendChild(nb);
     ops.appendChild(rb);
     var db = document.createElement('button');
     db.className = 'del';
@@ -7778,6 +8045,7 @@ function render() {
     ops.appendChild(db);
     card.appendChild(ops);
     card.appendChild(cf);
+    card.appendChild(ne);
     box.appendChild(card);
   });
 }
@@ -7798,6 +8066,17 @@ document.getElementById('chips').addEventListener('click', function (e) {
 document.getElementById('sort').addEventListener('change', function () { page = 1; render(); });
 document.getElementById('prev').onclick = function () { if (page > 1) { page--; render(); } };
 document.getElementById('next').onclick = function () { page++; render(); };
+
+function showTab(which) {
+  var isStats = which === 'stats';
+  document.getElementById('paneList').style.display = isStats ? 'none' : '';
+  document.getElementById('paneStats').style.display = isStats ? '' : 'none';
+  document.getElementById('tabList').className = 'tab' + (isStats ? '' : ' on');
+  document.getElementById('tabStats').className = 'tab' + (isStats ? ' on' : '');
+  window.scrollTo(0, 0);
+}
+document.getElementById('tabList').onclick = function () { showTab('list'); };
+document.getElementById('tabStats').onclick = function () { showTab('stats'); };
 
 function stile(v, l) {
   var d = document.createElement('div');
@@ -7831,7 +8110,7 @@ function statsFail() {
   box.textContent = '';
   var e = document.createElement('div');
   e.className = 'sloading';
-  e.textContent = '统计加载失败（不影响下方用户列表）';
+  e.textContent = '统计加载失败（不影响用户列表）';
   box.appendChild(e);
 }
 
