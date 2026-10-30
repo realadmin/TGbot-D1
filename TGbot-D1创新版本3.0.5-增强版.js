@@ -21,7 +21,7 @@
  *   录 90 天清理；verified_ttl_days 到期删用户行与话题映射，回来
  *   的人会新建话题。
  * 功能清单（与仓库 README-增强版 条目对应）
- * Turnstile / 问答双验证与回退；管理员一次性通行证（网页用户列表发放，机器人私聊送达，30 分钟有效、凭 Telegram 身份确认、用后即焚，救济怎么也过不了验证的用户）；验证提示、通行证与成功回执都会记录消息 ID 并自动清理：通过验证即撤回提示与未用通行证，成功回执在首条消息转发成功后撤回，过期通行证在用户下次互动时清扫，状态类消息只保留最新一条；用户列表会显示待验证用户的通行证状态（已发证剩余分钟），发证动作返回到期时间并即时刷新行内徽标；引用转发（含部分引用，三级降级）；
+ * Turnstile / 问答双验证与回退；管理员一次性通行证（网页用户列表发放，机器人私聊送达，30 分钟有效、凭 Telegram 身份确认、用后即焚，救济怎么也过不了验证的用户）；验证提示、通行证与成功回执都会记录消息 ID 并自动清理：通过验证即撤回提示与未用通行证，成功回执在首条消息转发成功后撤回，过期通行证在用户下次互动时清扫，状态类消息只保留最新一条；用户列表会显示待验证用户的通行证状态（已发证剩余分钟），发证动作返回到期时间并即时刷新行内徽标；第三轮三路审计修复：删人/重置/超时清理连带作废通行证、Turnstile 确认补封禁检查、删证与发证改原子条件操作、熔断到期通知与熔断回复改原子占用、验证提示加 3 分钟节流、反应镜像补用户状态检查、初始化错误不外泄细节、节流标记在验证成功/删人/超时清理时一并清掉；引用转发（含部分引用，三级降级）；
  * 反应双向同步；原地编辑同步 + 回复关联的 ✏️ 提示（Bot API 编辑
  * 无原生标记）；拉黑 / 取消拉黑提醒（my_chat_member + 403 兜底、
  * 标记去重）；/delete 按配对连带删除私聊原消息（原生删除无机器人
@@ -534,10 +534,21 @@ async function ensureUserColumn(
   );
 
   if (!exists) {
-    await env.TG_BOT_DB.prepare(
-      `ALTER TABLE users ADD COLUMN ` +
-      `${columnName} ${definition}`
-    ).run();
+    try {
+      await env.TG_BOT_DB.prepare(
+        `ALTER TABLE users ADD COLUMN ` +
+        `${columnName} ${definition}`
+      ).run();
+    } catch (error) {
+      // 多个实例并发迁移时，后到者会撞上「列已存在」，视为成功。
+      if (
+        !String(error?.message || error).includes(
+          'duplicate column'
+        )
+      ) {
+        throw error;
+      }
+    }
   }
 }
 
@@ -751,6 +762,21 @@ async function cleanupExpiredUsers(env, now) {
       `botblocked:${userId}`,
       env
     );
+
+    await dbConfigDelete(
+      `pass:${userId}`,
+      env
+    );
+
+    await dbConfigDelete(
+      `pausenote:${userId}`,
+      env
+    );
+
+    await dbConfigDelete(
+      `promptat:${userId}`,
+      env
+    );
   }
 }
 
@@ -842,6 +868,18 @@ async function dbConfigDelete(key, env) {
   await env.TG_BOT_DB.prepare(
     'DELETE FROM config WHERE key = ?'
   ).bind(key).run();
+}
+
+// 原子条件删：值仍是调用方读到的那份才删，返回是否真的删掉。
+// 用来防「读到旧值→期间被改写→无条件删误删新值」一类竞态。
+async function dbConfigDeleteIfValue(key, value, env) {
+  const result = await env.TG_BOT_DB.prepare(
+    'DELETE FROM config WHERE key = ? AND value = ?'
+  )
+    .bind(key, String(value))
+    .run();
+
+  return !result?.meta || result.meta.changes > 0;
 }
 
 async function getConfig(
@@ -3187,6 +3225,16 @@ async function handleMessageReaction(
       return;
     }
 
+    const reactorUser = await dbUserGet(userId, env);
+
+    if (
+      !reactorUser ||
+      Number(reactorUser.is_blocked || 0) === 1 ||
+      reactorUser.user_state !== USER_STATE.VERIFIED
+    ) {
+      return;
+    }
+
     await mirrorReaction(
       env,
       env.ADMIN_GROUP_ID,
@@ -3334,8 +3382,8 @@ async function showMainMenu(
   const versionLine =
     updateState.status === 'update' &&
     updateCache?.url
-      ? `\n\n当前版本：${BOT_VERSION}｜🆕 <a href="${escapeHtml(updateCache.url)}">有新版本 ${escapeHtml(updateCache.tag)}</a>`
-      : `\n\n当前版本：${BOT_VERSION}`;
+      ? `当前版本：${BOT_VERSION}｜🆕 <a href="${escapeHtml(updateCache.url)}">有新版本 ${escapeHtml(updateCache.tag)}</a>`
+      : `当前版本：${BOT_VERSION}`;
 
   const pauseState = await getPauseState(env);
 
@@ -3345,8 +3393,7 @@ async function showMainMenu(
 
   const text = `
 ⚙️ <b>机器人主菜单</b>
-
-管理面板已搬到网页。${versionLine}${pauseLine}
+${versionLine}${pauseLine}
   `.trim();
 
   const keyboard = [];
@@ -3468,21 +3515,25 @@ async function handleStart(
     const verificationQuestion =
       await getConfig('verif_q', env);
 
-    const promptSent = await telegramApi(
-      env.BOT_TOKEN,
-      'sendMessage',
-      {
-        chat_id: chatId,
-        text: verificationQuestion
-      }
-    );
+    if (!(await promptThrottled(env, chatId))) {
+      const promptSent = await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text: verificationQuestion
+        }
+      );
 
-    await trackSlotMessage(
-      env,
-      chatId,
-      'verify_prompt_msg_id',
-      promptSent?.message_id
-    );
+      await trackSlotMessage(
+        env,
+        chatId,
+        'verify_prompt_msg_id',
+        promptSent?.message_id
+      );
+
+      await markPromptSent(env, chatId);
+    }
   }
 
   await dbUserUpdate(
@@ -3847,6 +3898,18 @@ async function clearSlotMessage(env, userId, column) {
   await quietDeleteMessage(env, userId, oldId);
 }
 
+// 作废某用户的未用通行证：删记录并删掉证消息。
+// 删人、重置验证、验证成功联动都走这里，保证「重新来过」收得干净。
+async function voidUserPass(env, userId) {
+  const rec = await passRecordGet(userId, env);
+
+  await dbConfigDelete(`pass:${userId}`, env);
+
+  if (rec?.m) {
+    await quietDeleteMessage(env, userId, rec.m);
+  }
+}
+
 // 任意入口验证通过后的联动清理：撤回验证提示；
 // 若还有未使用的通行证，一并删消息并作废（人已通过，证留着只是风险）。
 async function cleanupAfterVerified(env, userId) {
@@ -3856,28 +3919,62 @@ async function cleanupAfterVerified(env, userId) {
     'verify_prompt_msg_id'
   );
 
-  const rec = await passRecordGet(userId, env);
+  await voidUserPass(env, userId);
 
-  if (rec) {
-    await dbConfigDelete(`pass:${userId}`, env);
-
-    if (rec.m) {
-      await quietDeleteMessage(env, userId, rec.m);
-    }
-  }
+  await dbConfigDelete(`promptat:${userId}`, env);
 }
 
 // 过期通行证清扫：用户下次互动时顺手删掉过期通行证消息并清记录。
+// 删除用「值仍是读到的那份」的原子条件删：期间被重发的新证不受影响。
 async function sweepExpiredPass(env, userId) {
-  const rec = await passRecordGet(userId, env);
+  const key = `pass:${userId}`;
+  const raw = await dbConfigGet(key, env);
 
-  if (rec && Number(rec.e) <= Date.now()) {
-    await dbConfigDelete(`pass:${userId}`, env);
-
-    if (rec.m) {
-      await quietDeleteMessage(env, userId, rec.m);
-    }
+  if (!raw) {
+    return;
   }
+
+  let rec = null;
+
+  try {
+    rec = JSON.parse(raw);
+  } catch {
+    return;
+  }
+
+  if (!rec?.n || Number(rec.e) > Date.now()) {
+    return;
+  }
+
+  const deleted = await dbConfigDeleteIfValue(
+    key,
+    raw,
+    env
+  );
+
+  if (deleted && rec.m) {
+    await quietDeleteMessage(env, userId, rec.m);
+  }
+}
+
+// 验证提示节流：同一用户 3 分钟内只发一次提示，
+// 挡住待验证访客刷消息放大 Telegram 调用与 D1 写入。
+const PROMPT_RESEND_MIN_MS = 180000;
+
+async function promptThrottled(env, userId) {
+  const last = Number(
+    (await dbConfigGet(`promptat:${userId}`, env)) || 0
+  );
+
+  return Date.now() - last < PROMPT_RESEND_MIN_MS;
+}
+
+async function markPromptSent(env, userId) {
+  await dbConfigPut(
+    `promptat:${userId}`,
+    String(Date.now()),
+    env
+  );
 }
 
 // 校验 Telegram Mini App initData 并返回打开者用户 ID：
@@ -4035,6 +4132,10 @@ async function sendTurnstilePrompt(
   env,
   origin
 ) {
+  if (await promptThrottled(env, chatId)) {
+    return;
+  }
+
   const base = getPublicOrigin(
     origin,
     env
@@ -4062,6 +4163,8 @@ async function sendTurnstilePrompt(
       'verify_prompt_msg_id',
       promptSent?.message_id
     );
+
+    await markPromptSent(env, chatId);
 
     return;
   }
@@ -4100,6 +4203,8 @@ async function sendTurnstilePrompt(
     'verify_prompt_msg_id',
     promptSent?.message_id
   );
+
+  await markPromptSent(env, chatId);
 }
 
 function renderVerifyPage(env, params) {
@@ -4556,7 +4661,8 @@ async function handleVerifyConfirm(
       'https://challenges.cloudflare.com/turnstile/v0/siteverify',
       {
         method: 'POST',
-        body: form
+        body: form,
+        signal: AbortSignal.timeout(10000)
       }
     );
 
@@ -4624,6 +4730,13 @@ async function handleVerifyConfirm(
   const user =
     await dbUserGetOrCreate(u, env);
 
+  if (Number(user.is_blocked || 0) === 1) {
+    return jsonResponse(403, {
+      ok: false,
+      error: 'blocked'
+    });
+  }
+
   if (
     user.user_state !==
     USER_STATE.VERIFIED
@@ -4638,22 +4751,30 @@ async function handleVerifyConfirm(
 
     await cleanupAfterVerified(env, u);
 
-    const successSent = await telegramApi(
-      env.BOT_TOKEN,
-      'sendMessage',
-      {
-        chat_id: u,
-        text:
-          '🎉 验证成功！现在可以开始发送消息了。'
-      }
-    );
+    try {
+      const successSent = await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: u,
+          text:
+            '🎉 验证成功！现在可以开始发送消息了。'
+        }
+      );
 
-    await trackSlotMessage(
-      env,
-      u,
-      'receipt_msg_id',
-      successSent?.message_id
-    );
+      await trackSlotMessage(
+        env,
+        u,
+        'receipt_msg_id',
+        successSent?.message_id
+      );
+    } catch (error) {
+      // 状态已保存，通知失败只记日志，不让接口报 500 误导用户。
+      console.error(
+        '验证成功后通知用户失败：',
+        error?.message || error
+      );
+    }
   }
 
   return jsonResponse(200, {
@@ -5354,6 +5475,8 @@ async function handleAdminCommand(
       },
       env
     );
+
+    await voidUserPass(env, userId);
 
     await sendTopicNotice(
       message,
@@ -6873,6 +6996,9 @@ async function purgeManagedUser(
     }
   }
 
+  // 连带作废未用通行证（删记录并删证消息），防删档后凭旧证复活。
+  await voidUserPass(env, userId);
+
   await env.TG_BOT_DB.batch([
     env.TG_BOT_DB.prepare(
       'DELETE FROM messages WHERE user_id = ?'
@@ -6897,6 +7023,16 @@ async function purgeManagedUser(
 
   await dbConfigDelete(
     `botblocked:${userId}`,
+    env
+  );
+
+  await dbConfigDelete(
+    `pausenote:${userId}`,
+    env
+  );
+
+  await dbConfigDelete(
+    `promptat:${userId}`,
     env
   );
 
@@ -9154,6 +9290,8 @@ async function handleUserListAction(request, env) {
       env
     );
 
+    await voidUserPass(env, targetId);
+
     return Response.json({ ok: true });
   }
 
@@ -9215,12 +9353,16 @@ async function handleUserListAction(request, env) {
 
     const oldPass = await passRecordGet(targetId, env);
 
-    if (oldPass?.m) {
-      await quietDeleteMessage(env, targetId, oldPass.m);
-    }
-
     const exp = Date.now() + PASS_LINK_TTL_MS;
     const nonce = randomId();
+
+    // 先落记录再发送：发送环节出故障也不会出现「有链接、无记录」；
+    // 旧证在新记录落库的这一刻即失效（与此前口径一致）。
+    await dbConfigPut(
+      `pass:${targetId}`,
+      JSON.stringify({ n: nonce, e: exp }),
+      env
+    );
 
     const origin = new URL(request.url).origin;
     const passUrl = await buildPassUrl(
@@ -9252,7 +9394,12 @@ async function handleUserListAction(request, env) {
         }
       });
     } catch (error) {
-      await dbConfigDelete(`pass:${targetId}`, env);
+      // 只删本次这张（认随机数），不误伤并发发放的另一张新证。
+      const cur = await passRecordGet(targetId, env);
+
+      if (cur && cur.n === nonce) {
+        await dbConfigDelete(`pass:${targetId}`, env);
+      }
 
       return Response.json(
         {
@@ -9263,15 +9410,25 @@ async function handleUserListAction(request, env) {
       );
     }
 
-    await dbConfigPut(
-      `pass:${targetId}`,
-      JSON.stringify({
-        n: nonce,
-        e: exp,
-        m: passSent?.message_id || null
-      }),
-      env
-    );
+    // 回填消息 ID 前复检随机数：期间被另一张新证顶替时不覆盖对方的记录。
+    const cur = await passRecordGet(targetId, env);
+
+    if (cur && cur.n === nonce) {
+      await dbConfigPut(
+        `pass:${targetId}`,
+        JSON.stringify({
+          n: nonce,
+          e: exp,
+          m: passSent?.message_id || null
+        }),
+        env
+      );
+    }
+
+    // 新证确认送达后，再删上一张证的消息。
+    if (oldPass?.m) {
+      await quietDeleteMessage(env, targetId, oldPass.m);
+    }
 
     return Response.json({ ok: true, passExp: exp });
   }
@@ -9834,12 +9991,21 @@ async function getPauseState(env) {
   const until = Number(state.until || 0);
 
   if (until && Date.now() >= until) {
+    // 原子占用：并发读到过期的多个调用里，只让抢到的一方发通知。
+    const wonNotice = await dbConfigClaim(
+      'sys:pause-notified',
+      String(state.episode),
+      env
+    );
+
     await dbConfigDelete(PAUSE_STATE_KEY, env);
 
-    await notifyPrimaryAdmins(
-      env,
-      '⏰ 服务熔断时间已到，机器人已自动恢复服务。'
-    );
+    if (wonNotice) {
+      await notifyPrimaryAdmins(
+        env,
+        '⏰ 服务熔断时间已到，机器人已自动恢复服务。'
+      );
+    }
 
     return null;
   }
@@ -10012,12 +10178,15 @@ async function pauseGateDrops(update, env) {
     )) === 'true';
 
   if (replyEnabled) {
-    const marker = await dbConfigGet(
+    // 先原子占用再发送：并发触发也只发出一条；
+    // 发送失败则释放占用，允许下一次触发重试。
+    const wonReply = await dbConfigClaim(
       `pausenote:${actorId}`,
+      state.episode,
       env
     );
 
-    if (marker !== state.episode) {
+    if (wonReply) {
       const replyText = await getConfig(
         'pause_reply_text',
         env,
@@ -10038,13 +10207,12 @@ async function pauseGateDrops(update, env) {
           '发送服务熔断回复失败：',
           error?.message || error
         );
-      }
 
-      await setConfig(
-        `pausenote:${actorId}`,
-        state.episode,
-        env
-      );
+        await dbConfigDelete(
+          `pausenote:${actorId}`,
+          env
+        );
+      }
     }
   }
 
@@ -10166,8 +10334,7 @@ export default {
       );
 
       return new Response(
-        `Initialization Error: ` +
-        `${error?.message || error}`,
+        'Initialization Error',
         {
           status: 500,
           headers: {
