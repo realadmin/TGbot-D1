@@ -21,7 +21,7 @@
  *   录 90 天清理；verified_ttl_days 到期删用户行与话题映射，回来
  *   的人会新建话题。
  * 功能清单（与仓库 README-增强版 条目对应）
- * Turnstile / 问答双验证与回退；引用转发（含部分引用，三级降级）；
+ * Turnstile / 问答双验证与回退；管理员一次性通行证（网页用户列表发放，机器人私聊送达，30 分钟有效、凭 Telegram 身份确认、用后即焚，救济怎么也过不了验证的用户）；引用转发（含部分引用，三级降级）；
  * 反应双向同步；原地编辑同步 + 回复关联的 ✏️ 提示（Bot API 编辑
  * 无原生标记）；拉黑 / 取消拉黑提醒（my_chat_member + 403 兜底、
  * 标记去重）；/delete 按配对连带删除私聊原消息（原生删除无机器人
@@ -3349,7 +3349,7 @@ async function showMainMenu(
 
     keyboard.push([
       {
-        text: '📋 用户列表（网页版）',
+        text: '📋 用户列表',
         web_app: {
           url: await buildUserListUrl(
             listOrigin,
@@ -3531,6 +3531,7 @@ async function handleVerification(
 /* -------------------------------------------------------------------------- */
 
 const VERIFY_LINK_TTL_MS = 10 * 60 * 1000;
+const PASS_LINK_TTL_MS = 30 * 60 * 1000;
 
 function isTurnstileConfigured(env) {
   return Boolean(
@@ -3686,6 +3687,145 @@ async function checkVerifySignature(
     expected,
     String(signature || '')
   );
+}
+
+
+async function buildPassUrl(origin, userId, nonce, exp, env) {
+  const signature = await hmacSha256Hex(
+    env.WEBHOOK_SECRET,
+    `pass:${userId}:${exp}:${nonce}`
+  );
+
+  const params = new URLSearchParams({
+    u: String(userId),
+    e: String(exp),
+    n: String(nonce),
+    s: signature
+  });
+
+  return `${origin}/pass?${params.toString()}`;
+}
+
+async function checkPassSignature(userId, expRaw, nonce, signature, env) {
+  const uid = String(userId || '');
+
+  if (!/^\d{1,20}$/.test(uid)) {
+    return false;
+  }
+
+  const exp = Number(expRaw);
+  const now = Date.now();
+
+  if (
+    !Number.isFinite(exp) ||
+    exp <= now ||
+    exp > now + PASS_LINK_TTL_MS + 60 * 1000
+  ) {
+    return false;
+  }
+
+  const expected = await hmacSha256Hex(
+    env.WEBHOOK_SECRET,
+    `pass:${uid}:${exp}:${String(nonce || '')}`
+  );
+
+  return timingSafeEqualString(
+    expected,
+    String(signature || '')
+  );
+}
+
+async function passRecordGet(userId, env) {
+  const raw = await dbConfigGet(`pass:${userId}`, env);
+
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const rec = JSON.parse(raw);
+    return rec && rec.n ? rec : null;
+  } catch {
+    return null;
+  }
+}
+
+// 校验 Telegram Mini App initData 并返回打开者用户 ID：
+// 链接可以被转发，只有打开者本人与通行证绑定用户一致才算数。
+async function telegramInitDataUserId(initDataRaw, botToken) {
+  try {
+    const params = new URLSearchParams(String(initDataRaw || ''));
+    const hash = params.get('hash');
+
+    if (!hash) {
+      return null;
+    }
+
+    params.delete('hash');
+
+    const pairs = [];
+
+    for (const [k, v] of params.entries()) {
+      pairs.push(`${k}=${v}`);
+    }
+
+    pairs.sort();
+
+    const enc = new TextEncoder();
+
+    const webAppKey = await crypto.subtle.importKey(
+      'raw',
+      enc.encode('WebAppData'),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+
+    const secret = await crypto.subtle.sign(
+      'HMAC',
+      webAppKey,
+      enc.encode(String(botToken || ''))
+    );
+
+    const secretKey = await crypto.subtle.importKey(
+      'raw',
+      secret,
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+
+    const sig = await crypto.subtle.sign(
+      'HMAC',
+      secretKey,
+      enc.encode(pairs.join('\n'))
+    );
+
+    const hex = [...new Uint8Array(sig)]
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+
+    if (!timingSafeEqualString(hex, hash)) {
+      return null;
+    }
+
+    const authDate = Number(params.get('auth_date') || 0);
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    if (
+      !authDate ||
+      authDate > nowSec + 300 ||
+      nowSec - authDate > 3600
+    ) {
+      return null;
+    }
+
+    const user = JSON.parse(params.get('user') || 'null');
+
+    return user && user.id != null ? String(user.id) : null;
+  } catch {
+    return null;
+  }
 }
 
 async function sendTestVerifyPrompt(
@@ -3913,6 +4053,189 @@ function renderVerifyPage(env, params) {
 </script>
 </body>
 </html>`;
+}
+
+
+function buildPassPage(params) {
+  const payload = JSON.stringify({
+    u: String(params.u),
+    e: String(params.e),
+    n: String(params.n),
+    s: String(params.s)
+  }).replace(/</g, '\\u003c');
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>验证通行证</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 0; padding: 24px 16px; background: #17212b; color: #fff; }
+  main { max-width: 420px; margin: 0 auto; text-align: center; }
+  h1 { font-size: 20px; margin: 8px 0 12px; }
+  p { color: #a7b5c4; font-size: 14px; line-height: 1.6; }
+  button { margin-top: 14px; padding: 12px 22px; font-size: 16px; border: 0; border-radius: 10px; background: #2b5278; color: #fff; cursor: pointer; }
+  button:disabled { opacity: .55; cursor: default; }
+  #status { min-height: 24px; color: #fff; margin-top: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🎫 验证通行证</h1>
+  <p>管理员为你发放了一张一次性通行证。<br>点击下方按钮即可通过验证，回到对话就能直接发消息。</p>
+  <button id="go">✅ 确认通过验证</button>
+  <p id="status"></p>
+</main>
+<script>
+  var payload = ${payload};
+  var btn = document.getElementById('go');
+  var st = document.getElementById('status');
+  if (window.Telegram && Telegram.WebApp) { Telegram.WebApp.ready(); Telegram.WebApp.expand(); }
+  btn.addEventListener('click', function () {
+    var initData = (window.Telegram && Telegram.WebApp && Telegram.WebApp.initData) || '';
+    if (!initData) {
+      st.textContent = '请从 Telegram 里打开这张通行证，不要用浏览器直接打开链接。';
+      return;
+    }
+    btn.disabled = true;
+    st.textContent = '正在确认…';
+    var body = { u: payload.u, e: payload.e, n: payload.n, s: payload.s, initData: initData };
+    fetch('/pass/confirm', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (d.ok) {
+        st.textContent = '🎉 验证成功！回到对话即可直接发消息。';
+        setTimeout(function () { if (window.Telegram && Telegram.WebApp) Telegram.WebApp.close(); }, 1200);
+      } else {
+        btn.disabled = false;
+        var msgs = {
+          bad_signature: '通行证无效或已过期，请联系管理员重新发放。',
+          bad_initdata: '无法确认你的 Telegram 身份，请从与机器人的对话里打开通行证。',
+          used_or_invalid: '这张通行证已使用或已失效，请联系管理员重新发放。',
+          blocked: '账号已被封禁，通行证无法使用，请联系管理员。'
+        };
+        st.textContent = msgs[d.error] || ('确认失败：' + (d.error || '未知错误'));
+      }
+    }).catch(function () {
+      btn.disabled = false;
+      st.textContent = '网络异常，请重试。';
+    });
+  });
+</script>
+</body>
+</html>`;
+}
+
+async function handlePassPage(request, env) {
+  const url = new URL(request.url);
+
+  const u = url.searchParams.get('u') || '';
+  const e = url.searchParams.get('e') || '';
+  const n = url.searchParams.get('n') || '';
+  const s = url.searchParams.get('s') || '';
+
+  const valid = await checkPassSignature(u, e, n, s, env);
+  const rec = valid ? await passRecordGet(u, env) : null;
+
+  if (!valid || !rec || rec.n !== n || Number(rec.e) !== Number(e)) {
+    return new Response(
+      '通行证无效或已失效，请联系管理员重新发放。',
+      {
+        status: 403,
+        headers: {
+          'content-type': 'text/plain; charset=utf-8',
+          'cache-control': 'no-store'
+        }
+      }
+    );
+  }
+
+  return new Response(buildPassPage({ u, e, n, s }), {
+    status: 200,
+    headers: {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store'
+    }
+  });
+}
+
+async function handlePassConfirm(request, env) {
+  const jsonResponse = (status, data) =>
+    new Response(JSON.stringify(data), {
+      status,
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store'
+      }
+    });
+
+  let body;
+
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse(400, { ok: false, error: 'bad_json' });
+  }
+
+  const u = String(body?.u || '');
+  const e = String(body?.e || '');
+  const n = String(body?.n || '');
+  const s = String(body?.s || '');
+
+  const valid = await checkPassSignature(u, e, n, s, env);
+
+  if (!valid) {
+    return jsonResponse(403, { ok: false, error: 'bad_signature' });
+  }
+
+  const openerId = await telegramInitDataUserId(
+    body?.initData,
+    env.BOT_TOKEN
+  );
+
+  if (openerId !== u) {
+    return jsonResponse(403, { ok: false, error: 'bad_initdata' });
+  }
+
+  const rec = await passRecordGet(u, env);
+
+  if (!rec || rec.n !== n || Number(rec.e) !== Number(e)) {
+    return jsonResponse(403, { ok: false, error: 'used_or_invalid' });
+  }
+
+  const user = await dbUserGetOrCreate(u, env);
+
+  if (Number(user.is_blocked || 0) === 1) {
+    return jsonResponse(403, { ok: false, error: 'blocked' });
+  }
+
+  await dbConfigDelete(`pass:${u}`, env);
+
+  if (user.user_state !== USER_STATE.VERIFIED) {
+    await dbUserUpdate(
+      u,
+      { user_state: USER_STATE.VERIFIED },
+      env
+    );
+
+    try {
+      await telegramApi(env.BOT_TOKEN, 'sendMessage', {
+        chat_id: u,
+        text: '🎉 验证成功！现在可以开始发送消息了。'
+      });
+    } catch (error) {
+      console.error(
+        '通行证通过后通知用户失败：',
+        error?.message || error
+      );
+    }
+  }
+
+  return jsonResponse(200, { ok: true });
 }
 
 async function handleVerifyPage(
@@ -6401,7 +6724,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.1.0';
+const BOT_VERSION = 'v1.2.0';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -8671,6 +8994,74 @@ async function handleUserListAction(request, env) {
     return Response.json({ ok: true });
   }
 
+  if (action === 'pass') {
+    const target = await dbUserGetOrCreate(targetId, env);
+
+    if (target.user_state === USER_STATE.VERIFIED) {
+      return Response.json(
+        { ok: false, error: '对方已是已验证状态' },
+        { status: 400 }
+      );
+    }
+
+    if (Number(target.is_blocked || 0) === 1) {
+      return Response.json(
+        { ok: false, error: '对方已被封禁，请先解封再发放' },
+        { status: 400 }
+      );
+    }
+
+    const exp = Date.now() + PASS_LINK_TTL_MS;
+    const nonce = randomId();
+
+    await dbConfigPut(
+      `pass:${targetId}`,
+      JSON.stringify({ n: nonce, e: exp }),
+      env
+    );
+
+    const origin = new URL(request.url).origin;
+    const passUrl = await buildPassUrl(
+      origin,
+      targetId,
+      nonce,
+      exp,
+      env
+    );
+
+    try {
+      await telegramApi(env.BOT_TOKEN, 'sendMessage', {
+        chat_id: targetId,
+        text:
+          '🎫 管理员为你发放了一张验证通行证\n\n' +
+          '如果人机验证一直过不去，点击下方按钮即可直接通过验证。\n' +
+          '⏰ 通行证 30 分钟内有效，且只能使用一次。',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: '🎫 使用通行证通过验证',
+                web_app: { url: passUrl }
+              }
+            ]
+          ]
+        }
+      });
+    } catch (error) {
+      await dbConfigDelete(`pass:${targetId}`, env);
+
+      return Response.json(
+        {
+          ok: false,
+          error: '通行证发送失败：对方可能已拉黑机器人'
+        },
+        { status: 502 }
+      );
+    }
+
+    return Response.json({ ok: true });
+  }
+
   return Response.json(
     { ok: false, error: 'unknown action' },
     { status: 400 }
@@ -8933,6 +9324,20 @@ function render() {
         else window.open(url, '_blank');
       };
       ops.appendChild(jb);
+    }
+    if (u.state !== 'verified') {
+      var pb = document.createElement('button');
+      pb.className = 'ntb';
+      pb.textContent = '🎫 通行证';
+      pb.onclick = function () {
+        pb.disabled = true;
+        act(u.id, 'pass', false).then(function (d) {
+          pb.disabled = false;
+          if (d.ok) toast('通行证已发送到对方私聊');
+          else toast('操作失败：' + (d.error || ''));
+        });
+      };
+      ops.appendChild(pb);
     }
     ops.appendChild(rb);
     var db = document.createElement('button');
@@ -9564,6 +9969,26 @@ export default {
         '/verify/confirm'
     ) {
       return handleVerifyConfirm(
+        request,
+        env
+      );
+    }
+
+    if (
+      request.method === 'GET' &&
+      requestUrl.pathname === '/pass'
+    ) {
+      return handlePassPage(
+        request,
+        env
+      );
+    }
+
+    if (
+      request.method === 'POST' &&
+      requestUrl.pathname === '/pass/confirm'
+    ) {
+      return handlePassConfirm(
         request,
         env
       );
