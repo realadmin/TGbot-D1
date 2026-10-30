@@ -18,6 +18,16 @@
  * 连带删除客人私聊中的原消息（机器人可删私聊 incoming 消息、
  * 限发送未满 48 小时）；客人已自行删除视为已删、不提示，其余
  * 失败在话题里留一行说明；话题侧删除与墓碑行为不变。
+ * 追加（菜单熔断说明补齐）：主人实测发现点主菜单按钮触发熔断时，
+ * 选完时长后的确认（浮动提示 + 主菜单已暂停状态行）没有到期通知
+ * 说明——说明此前只在选时长子菜单里。本版把说明补进主菜单的
+ * 已暂停状态行：暂停期间每次打开主菜单都看得到，与命令确认口径
+ * 一致。
+ * 追加（熔断到期通知说明）：按主人要求，开启熔断的确认消息
+ * （私聊 / 话题 / 菜单子菜单）、网页管理台提示与指南页都写明：
+ * 到期不会立刻发通知，恢复通知在到期后第一条消息到来时一并
+ * 送达；没人发消息时收不到通知是正常的，熔断其实已经结束。
+ * 惰性到期行为本身不变（主人确认通知晚点到没关系）。
  * 追加（紧急熔断）：新增机器人紧急暂停——主管理员私聊或话题里
  * /pause [分钟]（不带数字默认 60，上限 10080）暂停服务，暂停期间
  * 访客的消息 / 编辑 / 反应在入口直接丢弃（管理员与群侧不受影响），
@@ -3425,7 +3435,7 @@ async function showMainMenu(
   const pauseState = await getPauseState(env);
 
   const pauseLine = pauseState
-    ? `\n⏸ <b>已暂停服务</b>，${describePauseRemaining(pauseState)}`
+    ? `\n⏸ <b>已暂停服务</b>，${describePauseRemaining(pauseState)}\nℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，熔断其实已经结束。`
     : '';
 
   const text = `
@@ -4512,7 +4522,8 @@ async function handlePrivateMessage(
               text:
                 `⏸ 机器人正在暂停中，${describePauseRemaining(state)}。\n` +
                 '重新计时发送 /pause 分钟数，' +
-                '立即恢复发送 /resume。'
+                '立即恢复发送 /resume。\n' +
+                'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；若一直没人发消息，收不到通知是正常的——熔断其实已经结束，只是没通知。'
             }
           );
         } else {
@@ -4561,7 +4572,8 @@ async function handlePrivateMessage(
                   (replyOn
                     ? '，每位访客会收到一条回复提醒'
                     : '，且不会收到任何回复') +
-                  '。恢复请发送 /resume。'
+                  '。恢复请发送 /resume。\n' +
+                  'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；若一直没人发消息，收不到通知是正常的——熔断其实已经结束，只是没通知。'
               }
             );
           }
@@ -4869,7 +4881,7 @@ async function handleAdminCommand(
     if (!arg && state) {
       await sendTopicNotice(
         message,
-        `⏸ 机器人正在暂停中，${describePauseRemaining(state)}。`,
+        `⏸ 机器人正在暂停中，${describePauseRemaining(state)}。\nℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，熔断其实已经结束。`,
         env
       );
 
@@ -4903,7 +4915,7 @@ async function handleAdminCommand(
 
     await sendTopicNotice(
       message,
-      `⏸ 机器人已暂停服务，${describePauseRemaining(fresh)}。`,
+      `⏸ 机器人已暂停服务，${describePauseRemaining(fresh)}。\nℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，熔断其实已经结束。`,
       env
     );
 
@@ -6783,7 +6795,8 @@ async function handlePauseCallback(
         '⏸ <b>紧急暂停</b>\n\n' +
         '选择暂停时长。暂停期间访客的消息、编辑与反应' +
         '都会被丢弃（管理员不受影响），到期自动恢复，' +
-        '也可随时在主菜单或用 /resume 提前恢复。',
+        '也可随时在主菜单或用 /resume 提前恢复。\n' +
+        'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，熔断其实已经结束。',
       reply_markup: {
         inline_keyboard: [
           [
@@ -7489,7 +7502,7 @@ function buildGuidePage() {
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
       <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在。</li>
-      <li><b class=\"k\">被轰炸时先熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客的消息、编辑、反应一律丢弃、不补送；开启熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息。到期自动恢复，也可随时 <code>/resume</code> 提前恢复。</li>
+      <li><b class=\"k\">被轰炸时先熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客的消息、编辑、反应一律丢弃、不补送；开启熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
     </ul>
   </section>
 
@@ -7734,7 +7747,7 @@ function buildPanelPage() {
     <label>回复语句</label>
     <textarea id="f_pausereply" rows="2"></textarea>
     <button class="save" data-k="pause_reply_text" data-t="f_pausereply">保存</button>
-    <div class="hint">暂停期间访客的消息、编辑与表情反应都会被丢弃、不转发，恢复后不会补送，请提醒对方重发重要内容。已被封禁的用户不会收到回复。暂停到期会自动恢复，也可随时恢复。</div>
+    <div class="hint">暂停期间访客的消息、编辑与表情反应都会被丢弃、不转发，恢复后不会补送，请提醒对方重发重要内容。已被封禁的用户不会收到回复。暂停到期会自动恢复，也可随时恢复；到期时不会立刻发通知，恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的。</div>
   </section>
 </main>
 <div id="toast"></div>
