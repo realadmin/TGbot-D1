@@ -9,6 +9,11 @@
  * 追加（反应同步版）：转发时在 messages 表存消息配对（rxmap 索引），
  * 新增 message_reaction 处理，两侧反应经 setMessageReaction 双向镜像；
  * 需在 setWebhook 时用 allowed_updates 订阅 message_reaction 才有效。
+ * 追加（新手引导）：主菜单新增「📖 新手引导」网页按钮，
+ * GET /guide 小白向使用手册（复用 usrlist 签名、仅主管理员）：
+ * 项目说明、开始使用、验证、接待日常、命令速查、管理台、
+ * 用户列表与统计、版本更新、常见问题九节，纯静态页。
+ * 本版起版本号升至 v1.1.0（BOT_VERSION）。
  * 追加（管理台验证区调整）：基础配置里验证方式移到验证问题
  * 之前；选 Turnstile 时问题/答案两项整段隐藏（选静态问答才显示）。
  * 追加（列表页标签页）：网页用户列表改为「用户列表 / 数据统计」
@@ -3345,6 +3350,19 @@ async function showMainMenu(
         }
       }
     ]);
+
+    keyboard.push([
+      {
+        text: '📖 新手引导',
+        web_app: {
+          url: await buildGuideUrl(
+            listOrigin,
+            chatId,
+            env
+          )
+        }
+      }
+    ]);
   }
 
   keyboard.push([
@@ -6122,7 +6140,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.0.2';
+const BOT_VERSION = 'v1.1.0';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -6500,6 +6518,15 @@ async function buildUserListUrl(origin, adminId, env) {
   );
 }
 
+async function buildGuideUrl(origin, adminId, env) {
+  return buildSignedPanelUrl(
+    origin,
+    adminId,
+    env,
+    '/guide'
+  );
+}
+
 async function checkUserListAuth(uid, expRaw, signature, env) {
   const id = String(uid || '');
 
@@ -6859,6 +6886,187 @@ async function handlePanelPage(request, env) {
     buildPanelPage,
     '链接无效或已过期，请回到机器人主菜单重新打开网页管理台。'
   );
+}
+
+async function handleGuidePage(request, env) {
+  return signedPageResponse(
+    request,
+    env,
+    buildGuidePage,
+    '链接无效或已过期，请回到机器人主菜单重新打开新手引导。'
+  );
+}
+
+function buildGuidePage() {
+  return `<!doctype html>
+<html lang=\"zh-CN\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>新手引导</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-padding-top: 190px; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #0f1a24; color: #dbe6f2; padding-bottom: 30px; }
+  header { position: sticky; top: 0; background: #13222f; padding: 12px 14px 10px; border-bottom: 1px solid #22374a; z-index: 3; }
+  h1 { font-size: 19px; }
+  .sub { color: #9db2c5; font-size: 12.5px; margin-top: 3px; line-height: 1.55; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 9px; }
+  .chip { color: #b8cbdd; text-decoration: none; font-size: 12.5px; border: 1px solid #2b3a47; padding: 5px 10px; border-radius: 999px; }
+  main { padding: 12px; max-width: 760px; margin: 0 auto; }
+  section { background: #16242f; border: 1px solid #22374a; border-radius: 12px; padding: 14px 15px; margin-bottom: 12px; }
+  h2 { font-size: 16px; margin-bottom: 9px; }
+  p, li { font-size: 14px; line-height: 1.7; color: #c6d5e3; }
+  ul, ol { padding-left: 20px; }
+  li { margin: 3px 0; }
+  p { margin: 6px 0; }
+  code { background: #0d1620; border: 1px solid #2b3a47; border-radius: 6px; padding: 1px 6px; font-size: 13px; color: #9fd0ff; white-space: nowrap; }
+  .cmd { display: flex; gap: 10px; padding: 7px 0; border-bottom: 1px dashed #22374a; align-items: baseline; }
+  .cmd:last-child { border-bottom: 0; }
+  .cmd div { font-size: 13.5px; line-height: 1.6; color: #c6d5e3; }
+  .tip { background: #2a2118; border: 1px solid #57452a; color: #ecd9ac; border-radius: 10px; padding: 9px 12px; font-size: 13.5px; line-height: 1.65; margin-top: 9px; }
+  .q { font-weight: 600; color: #eef5fb; margin-top: 11px; font-size: 14px; }
+  b.k { color: #fff; }
+</style>
+</head>
+<body>
+<header id="ghead">
+  <h1>📖 新手引导</h1>
+  <div class=\"sub\">双向客服机器人使用手册 · 当前版本 ${BOT_VERSION}<br>看完这一页，就能上手接待访客了。</div>
+  <div class=\"chips\">
+    <a class=\"chip\" href=\"#g-intro\">项目说明</a>
+    <a class=\"chip\" href=\"#g-start\">开始使用</a>
+    <a class=\"chip\" href=\"#g-verify\">验证</a>
+    <a class=\"chip\" href=\"#g-chat\">接待日常</a>
+    <a class=\"chip\" href=\"#g-cmd\">命令速查</a>
+    <a class=\"chip\" href=\"#g-panel\">网页管理台</a>
+    <a class=\"chip\" href=\"#g-users\">用户列表</a>
+    <a class=\"chip\" href=\"#g-update\">版本更新</a>
+    <a class=\"chip\" href=\"#g-faq\">常见问题</a>
+  </div>
+</header>
+<main>
+
+  <section id=\"g-intro\">
+    <h2>🧭 项目说明</h2>
+    <p>这是一个<b class=\"k\">双向客服机器人</b>。访客在私聊里给机器人发消息，消息会自动转到管理员群里一个属于他本人的专属「话题」；你在话题里打字回复，机器人再把话带回访客的私聊。一人一个话题，谁和谁的话分得清清楚楚，不会串线。</p>
+    <ul>
+      <li>它是在开源项目 TGbot-D1（3.0.5）基础上增强的版本：真人验证、表情同步、消息编辑同步、拉黑提醒、网页管理台、用户列表与数据统计、自动检查更新，都包含在你现在用的这一版里。</li>
+      <li><b class=\"k\">隐私口径：</b>机器人只负责「搬运」消息，<b class=\"k\">不保存聊天正文</b>。数据库里只留转发所需的配对记录，并只保留 90 天。</li>
+      <li><b class=\"k\">费用：</b>它跑在 Cloudflare 的免费额度上，日常使用量完全免费，不用绑卡。</li>
+    </ul>
+  </section>
+
+  <section id=\"g-start\">
+    <h2>🚀 开始使用</h2>
+    <ol>
+      <li><b class=\"k\">打开主菜单：</b>在机器人私聊里发送 <code>/start</code>，网页管理台、用户列表和这本引导都在这里。</li>
+      <li><b class=\"k\">先定验证方式：</b>进「网页管理台 → 基础配置」，选一种验证方式（推荐 Turnstile，访客点一下就通过），顺便把欢迎消息改成你想对访客说的第一句话。</li>
+      <li><b class=\"k\">把机器人发给访客：</b>访客打开私聊、完成验证之后给你发消息，你的群里就会自动多出一个以他名字命名的话题。</li>
+      <li><b class=\"k\">在话题里直接回复：</b>不需要任何额外设置，在他的话题里打字、发图，就是发给他本人。</li>
+    </ol>
+    <div class=\"tip\">访客那边的视角：打开机器人 → 点「开始」→ 按提示完成一次验证 → 直接打字聊天。验证只做一次，之后不用再验。</div>
+  </section>
+
+  <section id=\"g-verify\">
+    <h2>🛡 验证</h2>
+    <p>验证是用来挡垃圾机器人和广告号的：没通过验证的人，发什么都不会转进群里。</p>
+    <ul>
+      <li><b class=\"k\">Turnstile 小程序验证（推荐）：</b>访客点「开始验证」按钮，弹出一个小页面自动完成人机校验，几秒通过，体验最顺。</li>
+      <li><b class=\"k\">静态问答验证：</b>你出一道题，访客答对才放行；答案可以准备多个，用竖线 <code>|</code> 分隔，答中任意一个都算对。</li>
+      <li><b class=\"k\">在哪里切换：</b>网页管理台 → 基础配置 → 验证方式。选了 Turnstile 后，问题和答案两项会自动隐藏；如果还没配好 Turnstile 密钥，机器人会自动用问答模式兜底，不会把人卡死。</li>
+      <li><b class=\"k\">让某人重新验证：</b>打开他的话题，发送 <code>/reverify</code>，他下一次发消息前要重新过一遍验证。</li>
+      <li><b class=\"k\">自己先试一遍：</b>私聊发送 <code>/testverify</code> 会拿到一个测试验证链接，点开能看到访客眼中的验证页长什么样；测试模式只是看看样子，不会真的放行或记录任何人。</li>
+    </ul>
+  </section>
+
+  <section id=\"g-chat\">
+    <h2>💬 接待日常</h2>
+    <ul>
+      <li><b class=\"k\">资料卡：</b>每个话题顶部都钉着访客的资料卡（名字、ID、状态、你的备注）。卡片不见了就在话题里发 <code>/card</code> 重新生成；卡片上的按钮可以直接封禁、解封、静音、刷新。</li>
+      <li><b class=\"k\">引用回复会跟着走：</b>你在话题里引用某条消息再回复，访客那边看到的也是引用着他原话的回复；访客引用着回复你时同理，连他框选一小段文字的「部分引用」都会原样带过去。</li>
+      <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，旁边出现一行「✏️ 对方修改了这条消息」的小提示。Telegram 不给机器人提供官方的「已编辑」标记，这行提示就是补这个用的；访客编辑他的消息时，你这边也一样。</li>
+      <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。</li>
+      <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
+      <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在。</li>
+    </ul>
+  </section>
+
+  <section id=\"g-cmd\">
+    <h2>⌨️ 命令速查</h2>
+    <p>下面这些命令都在<b class=\"k\">访客的话题里</b>发送（在私聊里发没用）：</p>
+    <div class=\"cmd\"><code>/ban</code><div>封禁这位访客：他的消息不再转进来。</div></div>
+    <div class=\"cmd\"><code>/unban</code><div>解除封禁，恢复正常转发。</div></div>
+    <div class=\"cmd\"><code>/delete</code><div>先回复选中一条消息、再发这条命令：双向删除那条消息。</div></div>
+    <div class=\"cmd\"><code>/terminate</code><div>结束会话并删掉整个话题（删了找不回来，谨慎用）。</div></div>
+    <div class=\"cmd\"><code>/card</code><div>重新生成这个话题的资料卡。</div></div>
+    <div class=\"cmd\"><code>/reverify</code><div>让这位访客重新做一次验证。</div></div>
+    <div class=\"cmd\"><code>/note 内容</code><div>给这位访客存一条只有管理员看得到的备注（如「老客户，注意时效」）；只发 /note 是查看，/notedelete 是删除。</div></div>
+    <p style=\"margin-top:10px\">在<b class=\"k\">私聊</b>里用的命令：</p>
+    <div class=\"cmd\"><code>/start</code><div>打开主菜单。</div></div>
+    <div class=\"cmd\"><code>/testverify</code><div>拿一条验证页的测试链接，自己先体验一遍。</div></div>
+    <div class=\"cmd\"><code>/version</code><div>查看当前版本，以及有没有新版本。</div></div>
+  </section>
+
+  <section id=\"g-panel\">
+    <h2>🛠 网页管理台</h2>
+    <p>从主菜单打开，<b class=\"k\">只有主管理员能进</b>。所有设置都集中在这里，改完点对应的「保存」立即生效：</p>
+    <ul>
+      <li><b class=\"k\">基础配置：</b>欢迎消息、验证方式与题目、已验证超时清理。超时清理填一个天数（比如 90），长期没动静的用户会被自动清除并释放位置；填 0 表示永不自动清。注意：被清掉的人下次再来会新建一个话题，老话题会留着当存档。</li>
+      <li><b class=\"k\">类型过滤：</b>不想转发的消息类型（贴纸、语音、视频等）在这里关掉，对方发了也不会过到对面去。</li>
+      <li><b class=\"k\">屏蔽关键词：</b>访客的话里出现关键词会被拦下并记一次数，次数达到你设的阈值就自动封禁他。不会写正则表达式也没关系，直接填普通词句就行。</li>
+      <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
+      <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到用户列表。</li>
+    </ul>
+    <div class=\"tip\">管理台的网页链接 30 分钟过期；打开时提示过期，回主菜单重新点一次就行。</div>
+  </section>
+
+  <section id=\"g-users\">
+    <h2>📋 用户列表与数据统计</h2>
+    <ul>
+      <li><b class=\"k\">两个标签页：</b>「用户列表」和「数据统计」，默认打开列表页，点顶部标签切换。</li>
+      <li><b class=\"k\">找人：</b>顶部搜索框可以按名字、用户名、数字 ID、甚至你写的备注来搜；下面的「全部 / 已验证 / 待验证 / 已屏蔽」是快速筛选；还能换排序顺序。</li>
+      <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「删除」（删掉他的记录，可勾选连话题一起删）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。</li>
+      <li><b class=\"k\">统计页：</b>能看到用户总数、已验证 / 待验证人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
+    </ul>
+  </section>
+
+  <section id=\"g-update\">
+    <h2>🔄 版本与更新</h2>
+    <ul>
+      <li>主菜单底部有一行当前版本号；有新版本时，那一行会变成可以点开的链接，机器人也会私聊通知主管理员一次（只通知一次，不刷屏）。</li>
+      <li>想手动确认时，点主菜单的「🔄 检查更新」；查太勤会被限速（5 分钟最多查一次），这是故意的，防止白白消耗额度。</li>
+      <li>升级不丢东西：用户、配置、备注都存在数据库里，按项目仓库里的部署教程、换上新版文件重新部署即可。</li>
+    </ul>
+  </section>
+
+  <section id=\"g-faq\">
+    <h2>❓ 常见问题</h2>
+    <p class=\"q\">关掉某个话题，是不是就把这个访客停掉了？</p>
+    <p>不是。关话题只对普通群成员生效，机器人和管理员照样能在里面发消息。想真正停掉一个访客，在他的话题里发 /ban；想连话题一起清掉，发 /terminate。</p>
+    <p class=\"q\">输入 / 时，/note 这些新命令不出现在候选里？</p>
+    <p>那是 Telegram App 自己缓存了旧的命令名单，彻底关掉 App 再重开就会刷新；等不及也可以把命令手打全，一样有效。</p>
+    <p class=\"q\">编辑过的消息为什么没有官方的「已编辑」小字？</p>
+    <p>Telegram 不允许机器人给消息加官方编辑标记，所以机器人用一行「✏️ 对方修改了这条消息」的提示代替，一样看得懂。</p>
+    <p class=\"q\">贴的表情为什么显示成机器人贴的？</p>
+    <p>Telegram 只允许机器人以自己的名义贴表情，同步到对方那边自然显示机器人名字，这个改不了。</p>
+    <p class=\"q\">访客说验证一直过不了，怎么办？</p>
+    <p>先让他换个网络或重启 App 再试；你也可以发 /testverify 自己点一遍，看看验证页是否正常，或者在管理台临时把验证方式切成静态问答，让他先通过。</p>
+    <p class=\"q\">网页打开提示「链接无效或已过期」？</p>
+    <p>管理台、用户列表和这本引导的链接都是 30 分钟有效的签名链接，回机器人主菜单重新打开即可。</p>
+  </section>
+
+</main>
+<script>
+  function gFixPad() {
+    var hd = document.getElementById('ghead');
+    if (hd) document.documentElement.style.scrollPaddingTop = (hd.offsetHeight + 10) + 'px';
+  }
+  window.addEventListener('resize', gFixPad);
+  gFixPad();
+</script>
+</body>
+</html>`;
 }
 
 function buildPanelPage() {
@@ -8348,6 +8556,16 @@ export default {
       requestUrl.pathname === '/panel'
     ) {
       return handlePanelPage(
+        request,
+        env
+      );
+    }
+
+    if (
+      request.method === 'GET' &&
+      requestUrl.pathname === '/guide'
+    ) {
+      return handleGuidePage(
         request,
         env
       );
