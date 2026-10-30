@@ -31,7 +31,7 @@
  * 台（原按钮菜单已下线，旧按钮回迁移提示）；新手引导 /guide；
  * 自动检查更新；服务熔断 /pause /resume（手动触发，闸门在去重之
  * 前；到期惰性恢复——由到期后第一条更新触发解除并通知，属刻意
- * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员。
+ * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数。
  * 三页（指南 / 管理台 / 访客列表）约定
  * - 页眉 position:fixed + 脚本实测高度补偿 body padding-top，
  *   不要改回 sticky：iOS 上 sticky 在滚动中逐帧重定位会闪烁。
@@ -131,6 +131,10 @@ async function ensureBotCommands(env) {
           {
             command: 'delete',
             description: '删除被回复的消息'
+          },
+          {
+            command: 'clear',
+            description: '清空与当前话题访客的全部聊天记录'
           },
           {
             command: 'terminate',
@@ -5392,6 +5396,7 @@ async function handleAdminCommand(
   'ban',
   'unban',
   'delete',
+  'clear',
   'terminate',
   'card',
   'reverify',
@@ -5859,6 +5864,62 @@ async function handleAdminCommand(
 
     return true;
   }
+  if (parsed.command === 'clear') {
+    const userId =
+      await resolveTopicUserId(
+        message,
+        env
+      );
+
+    if (!userId) {
+      await sendTopicNotice(
+        message,
+        '❌ 找不到该话题对应的访客 ID。',
+        env
+      );
+
+      return true;
+    }
+
+    await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: env.ADMIN_GROUP_ID,
+        message_thread_id: Number(topicId),
+        text:
+          `🧹 确认清空与访客 ${userId} 的全部聊天记录？\n` +
+          '将删除：话题内的全部转发副本、访客私聊中的全部聊天副本，以及全部消息配对记录。\n' +
+          '注意：私聊里 48 小时前的消息删不掉，执行后会报告条数。\n' +
+          '话题本身和访客档案保留，对方之后仍可继续聊天。',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: '🧹 确认清空',
+                callback_data:
+                  `clear:yes:${userId}`
+              },
+              {
+                text: '取消',
+                callback_data:
+                  `clear:no:${userId}`
+              }
+            ]
+          ]
+        }
+      }
+    );
+
+    await quietDeleteMessage(
+      env,
+      env.ADMIN_GROUP_ID,
+      message.message_id
+    );
+
+    return true;
+  }
+
 if (parsed.command === 'card') {
   const userId =
     await resolveTopicUserId(
@@ -6881,6 +6942,15 @@ async function handleCallbackQuery(
     return;
   }
 
+  if (data.startsWith('clear:')) {
+    await handleClearCallback(
+      callbackQuery,
+      env
+    );
+
+    return;
+  }
+
   if (data.startsWith('updchk:')) {
     await handleUpdateCheckCallback(
       callbackQuery,
@@ -7030,6 +7100,296 @@ async function handleMyChatMember(
   ) {
     await noteBotUnblocked(userId, env);
   }
+}
+
+// 整段对话清空：按 rxmap 配对收集一位访客在私聊与话题两侧的全部消息编号
+// （含 ✏️ 编辑提示消息），供批量删除使用。配对值 'gone'（已单独删除的墓碑）跳过。
+async function collectConversationMessageIds(
+  userId,
+  env
+) {
+  const pairRows = await env.TG_BOT_DB.prepare(
+    'SELECT message_id, text FROM messages ' +
+    'WHERE user_id = ? AND (message_id LIKE ? ' +
+    'OR (message_id LIKE ? AND text LIKE ?))'
+  ).bind(
+    REACTION_MAP_USER,
+    `p:${userId}:%`,
+    't:%',
+    `${userId}:%`
+  ).all();
+
+  const privateIds = new Set();
+  const topicIds = new Set();
+
+  for (const row of pairRows.results || []) {
+    const mid = String(row.message_id || '');
+    const text = String(row.text || '');
+
+    if (text === 'gone') {
+      continue;
+    }
+
+    if (mid.startsWith(`p:${userId}:`)) {
+      const priv = Number(
+        mid.slice(`p:${userId}:`.length)
+      );
+      const topic = Number(text);
+
+      if (priv) privateIds.add(priv);
+      if (topic) topicIds.add(topic);
+    } else if (mid.startsWith('t:')) {
+      const topic = Number(mid.slice(2));
+      const priv = Number(text.split(':')[1]);
+
+      if (topic) topicIds.add(topic);
+      if (priv) privateIds.add(priv);
+    }
+  }
+
+  const hintRows = await env.TG_BOT_DB.prepare(
+    'SELECT message_id, text FROM messages ' +
+    'WHERE user_id = ? AND message_id LIKE ?'
+  ).bind(
+    REACTION_MAP_USER,
+    `hint:p:${userId}:%`
+  ).all();
+
+  for (const row of hintRows.results || []) {
+    const hid = Number(row.text);
+
+    if (hid) topicIds.add(hid);
+  }
+
+  for (const topicId of [...topicIds]) {
+    const hint = await dbMessageDataGet(
+      REACTION_MAP_USER,
+      `hint:t:${topicId}`,
+      env
+    );
+
+    const hid = Number(hint?.text);
+
+    if (hid) privateIds.add(hid);
+  }
+
+  return {
+    privateIds: [...privateIds],
+    topicIds: [...topicIds]
+  };
+}
+
+// 批量删除并计数：整批失败时退回逐条删，
+// 「消息不存在」按既有口径视为已删。
+async function deleteMessagesCounted(
+  env,
+  chatId,
+  ids
+) {
+  let ok = 0;
+  let failed = 0;
+
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100);
+
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'deleteMessages',
+        {
+          chat_id: chatId,
+          message_ids: chunk
+        }
+      );
+
+      ok += chunk.length;
+    } catch {
+      for (const id of chunk) {
+        try {
+          await telegramApi(
+            env.BOT_TOKEN,
+            'deleteMessage',
+            {
+              chat_id: chatId,
+              message_id: id
+            }
+          );
+
+          ok += 1;
+        } catch (error) {
+          if (
+            /not found/i.test(
+              String(error?.message || error)
+            )
+          ) {
+            ok += 1;
+          } else {
+            failed += 1;
+          }
+        }
+      }
+    }
+  }
+
+  return { ok, failed };
+}
+
+// 清空执行体：删私聊副本（必做）+ 话题内副本（可选），
+// 然后删掉该访客的全部配对与提示记账行。
+async function wipeConversationCopies(
+  userId,
+  env,
+  includeTopicContents
+) {
+  const { privateIds, topicIds } =
+    await collectConversationMessageIds(
+      userId,
+      env
+    );
+
+  const priv = await deleteMessagesCounted(
+    env,
+    userId,
+    privateIds
+  );
+
+  let topic = { ok: 0, failed: 0 };
+
+  if (includeTopicContents) {
+    topic = await deleteMessagesCounted(
+      env,
+      env.ADMIN_GROUP_ID,
+      topicIds
+    );
+  }
+
+  await env.TG_BOT_DB.prepare(
+    'DELETE FROM messages WHERE user_id = ? ' +
+    'AND (message_id LIKE ? ' +
+    'OR (message_id LIKE ? AND text LIKE ?) ' +
+    'OR message_id LIKE ?)'
+  ).bind(
+    REACTION_MAP_USER,
+    `p:${userId}:%`,
+    't:%',
+    `${userId}:%`,
+    `hint:p:${userId}:%`
+  ).run();
+
+  for (const topicId of topicIds) {
+    await dbMessageDataDelete(
+      REACTION_MAP_USER,
+      `hint:t:${topicId}`,
+      env
+    );
+  }
+
+  return { private: priv, topic };
+}
+
+// /clear 的确认按钮回调：clear:yes:<访客ID> / clear:no:<访客ID>。
+async function handleClearCallback(
+  callbackQuery,
+  env
+) {
+  const data = String(callbackQuery.data || '');
+  const parts = data.split(':');
+  const action = parts[1];
+  const userId = parts[2] || '';
+
+  const clickerId = String(
+    callbackQuery.from?.id || ''
+  );
+
+  if (
+    !userId ||
+    !(await isAdminUser(clickerId, env))
+  ) {
+    await answerCallback(
+      callbackQuery.id,
+      env,
+      '无权操作。',
+      true
+    );
+
+    return;
+  }
+
+  const msg = callbackQuery.message || {};
+  const chatId = msg.chat?.id;
+  const threadId = msg.message_thread_id;
+
+  const editConfirm = async (text) => {
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'editMessageText',
+        {
+          chat_id: chatId,
+          message_id: msg.message_id,
+          text
+        }
+      );
+    } catch {
+      /* 确认消息已被删时忽略 */
+    }
+  };
+
+  if (action === 'no') {
+    await answerCallback(callbackQuery.id, env);
+
+    await editConfirm('🚫 已取消清空，聊天记录未动。');
+
+    return;
+  }
+
+  if (action !== 'yes') {
+    return;
+  }
+
+  const target =
+    await dbUserGetOrCreate(userId, env);
+
+  if (
+    !target.topic_id ||
+    String(target.topic_id) !== String(threadId)
+  ) {
+    await answerCallback(
+      callbackQuery.id,
+      env,
+      '该话题已不属于这位访客。',
+      true
+    );
+
+    return;
+  }
+
+  await answerCallback(
+    callbackQuery.id,
+    env,
+    '正在清空…'
+  );
+
+  const wipe = await wipeConversationCopies(
+    userId,
+    env,
+    true
+  );
+
+  const lines = [
+    `🧹 已清空与访客 ${userId} 的聊天记录：`,
+    `· 话题内删除 ${wipe.topic.ok} 条` +
+      (wipe.topic.failed
+        ? `，${wipe.topic.failed} 条删除失败`
+        : ''),
+    `· 私聊删除 ${wipe.private.ok} 条` +
+      (wipe.private.failed
+        ? `，${wipe.private.failed} 条删不掉（多为超过 48 小时）`
+        : ''),
+    '话题与访客档案已保留，对方之后仍可继续聊天。'
+  ];
+
+  await editConfirm(lines.join('\n'));
 }
 
 async function purgeManagedUser(
@@ -8119,6 +8479,7 @@ function buildGuidePage() {
       <li><b class=\"k\">引用回复会跟着走：</b>你在话题里引用某条消息再回复，访客那边看到的也是引用着他原话的回复；访客引用着回复你时同理，连他框选一小段文字的「部分引用」都会原样带过去。</li>
       <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，旁边出现一行「✏️ 对方修改了这条消息」的小提示。Telegram 不给机器人提供官方的「已编辑」标记，这行提示就是补这个用的；访客编辑他的消息时，你这边也一样。</li>
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。注意：访客私聊那边的原消息只能删 48 小时以内的，超了删不掉时会在话题里留一行说明。</li>
+      <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
       <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在。</li>
       <li><b class=\"k\">被轰炸时先开启服务熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客新发的消息会被机器人当场删除、不补送——消息发出去就消失，就是还在暂停的信号；对熔断前已送达消息的编辑和反应照常同步到话题副本，两边记录保持一致；开启服务熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息；恢复服务时，那条「请稍后再试」会自动改成「✅ 服务已恢复」，访客一看便知。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
@@ -8132,6 +8493,7 @@ function buildGuidePage() {
     <div class=\"cmd\"><code>/unban</code><div>解除封禁，恢复正常转发。</div></div>
     <div class=\"cmd\"><code>/delete</code><div>先回复选中一条消息、再发这条命令：双向删除那条消息。</div></div>
     <div class=\"cmd\"><code>/terminate</code><div>结束会话并删掉整个话题（删了找不回来，谨慎用）。</div></div>
+    <div class=\"cmd\"><code>/clear</code><div>清空和这位访客的整段聊天记录：话题里的转发副本和访客私聊里的副本一起删（会先弹确认按钮），话题和访客档案保留；私聊里 48 小时前的消息删不掉，清完会报告条数。</div></div>
     <div class=\"cmd\"><code>/card</code><div>重新生成这个话题的资料卡。</div></div>
     <div class=\"cmd\"><code>/reverify</code><div>让这位访客重新做一次验证。</div></div>
     <div class=\"cmd\"><code>/note 内容</code><div>给这位访客存一条只有管理员看得到的备注（如「老客户，注意时效」）；只发 /note 是查看，/notedelete 是删除。备注除了显示在资料卡上，还会同步到话题名最前面（格式「备注｜名字 (ID)」），在群的话题列表里一眼就能看到。</div></div>
@@ -8163,7 +8525,7 @@ function buildGuidePage() {
     <ul>
       <li><b class=\"k\">两个标签页：</b>「访客列表」和「数据统计」，默认打开列表页，点顶部标签切换。</li>
       <li><b class=\"k\">找人：</b>顶部搜索框可以按名字、用户名、数字 ID、甚至你写的备注来搜；下面的「全部 / 已验证 / 待验证 / 已屏蔽」是快速筛选；还能换排序顺序。</li>
-      <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（删掉他的记录，可勾选连话题一起删）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。</li>
+      <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。</li>
       <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
     </ul>
   </section>
@@ -9405,13 +9767,27 @@ async function handleUserListAction(request, env) {
   }
 
   if (action === 'delete') {
+    const withTopic = body?.deleteTopic === true;
+
+    let wipe = null;
+
+    if (withTopic) {
+      // 连话题版先清私聊副本（话题稍后整体删除，
+      // 话题内副本随话题一并消失，不逐条删）。
+      wipe = await wipeConversationCopies(
+        targetId,
+        env,
+        false
+      );
+    }
+
     await purgeManagedUser(
       targetId,
-      body?.deleteTopic === true,
+      withTopic,
       env
     );
 
-    return Response.json({ ok: true });
+    return Response.json({ ok: true, wipe });
   }
 
   if (action === 'pass') {
@@ -9829,9 +10205,9 @@ function render() {
         else toast('操作失败：' + (d.error || ''));
       });
     }));
-    cf.appendChild(mk('b', '连话题一起删', function () {
+    cf.appendChild(mk('b', '连话题、私聊一起清空', function () {
       act(u.id, 'delete', true).then(function (d) {
-        if (d.ok) { all = all.filter(function (x) { return x.id !== u.id; }); toast('已删除记录与话题'); render(); }
+        if (d.ok) { all = all.filter(function (x) { return x.id !== u.id; }); toast(d.wipe ? ('已清空：私聊删除 ' + d.wipe.private.ok + ' 条' + (d.wipe.private.failed ? '，' + d.wipe.private.failed + ' 条超过 48 小时删不掉' : '') + '，话题与记录已删除') : '已删除记录与话题'); render(); }
         else toast('操作失败：' + (d.error || ''));
       });
     }));
