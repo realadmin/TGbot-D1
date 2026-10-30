@@ -14,6 +14,10 @@
  * 项目说明、开始使用、验证、接待日常、命令速查、管理台、
  * 用户列表与统计、版本更新、常见问题九节，纯静态页。
  * 本版起版本号升至 v1.1.0（BOT_VERSION）。
+ * 追加（连带删除版）：/delete 删除话题侧消息后，按 rxmap 配对
+ * 连带删除客人私聊中的原消息（机器人可删私聊 incoming 消息、
+ * 限发送未满 48 小时）；客人已自行删除视为已删、不提示，其余
+ * 失败在话题里留一行说明；话题侧删除与墓碑行为不变。
  * 追加（管理台验证区调整）：基础配置里验证方式移到验证问题
  * 之前；选 Turnstile 时问题/答案两项整段隐藏（选静态问答才显示）。
  * 追加（列表页标签页）：网页用户列表改为「用户列表 / 数据统计」
@@ -2781,6 +2785,8 @@ async function tombstoneTopicMessage(
   // 管理员用 /delete 删掉话题侧消息后调用：把该消息的同步
   // 映射标记为 gone 并清掉路由行与提示，之后对它的编辑/反应
   // 一律静默丢弃，防止被删内容借回退通知重新出现。
+  let resolvedPair = null;
+
   try {
     const now =
       Math.floor(Date.now() / 1000);
@@ -2803,6 +2809,11 @@ async function tombstoneTopicMessage(
 
         const privateMessageId =
           pair.text.slice(separator + 1);
+
+        resolvedPair = {
+          userId,
+          privateMessageId
+        };
 
         await dbMessageDataPut(
           REACTION_MAP_USER,
@@ -2899,6 +2910,8 @@ async function tombstoneTopicMessage(
       error?.message || error
     );
   }
+
+  return resolvedPair;
 }
 
 function extractEmojiReactions(
@@ -4875,6 +4888,8 @@ async function handleAdminCommand(
       return true;
     }
 
+    let deletedPair = null;
+
     try {
       await telegramApi(
         env.BOT_TOKEN,
@@ -4886,10 +4901,11 @@ async function handleAdminCommand(
         }
       );
 
-      await tombstoneTopicMessage(
-        repliedMessage.message_id,
-        env
-      );
+      deletedPair =
+        await tombstoneTopicMessage(
+          repliedMessage.message_id,
+          env
+        );
 
       await telegramApi(
         env.BOT_TOKEN,
@@ -4907,6 +4923,38 @@ async function handleAdminCommand(
         `${error?.message || error}`,
         env
       );
+    }
+
+    // 连带删除客人私聊中的原消息（存在配对时）：
+    // 客人已自行删除（not found）视为已删、不提示；
+    // 其余失败（如消息超过 48 小时、机器人被拉黑）
+    // 在话题里留一行说明，话题侧删除结果不变。
+    if (deletedPair) {
+      try {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'deleteMessage',
+          {
+            chat_id: deletedPair.userId,
+            message_id:
+              Number(
+                deletedPair.privateMessageId
+              )
+          }
+        );
+      } catch (error) {
+        const reason =
+          error?.message || String(error);
+
+        if (!/not found/i.test(reason)) {
+          await sendTopicNotice(
+            message,
+            '⚠️ 话题侧已删除，但客人私聊中的' +
+              `原消息删除失败：${reason}`,
+            env
+          );
+        }
+      }
     }
 
     return true;
