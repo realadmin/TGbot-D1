@@ -18,6 +18,16 @@
  * 连带删除客人私聊中的原消息（机器人可删私聊 incoming 消息、
  * 限发送未满 48 小时）；客人已自行删除视为已删、不提示，其余
  * 失败在话题里留一行说明；话题侧删除与墓碑行为不变。
+ * 追加（紧急熔断）：新增机器人紧急暂停——主管理员私聊或话题里
+ * /pause [分钟]（不带数字默认 60，上限 10080）暂停服务，暂停期间
+ * 访客的消息 / 编辑 / 反应在入口直接丢弃（管理员与群侧不受影响），
+ * 到期由下一条更新惰性自动恢复并通知主管理员；/resume 随时恢复。
+ * 主菜单带暂停状态与暂停 / 恢复按钮（时长子菜单），网页管理台
+ * 新增「紧急熔断」区（状态、暂停 / 恢复、回复开关与语句）。
+ * 熔断回复：暂停期间可给访客回一句可改的话（默认「请稍后再试」，
+ * pause_reply_enabled / pause_reply_text 两项配置），每位访客每轮
+ * 暂停最多一条（pausenote:<uid> 记本轮 episode）；已封禁者不回。
+ * 闸门置于去重之前，轰炸时每条更新只多一次配置读。
  * 追加（指南平滑滚动）：章节按钮跳转改带平滑滚动动画
  * （scrollIntoView behavior:smooth，CSS 侧同步开启），
  * 系统开启减动效偏好时自动退回瞬时跳转。
@@ -159,6 +169,8 @@ const DEFAULTS = {
   block_keywords: '[]',
   block_threshold: '5',
   verified_ttl_days: '0',
+  pause_reply_enabled: 'true',
+  pause_reply_text: '请稍后再试',
   authorized_admins: '[]',
 
   enable_image_forwarding: 'true',
@@ -177,6 +189,7 @@ const LIMITS = {
   verif_a: 300,
   authorized_admins: 2000,
   block_keyword: 200,
+  pause_reply_text: 500,
   auto_reply_pattern: 200,
   auto_reply_response: 4000,
   filter_text: 5000
@@ -245,6 +258,14 @@ async function ensureBotCommands(env) {
           {
             command: 'notedelete',
             description: '删除当前话题用户的备注'
+          },
+          {
+            command: 'pause',
+            description: '紧急暂停机器人（/pause 分钟）'
+          },
+          {
+            command: 'resume',
+            description: '恢复机器人服务'
           }
         ]
       }
@@ -271,6 +292,14 @@ async function ensureBotCommands(env) {
           {
             command: 'version',
             description: '查看版本与检查更新'
+          },
+          {
+            command: 'pause',
+            description: '紧急暂停机器人（可带分钟数）'
+          },
+          {
+            command: 'resume',
+            description: '恢复机器人服务'
           }
         ]
       }
@@ -3393,10 +3422,16 @@ async function showMainMenu(
       ? `\n\n当前版本：${BOT_VERSION}｜🆕 <a href="${escapeHtml(updateCache.url)}">有新版本 ${escapeHtml(updateCache.tag)}</a>`
       : `\n\n当前版本：${BOT_VERSION}`;
 
+  const pauseState = await getPauseState(env);
+
+  const pauseLine = pauseState
+    ? `\n⏸ <b>已暂停服务</b>，${describePauseRemaining(pauseState)}`
+    : '';
+
   const text = `
 ⚙️ <b>机器人主菜单</b>
 
-管理面板已搬到网页。${versionLine}
+管理面板已搬到网页。${versionLine}${pauseLine}
   `.trim();
 
   const keyboard = [];
@@ -3453,6 +3488,22 @@ async function showMainMenu(
       callback_data: 'updchk:check'
     }
   ]);
+
+  if (pauseState) {
+    keyboard.push([
+      {
+        text: '▶️ 恢复服务',
+        callback_data: 'pause:resume'
+      }
+    ]);
+  } else {
+    keyboard.push([
+      {
+        text: '⏸ 紧急暂停',
+        callback_data: 'pause:menu'
+      }
+    ]);
+  }
 
   const reply_markup = {
     inline_keyboard: keyboard
@@ -4416,6 +4467,111 @@ async function handlePrivateMessage(
     return;
   }
 
+  const pauseMatch = commandText.match(
+    /^\/pause(?:\s+(\d+))?$/
+  );
+
+  if (pauseMatch || commandText === '/resume') {
+    if (isPrimary) {
+      if (commandText === '/resume') {
+        const state = await getPauseState(env);
+
+        if (!state) {
+          await telegramApi(
+            env.BOT_TOKEN,
+            'sendMessage',
+            {
+              chat_id: chatId,
+              text: '当前没有处于暂停状态。'
+            }
+          );
+        } else {
+          await performResume(env, userId);
+
+          await telegramApi(
+            env.BOT_TOKEN,
+            'sendMessage',
+            {
+              chat_id: chatId,
+              text:
+                '▶️ 机器人已恢复服务，' +
+                '访客消息恢复正常转发。'
+            }
+          );
+        }
+      } else {
+        const state = await getPauseState(env);
+        const arg = pauseMatch[1];
+
+        if (!arg && state) {
+          await telegramApi(
+            env.BOT_TOKEN,
+            'sendMessage',
+            {
+              chat_id: chatId,
+              text:
+                `⏸ 机器人正在暂停中，${describePauseRemaining(state)}。\n` +
+                '重新计时发送 /pause 分钟数，' +
+                '立即恢复发送 /resume。'
+            }
+          );
+        } else {
+          const minutes = arg
+            ? Number(arg)
+            : PAUSE_DEFAULT_MINUTES;
+
+          if (
+            !Number.isInteger(minutes) ||
+            minutes < 1 ||
+            minutes > PAUSE_MAX_MINUTES
+          ) {
+            await telegramApi(
+              env.BOT_TOKEN,
+              'sendMessage',
+              {
+                chat_id: chatId,
+                text:
+                  '⚠️ 用法：/pause [分钟数]，' +
+                  '例如 /pause 30；不带数字默认 60 分钟，' +
+                  '最大 10080 分钟（7 天）。'
+              }
+            );
+          } else {
+            const fresh = await performPause(
+              env,
+              minutes,
+              userId
+            );
+
+            const replyOn =
+              (await getConfig(
+                'pause_reply_enabled',
+                env,
+                'true'
+              )) === 'true';
+
+            await telegramApi(
+              env.BOT_TOKEN,
+              'sendMessage',
+              {
+                chat_id: chatId,
+                text:
+                  `⏸ 机器人已暂停服务，${describePauseRemaining(fresh)}。\n` +
+                  '暂停期间访客的消息、编辑与反应都会被丢弃' +
+                  (replyOn
+                    ? '，每位访客会收到一条回复提醒'
+                    : '，且不会收到任何回复') +
+                  '。恢复请发送 /resume。'
+              }
+            );
+          }
+        }
+      }
+    }
+
+    return;
+  }
+
   const user =
     await dbUserGetOrCreate(
       userId,
@@ -4652,7 +4808,9 @@ async function handleAdminCommand(
   'card',
   'reverify',
   'note',
-  'notedelete'
+  'notedelete',
+  'pause',
+  'resume'
 ]);
 
   if (!allowedCommands.has(parsed.command)) {
@@ -4666,6 +4824,89 @@ async function handleAdminCommand(
     await isAdminUser(senderId, env);
 
   if (!isAdmin) {
+    return true;
+  }
+
+  if (
+    parsed.command === 'pause' ||
+    parsed.command === 'resume'
+  ) {
+    if (!isPrimaryAdmin(senderId, env)) {
+      await sendTopicNotice(
+        message,
+        '⚠️ 熔断开关仅主管理员可操作。',
+        env
+      );
+
+      return true;
+    }
+
+    if (parsed.command === 'resume') {
+      const state = await getPauseState(env);
+
+      if (!state) {
+        await sendTopicNotice(
+          message,
+          '当前没有处于暂停状态。',
+          env
+        );
+      } else {
+        await performResume(env, senderId);
+
+        await sendTopicNotice(
+          message,
+          '▶️ 机器人已恢复服务。',
+          env
+        );
+      }
+
+      return true;
+    }
+
+    const state = await getPauseState(env);
+    const arg = String(parsed.argument || '').trim();
+
+    if (!arg && state) {
+      await sendTopicNotice(
+        message,
+        `⏸ 机器人正在暂停中，${describePauseRemaining(state)}。`,
+        env
+      );
+
+      return true;
+    }
+
+    const minutes = arg
+      ? Number(arg)
+      : PAUSE_DEFAULT_MINUTES;
+
+    if (
+      !Number.isInteger(minutes) ||
+      minutes < 1 ||
+      minutes > PAUSE_MAX_MINUTES
+    ) {
+      await sendTopicNotice(
+        message,
+        '⚠️ 用法：/pause [分钟数]，例如 /pause 30；' +
+          '不带数字默认 60 分钟。',
+        env
+      );
+
+      return true;
+    }
+
+    const fresh = await performPause(
+      env,
+      minutes,
+      senderId
+    );
+
+    await sendTopicNotice(
+      message,
+      `⏸ 机器人已暂停服务，${describePauseRemaining(fresh)}。`,
+      env
+    );
+
     return true;
   }
 
@@ -6041,6 +6282,15 @@ async function handleCallbackQuery(
     return;
   }
 
+  if (data.startsWith('pause:')) {
+    await handlePauseCallback(
+      callbackQuery,
+      env
+    );
+
+    return;
+  }
+
   if (data.startsWith('updchk:')) {
     await handleUpdateCheckCallback(
       callbackQuery,
@@ -6500,6 +6750,127 @@ function describeUpdateState(cache) {
     line:
       `最新版本：${cache.tag}（已是最新，上次成功检查：${timeText}）`
   };
+}
+
+async function handlePauseCallback(
+  callbackQuery,
+  env
+) {
+  const senderId = String(callbackQuery.from.id);
+  const callbackId = callbackQuery.id;
+  const messageId =
+    callbackQuery.message?.message_id || 0;
+  const data = String(callbackQuery.data || '');
+
+  if (!isPrimaryAdmin(senderId, env)) {
+    await answerCallback(
+      callbackId,
+      env,
+      '⚠️ 熔断开关仅主管理员可操作。',
+      true
+    );
+
+    return;
+  }
+
+  if (data === 'pause:menu') {
+    await answerCallback(callbackId, env);
+
+    await renderMenu(env, {
+      chatId: senderId,
+      messageId,
+      text:
+        '⏸ <b>紧急暂停</b>\n\n' +
+        '选择暂停时长。暂停期间访客的消息、编辑与反应' +
+        '都会被丢弃（管理员不受影响），到期自动恢复，' +
+        '也可随时在主菜单或用 /resume 提前恢复。',
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: '30 分钟',
+              callback_data: 'pause:for:30'
+            },
+            {
+              text: '60 分钟',
+              callback_data: 'pause:for:60'
+            }
+          ],
+          [
+            {
+              text: '4 小时',
+              callback_data: 'pause:for:240'
+            },
+            {
+              text: '24 小时',
+              callback_data: 'pause:for:1440'
+            }
+          ],
+          [
+            {
+              text: '↩️ 返回主菜单',
+              callback_data: 'menu:main'
+            }
+          ]
+        ]
+      }
+    });
+
+    return;
+  }
+
+  if (data.startsWith('pause:for:')) {
+    const minutes = Number(
+      data.slice('pause:for:'.length)
+    );
+
+    if (
+      !Number.isInteger(minutes) ||
+      minutes < 1 ||
+      minutes > PAUSE_MAX_MINUTES
+    ) {
+      await answerCallback(
+        callbackId,
+        env,
+        '时长无效。',
+        true
+      );
+
+      return;
+    }
+
+    const state = await performPause(
+      env,
+      minutes,
+      senderId
+    );
+
+    await answerCallback(
+      callbackId,
+      env,
+      `⏸ 已暂停，${describePauseRemaining(state)}`
+    );
+
+    await showMainMenu(senderId, env, messageId);
+
+    return;
+  }
+
+  if (data === 'pause:resume') {
+    await performResume(env, senderId);
+
+    await answerCallback(
+      callbackId,
+      env,
+      '▶️ 已恢复服务'
+    );
+
+    await showMainMenu(senderId, env, messageId);
+
+    return;
+  }
+
+  await answerCallback(callbackId, env);
 }
 
 async function handleUpdateCheckCallback(
@@ -7118,6 +7489,7 @@ function buildGuidePage() {
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
       <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在。</li>
+      <li><b class=\"k\">被轰炸时先熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客的消息、编辑、反应一律丢弃、不补送；开启熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息。到期自动恢复，也可随时 <code>/resume</code> 提前恢复。</li>
     </ul>
   </section>
 
@@ -7135,6 +7507,8 @@ function buildGuidePage() {
     <div class=\"cmd\"><code>/start</code><div>打开主菜单。</div></div>
     <div class=\"cmd\"><code>/testverify</code><div>拿一条验证页的测试链接，自己先体验一遍。</div></div>
     <div class=\"cmd\"><code>/version</code><div>查看当前版本，以及有没有新版本。</div></div>
+    <div class=\"cmd\"><code>/pause 60</code><div>紧急暂停机器人 60 分钟（不写数字 = 60 分钟，话题里也能发）：期间访客消息一律丢弃，到期自动恢复。</div></div>
+    <div class=\"cmd\"><code>/resume</code><div>立即恢复机器人服务（话题里也能发）。</div></div>
   </section>
 
   <section id=\"g-panel\">
@@ -7146,6 +7520,7 @@ function buildGuidePage() {
       <li><b class=\"k\">屏蔽关键词：</b>访客的话里出现关键词会被拦下并记一次数，次数达到你设的阈值就自动封禁他。不会写正则表达式也没关系，直接填普通词句就行。</li>
       <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
       <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到用户列表。</li>
+      <li><b class=\"k\">紧急熔断：</b>被消息轰炸时在这里一键暂停机器人（或用 /pause 命令），可设定暂停时长、到期自动恢复；还能设置暂停期间给访客的回复语句，或关掉回复保持完全静默。</li>
     </ul>
     <div class=\"tip\">管理台的网页链接 30 分钟过期；打开时提示过期，回主菜单重新点一次就行。</div>
   </section>
@@ -7272,6 +7647,7 @@ function buildPanelPage() {
     <a class="chip" href="#sec-keyword">屏蔽关键词</a>
     <a class="chip" href="#sec-reply">自动回复</a>
     <a class="chip" href="#sec-admin">协管员</a>
+    <a class="chip" href="#sec-pause">紧急熔断</a>
   </div>
 </header>
 <main id="main">
@@ -7341,6 +7717,24 @@ function buildPanelPage() {
     <div class="hint">协管员可在话题里回复访客、使用话题命令与资料卡按钮，但不能改配置。主管理员不在此列。</div>
     <button class="save" data-k="authorized_admins" data-t="f_admins">保存</button>
     <button class="save danger" id="admins_clear">清空协管员</button>
+  </section>
+  <section id="sec-pause" hidden>
+    <h2>⏸ 紧急熔断（暂停服务）</h2>
+    <div class="hint" id="pause_status">读取中…</div>
+    <label>暂停时长（分钟，1～10080）</label>
+    <input type="number" id="f_pause_min" min="1" max="10080" step="1" value="60">
+    <button class="save danger" id="pause_start">⏸ 暂停机器人</button>
+    <button class="save" id="pause_resume">▶️ 恢复服务</button>
+    <label>熔断期间回复访客</label>
+    <select id="f_pausereplymode">
+      <option value="true">开启：每位访客每轮暂停最多收到一条</option>
+      <option value="false">关闭：完全静默</option>
+    </select>
+    <button class="save" data-k="pause_reply_enabled" data-t="f_pausereplymode">保存</button>
+    <label>回复语句</label>
+    <textarea id="f_pausereply" rows="2"></textarea>
+    <button class="save" data-k="pause_reply_text" data-t="f_pausereply">保存</button>
+    <div class="hint">暂停期间访客的消息、编辑与表情反应都会被丢弃、不转发，恢复后不会补送，请提醒对方重发重要内容。已被封禁的用户不会收到回复。暂停到期会自动恢复，也可随时恢复。</div>
   </section>
 </main>
 <div id="toast"></div>
@@ -7507,6 +7901,30 @@ document.getElementById('admins_clear').onclick = function () {
   });
 };
 
+function renderPauseStatus(st) {
+  var el = document.getElementById('pause_status');
+  if (!el) return;
+  if (st && st.active) {
+    el.textContent = '当前状态：⏸ 已暂停，' + (st.remaining_text || '') + '。';
+  } else {
+    el.textContent = '当前状态：▶️ 正常服务中。';
+  }
+}
+document.getElementById('pause_start').onclick = function () {
+  var m = Number(document.getElementById('f_pause_min').value);
+  if (!Number.isInteger(m) || m < 1 || m > 10080) { toast('暂停时长必须是 1～10080 的整数分钟'); return; }
+  post('/api/config/pause', { action: 'pause', minutes: m }).then(function (d) {
+    if (d.ok) { renderPauseStatus(d.pause_state); toast('已暂停机器人'); }
+    else toast('暂停失败：' + (d.error || ''));
+  });
+};
+document.getElementById('pause_resume').onclick = function () {
+  post('/api/config/pause', { action: 'resume' }).then(function (d) {
+    if (d.ok) { renderPauseStatus(d.pause_state); toast('已恢复服务'); }
+    else toast('恢复失败：' + (d.error || ''));
+  });
+};
+
 function applyVmode() {
   var quiz = document.getElementById('f_verifymode').value === 'quiz';
   document.getElementById('w_verifq').style.display = quiz ? '' : 'none';
@@ -7532,6 +7950,9 @@ fetch('/api/config?' + qs.toString())
     document.getElementById('f_ttl').value = d.verified_ttl_days;
     document.getElementById('f_threshold').value = d.block_threshold;
     document.getElementById('f_admins').value = (d.authorizedAdmins || []).join(', ');
+    document.getElementById('f_pausereply').value = d.pause_reply_text || '请稍后再试';
+    document.getElementById('f_pausereplymode').value = d.pause_reply_enabled ? 'true' : 'false';
+    renderPauseStatus(d.pause_state);
     KW = d.keywords || [];
     RP = d.autoReplies || [];
     renderFilters(d.filters || {});
@@ -7670,6 +8091,29 @@ function validateScalarConfig(key, rawValue) {
     return { value: JSON.stringify(ids) };
   }
 
+  if (key === 'pause_reply_enabled') {
+    if (raw !== 'true' && raw !== 'false') {
+      return { error: '开关值无效' };
+    }
+
+    return { value: raw };
+  }
+
+  if (key === 'pause_reply_text') {
+    if (!raw.trim()) {
+      return { error: '内容不能为空' };
+    }
+
+    if (raw.length > LIMITS.pause_reply_text) {
+      return {
+        error:
+          `回复语句最多允许 ${LIMITS.pause_reply_text} 个字符`
+      };
+    }
+
+    return { value: raw };
+  }
+
   return { error: '不允许修改的配置项' };
 }
 
@@ -7744,6 +8188,19 @@ async function handleConfigApi(request, env) {
       'turnstile'
     ),
     turnstileReady: isTurnstileConfigured(env),
+    pause_reply_enabled:
+      (await getConfig(
+        'pause_reply_enabled',
+        env,
+        'true'
+      )) === 'true',
+    pause_reply_text: await getConfig(
+      'pause_reply_text',
+      env,
+      '请稍后再试'
+    ),
+    pause_state:
+      await describePauseStateForPanel(env),
     verified_ttl_days:
       Number(
         await getConfig('verified_ttl_days', env, '0')
@@ -7841,6 +8298,60 @@ async function handleConfigToggle(request, env) {
   );
 
   return Response.json({ ok: true });
+}
+
+async function handleConfigPause(request, env) {
+  const parsed = await readPanelPostBody(request, env);
+
+  if (parsed.response) {
+    return parsed.response;
+  }
+
+  const { body } = parsed;
+  const action = String(body?.action || '');
+
+  if (action === 'pause') {
+    const minutes = Number(body?.minutes);
+
+    if (
+      !Number.isInteger(minutes) ||
+      minutes < 1 ||
+      minutes > PAUSE_MAX_MINUTES
+    ) {
+      return Response.json(
+        {
+          ok: false,
+          error: '暂停时长必须是 1～10080 的整数分钟'
+        },
+        { status: 400 }
+      );
+    }
+
+    const state = await performPause(env, minutes, '');
+
+    return Response.json({
+      ok: true,
+      pause_state: {
+        active: true,
+        until: state.until,
+        remaining_text: describePauseRemaining(state)
+      }
+    });
+  }
+
+  if (action === 'resume') {
+    await performResume(env, '');
+
+    return Response.json({
+      ok: true,
+      pause_state: { active: false }
+    });
+  }
+
+  return Response.json(
+    { ok: false, error: '未知操作' },
+    { status: 400 }
+  );
 }
 
 async function handleConfigList(request, env) {
@@ -8539,11 +9050,295 @@ fetch('/api/users?' + qs.toString())
 </html>`;
 }
 
+/* -------------------------------------------------------------------------- */
+/*                            紧急熔断（改版新增）                              */
+/* -------------------------------------------------------------------------- */
+
+const PAUSE_STATE_KEY = 'sys:pause';
+const PAUSE_DEFAULT_MINUTES = 60;
+const PAUSE_MAX_MINUTES = 10080;
+
+async function notifyPrimaryAdmins(
+  env,
+  text,
+  exceptId = ''
+) {
+  for (const adminId of getPrimaryAdminIds(env)) {
+    if (
+      exceptId &&
+      String(adminId) === String(exceptId)
+    ) {
+      continue;
+    }
+
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: adminId,
+          text,
+          parse_mode: 'HTML'
+        }
+      );
+    } catch (error) {
+      console.error(
+        '通知主管理员失败：',
+        error?.message || error
+      );
+    }
+  }
+}
+
+async function getPauseState(env) {
+  const raw = await dbConfigGet(
+    PAUSE_STATE_KEY,
+    env
+  );
+
+  if (!raw) {
+    return null;
+  }
+
+  const state = safeJsonParse(raw, null);
+
+  if (
+    !state ||
+    typeof state !== 'object' ||
+    !state.episode
+  ) {
+    return null;
+  }
+
+  const until = Number(state.until || 0);
+
+  if (until && Date.now() >= until) {
+    await dbConfigDelete(PAUSE_STATE_KEY, env);
+
+    await notifyPrimaryAdmins(
+      env,
+      '⏰ 熔断时间已到，机器人已自动恢复服务。'
+    );
+
+    return null;
+  }
+
+  return {
+    episode: String(state.episode),
+    until,
+    by: String(state.by || '')
+  };
+}
+
+async function startPause(env, minutes, byAdminId) {
+  const state = {
+    episode: String(Date.now()),
+    until: Date.now() + minutes * 60000,
+    by: String(byAdminId || '')
+  };
+
+  await setConfig(
+    PAUSE_STATE_KEY,
+    JSON.stringify(state),
+    env
+  );
+
+  return state;
+}
+
+async function stopPause(env) {
+  await dbConfigDelete(PAUSE_STATE_KEY, env);
+}
+
+function describePauseRemaining(state) {
+  if (!state?.until) {
+    return '手动恢复前一直暂停';
+  }
+
+  const totalMinutes = Math.max(
+    1,
+    Math.ceil((state.until - Date.now()) / 60000)
+  );
+
+  if (totalMinutes < 60) {
+    return `约 ${totalMinutes} 分钟后自动恢复`;
+  }
+
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+
+  return minutes > 0
+    ? `约 ${hours} 小时 ${minutes} 分钟后自动恢复`
+    : `约 ${hours} 小时后自动恢复`;
+}
+
+async function performPause(env, minutes, byAdminId) {
+  const state = await startPause(
+    env,
+    minutes,
+    byAdminId
+  );
+
+  await notifyPrimaryAdmins(
+    env,
+    '⏸ 机器人已紧急暂停服务，' +
+      `${describePauseRemaining(state)}。` +
+      '期间访客消息将被丢弃。',
+    byAdminId
+  );
+
+  return state;
+}
+
+async function performResume(env, byAdminId) {
+  await stopPause(env);
+
+  await notifyPrimaryAdmins(
+    env,
+    '▶️ 机器人已恢复服务。',
+    byAdminId
+  );
+}
+
+async function describePauseStateForPanel(env) {
+  const state = await getPauseState(env);
+
+  if (!state) {
+    return { active: false };
+  }
+
+  return {
+    active: true,
+    until: state.until,
+    remaining_text: describePauseRemaining(state)
+  };
+}
+
+// 暂停闸门：置于去重之前。返回 true 表示这条更新应被丢弃。
+// 只拦非管理员的私聊侧更新（消息 / 编辑 / 反应 / 按钮）；
+// 管理员与管理群侧永远放行，my_chat_member 等事件不拦。
+async function pauseGateDrops(update, env) {
+  let actorId = '';
+  let kind = '';
+
+  if (update.message) {
+    if (update.message.chat?.type !== 'private') {
+      return false;
+    }
+
+    actorId = String(update.message.from?.id || '');
+    kind = 'message';
+  } else if (update.edited_message) {
+    if (
+      update.edited_message.chat?.type !== 'private'
+    ) {
+      return false;
+    }
+
+    actorId = String(
+      update.edited_message.from?.id || ''
+    );
+    kind = 'edited_message';
+  } else if (update.message_reaction) {
+    if (
+      update.message_reaction.chat?.type !== 'private'
+    ) {
+      return false;
+    }
+
+    actorId = String(
+      update.message_reaction.user?.id || ''
+    );
+    kind = 'reaction';
+  } else if (update.callback_query) {
+    actorId = String(
+      update.callback_query.from?.id || ''
+    );
+    kind = 'callback';
+  } else {
+    return false;
+  }
+
+  if (!actorId) {
+    return false;
+  }
+
+  const state = await getPauseState(env);
+
+  if (!state) {
+    return false;
+  }
+
+  if (await isAdminUser(actorId, env)) {
+    return false;
+  }
+
+  if (kind === 'callback') {
+    return true;
+  }
+
+  const user = await dbUserGet(actorId, env);
+
+  if (user?.is_blocked) {
+    return true;
+  }
+
+  const replyEnabled =
+    (await getConfig(
+      'pause_reply_enabled',
+      env,
+      'true'
+    )) === 'true';
+
+  if (replyEnabled) {
+    const marker = await dbConfigGet(
+      `pausenote:${actorId}`,
+      env
+    );
+
+    if (marker !== state.episode) {
+      const replyText = await getConfig(
+        'pause_reply_text',
+        env,
+        '请稍后再试'
+      );
+
+      try {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: actorId,
+            text: replyText
+          }
+        );
+      } catch (error) {
+        console.error(
+          '发送熔断回复失败：',
+          error?.message || error
+        );
+      }
+
+      await setConfig(
+        `pausenote:${actorId}`,
+        state.episode,
+        env
+      );
+    }
+  }
+
+  return true;
+}
+
 async function handleUpdate(
   update,
   env,
   origin = ''
 ) {
+  if (await pauseGateDrops(update, env)) {
+    return;
+  }
+
   const accepted = await claimUpdate(
     update?.update_id,
     env
@@ -8772,6 +9567,16 @@ export default {
       requestUrl.pathname === '/api/config/list'
     ) {
       return handleConfigList(
+        request,
+        env
+      );
+    }
+
+    if (
+      request.method === 'POST' &&
+      requestUrl.pathname === '/api/config/pause'
+    ) {
+      return handleConfigPause(
         request,
         env
       );
