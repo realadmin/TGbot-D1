@@ -21,7 +21,7 @@
  *   录 90 天清理；verified_ttl_days 到期删用户行与话题映射，回来
  *   的人会新建话题。
  * 功能清单（与仓库 README-增强版 条目对应）
- * Turnstile / 问答双验证与回退；管理员一次性通行证（网页用户列表发放，机器人私聊送达，30 分钟有效、凭 Telegram 身份确认、用后即焚，救济怎么也过不了验证的用户）；引用转发（含部分引用，三级降级）；
+ * Turnstile / 问答双验证与回退；管理员一次性通行证（网页用户列表发放，机器人私聊送达，30 分钟有效、凭 Telegram 身份确认、用后即焚，救济怎么也过不了验证的用户）；验证提示、通行证与成功回执都会记录消息 ID 并自动清理：通过验证即撤回提示与未用通行证，成功回执在首条消息转发成功后撤回，过期通行证在用户下次互动时清扫，状态类消息只保留最新一条；用户列表会显示待验证用户的通行证状态（已发证剩余分钟），发证动作返回到期时间并即时刷新行内徽标；引用转发（含部分引用，三级降级）；
  * 反应双向同步；原地编辑同步 + 回复关联的 ✏️ 提示（Bot API 编辑
  * 无原生标记）；拉黑 / 取消拉黑提醒（my_chat_member + 403 兜底、
  * 标记去重）；/delete 按配对连带删除私聊原消息（原生删除无机器人
@@ -99,6 +99,8 @@ const USER_UPDATE_FIELDS = new Set([
   'info_card_message_id',
   'user_info_json',
   'admin_note',
+  'verify_prompt_msg_id',
+  'receipt_msg_id',
   'topic_creating',
   'topic_lock_at',
   'created_at',
@@ -622,6 +624,18 @@ async function dbMigrate(env) {
     env,
     'admin_note',
     "TEXT NOT NULL DEFAULT ''"
+  );
+
+  await ensureUserColumn(
+    env,
+    'verify_prompt_msg_id',
+    'INTEGER'
+  );
+
+  await ensureUserColumn(
+    env,
+    'receipt_msg_id',
+    'INTEGER'
   );
 }
 
@@ -2560,6 +2574,15 @@ async function relayUserMessageToTopic(
     );
   }
 
+  if (copiedMessageId) {
+    // 首条正经消息已送达话题，成功回执/状态通知使命完成，顺手撤回。
+    await clearSlotMessage(
+      env,
+      userId,
+      'receipt_msg_id'
+    );
+  }
+
 }
 
 async function relayAdminMessageToUser(
@@ -3445,13 +3468,20 @@ async function handleStart(
     const verificationQuestion =
       await getConfig('verif_q', env);
 
-    await telegramApi(
+    const promptSent = await telegramApi(
       env.BOT_TOKEN,
       'sendMessage',
       {
         chat_id: chatId,
         text: verificationQuestion
       }
+    );
+
+    await trackSlotMessage(
+      env,
+      chatId,
+      'verify_prompt_msg_id',
+      promptSent?.message_id
     );
   }
 
@@ -3513,7 +3543,9 @@ async function handleVerification(
     env
   );
 
-  await telegramApi(
+  await cleanupAfterVerified(env, chatId);
+
+  const successSent = await telegramApi(
     env.BOT_TOKEN,
     'sendMessage',
     {
@@ -3521,6 +3553,13 @@ async function handleVerification(
       text:
         '🎉 验证成功！现在可以开始发送消息了。'
     }
+  );
+
+  await trackSlotMessage(
+    env,
+    chatId,
+    'receipt_msg_id',
+    successSent?.message_id
   );
 
   return true;
@@ -3750,6 +3789,97 @@ async function passRecordGet(userId, env) {
   }
 }
 
+// 静默删一条机器人自己的消息：已被用户删掉、超期删不动等一律忽略。
+async function quietDeleteMessage(env, chatId, messageId) {
+  if (!messageId) {
+    return;
+  }
+
+  try {
+    await telegramApi(env.BOT_TOKEN, 'deleteMessage', {
+      chat_id: chatId,
+      message_id: Number(messageId)
+    });
+  } catch {
+    /* 删除失败不打扰主流程 */
+  }
+}
+
+// 记账槽位：column 为 verify_prompt_msg_id / receipt_msg_id。
+// 写入新 ID 前先删掉槽里的旧消息，保证同类消息只留最新一条。
+async function trackSlotMessage(env, userId, column, messageId) {
+  if (!messageId) {
+    return;
+  }
+
+  const user = await dbUserGetOrCreate(userId, env);
+  const oldId = Number(user?.[column] || 0);
+  const newId = Number(messageId);
+
+  if (oldId && oldId !== newId) {
+    await quietDeleteMessage(env, userId, oldId);
+  }
+
+  if (oldId !== newId) {
+    await dbUserUpdate(
+      userId,
+      { [column]: newId },
+      env
+    );
+  }
+}
+
+// 撤回槽位里的消息并清空记录（没有记录时什么都不做）。
+async function clearSlotMessage(env, userId, column) {
+  const user = await dbUserGetOrCreate(userId, env);
+  const oldId = Number(user?.[column] || 0);
+
+  if (!oldId) {
+    return;
+  }
+
+  await dbUserUpdate(
+    userId,
+    { [column]: null },
+    env
+  );
+
+  await quietDeleteMessage(env, userId, oldId);
+}
+
+// 任意入口验证通过后的联动清理：撤回验证提示；
+// 若还有未使用的通行证，一并删消息并作废（人已通过，证留着只是风险）。
+async function cleanupAfterVerified(env, userId) {
+  await clearSlotMessage(
+    env,
+    userId,
+    'verify_prompt_msg_id'
+  );
+
+  const rec = await passRecordGet(userId, env);
+
+  if (rec) {
+    await dbConfigDelete(`pass:${userId}`, env);
+
+    if (rec.m) {
+      await quietDeleteMessage(env, userId, rec.m);
+    }
+  }
+}
+
+// 过期通行证清扫：用户下次互动时顺手删掉过期通行证消息并清记录。
+async function sweepExpiredPass(env, userId) {
+  const rec = await passRecordGet(userId, env);
+
+  if (rec && Number(rec.e) <= Date.now()) {
+    await dbConfigDelete(`pass:${userId}`, env);
+
+    if (rec.m) {
+      await quietDeleteMessage(env, userId, rec.m);
+    }
+  }
+}
+
 // 校验 Telegram Mini App initData 并返回打开者用户 ID：
 // 链接可以被转发，只有打开者本人与通行证绑定用户一致才算数。
 async function telegramInitDataUserId(initDataRaw, botToken) {
@@ -3917,13 +4047,20 @@ async function sendTurnstilePrompt(
       env
     );
 
-    await telegramApi(
+    const promptSent = await telegramApi(
       env.BOT_TOKEN,
       'sendMessage',
       {
         chat_id: chatId,
         text: question
       }
+    );
+
+    await trackSlotMessage(
+      env,
+      chatId,
+      'verify_prompt_msg_id',
+      promptSent?.message_id
     );
 
     return;
@@ -3935,7 +4072,7 @@ async function sendTurnstilePrompt(
     env
   );
 
-  await telegramApi(
+  const promptSent = await telegramApi(
     env.BOT_TOKEN,
     'sendMessage',
     {
@@ -3955,6 +4092,13 @@ async function sendTurnstilePrompt(
         ]
       }
     }
+  );
+
+  await trackSlotMessage(
+    env,
+    chatId,
+    'verify_prompt_msg_id',
+    promptSent?.message_id
   );
 }
 
@@ -4215,6 +4359,12 @@ async function handlePassConfirm(request, env) {
 
   await dbConfigDelete(`pass:${u}`, env);
 
+  if (rec.m) {
+    await quietDeleteMessage(env, u, rec.m);
+  }
+
+  await cleanupAfterVerified(env, u);
+
   if (user.user_state !== USER_STATE.VERIFIED) {
     await dbUserUpdate(
       u,
@@ -4223,10 +4373,17 @@ async function handlePassConfirm(request, env) {
     );
 
     try {
-      await telegramApi(env.BOT_TOKEN, 'sendMessage', {
+      const successSent = await telegramApi(env.BOT_TOKEN, 'sendMessage', {
         chat_id: u,
         text: '🎉 验证成功！现在可以开始发送消息了。'
       });
+
+      await trackSlotMessage(
+        env,
+        u,
+        'receipt_msg_id',
+        successSent?.message_id
+      );
     } catch (error) {
       console.error(
         '通行证通过后通知用户失败：',
@@ -4479,7 +4636,9 @@ async function handleVerifyConfirm(
       env
     );
 
-    await telegramApi(
+    await cleanupAfterVerified(env, u);
+
+    const successSent = await telegramApi(
       env.BOT_TOKEN,
       'sendMessage',
       {
@@ -4487,6 +4646,13 @@ async function handleVerifyConfirm(
         text:
           '🎉 验证成功！现在可以开始发送消息了。'
       }
+    );
+
+    await trackSlotMessage(
+      env,
+      u,
+      'receipt_msg_id',
+      successSent?.message_id
     );
   }
 
@@ -4619,7 +4785,13 @@ async function handlePrivateMessage(
       user.user_state ===
       USER_STATE.VERIFIED
     ) {
-      await telegramApi(
+      await clearSlotMessage(
+        env,
+        chatId,
+        'receipt_msg_id'
+      );
+
+      const noticeSent = await telegramApi(
         env.BOT_TOKEN,
         'sendMessage',
         {
@@ -4627,6 +4799,13 @@ async function handlePrivateMessage(
           text:
             '您已通过验证，可以直接发送消息。'
         }
+      );
+
+      await trackSlotMessage(
+        env,
+        chatId,
+        'receipt_msg_id',
+        noticeSent?.message_id
       );
     } else {
       await handleStart(chatId, env, origin);
@@ -4797,6 +4976,10 @@ async function handlePrivateMessage(
 
   if (user.is_blocked) {
     return;
+  }
+
+  if (!isAdmin) {
+    await sweepExpiredPass(env, userId);
   }
 
   if (
@@ -7378,12 +7561,29 @@ async function handleUserListApi(request, env) {
 
   const rows = result?.results || [];
 
-  const users = rows
+  const users = await Promise.all(
+    rows
     .filter(
       (user) => !isPrimaryAdmin(user.user_id, env)
     )
-    .map((user) => {
+    .map(async (user) => {
       const info = parseUserInfoForList(user);
+
+      let passExp = 0;
+
+      if (
+        !user.is_blocked &&
+        user.user_state === USER_STATE.PENDING
+      ) {
+        const rec = await passRecordGet(
+          String(user.user_id),
+          env
+        );
+
+        if (rec && Number(rec.e) > Date.now()) {
+          passExp = Number(rec.e);
+        }
+      }
 
       return {
         id: String(user.user_id),
@@ -7399,9 +7599,11 @@ async function handleUserListApi(request, env) {
           : '', 
         created_at: user.created_at || 0,
         updated_at: user.updated_at || 0,
-        note: user.admin_note || ''
+        note: user.admin_note || '',
+        passExp
       };
-    });
+    })
+  );
 
   const groupLinkId = String(
     env.ADMIN_GROUP_ID || ''
@@ -9011,14 +9213,14 @@ async function handleUserListAction(request, env) {
       );
     }
 
+    const oldPass = await passRecordGet(targetId, env);
+
+    if (oldPass?.m) {
+      await quietDeleteMessage(env, targetId, oldPass.m);
+    }
+
     const exp = Date.now() + PASS_LINK_TTL_MS;
     const nonce = randomId();
-
-    await dbConfigPut(
-      `pass:${targetId}`,
-      JSON.stringify({ n: nonce, e: exp }),
-      env
-    );
 
     const origin = new URL(request.url).origin;
     const passUrl = await buildPassUrl(
@@ -9029,8 +9231,10 @@ async function handleUserListAction(request, env) {
       env
     );
 
+    let passSent = null;
+
     try {
-      await telegramApi(env.BOT_TOKEN, 'sendMessage', {
+      passSent = await telegramApi(env.BOT_TOKEN, 'sendMessage', {
         chat_id: targetId,
         text:
           '🎫 管理员为你发放了一张验证通行证\n\n' +
@@ -9059,7 +9263,17 @@ async function handleUserListAction(request, env) {
       );
     }
 
-    return Response.json({ ok: true });
+    await dbConfigPut(
+      `pass:${targetId}`,
+      JSON.stringify({
+        n: nonce,
+        e: exp,
+        m: passSent?.message_id || null
+      }),
+      env
+    );
+
+    return Response.json({ ok: true, passExp: exp });
   }
 
   return Response.json(
@@ -9097,6 +9311,7 @@ function buildUserListPage() {
   .b-pend { background: #5c4a17; color: #f2cd72; }
   .b-ban { background: #5c2222; color: #f28b8b; }
   .b-dim { background: #2b3a47; color: #9db2c5; }
+  .b-pass { background: #173f5f; color: #8ecdf0; }
   .ops { margin-top: 9px; display: flex; gap: 8px; }
   .ops button, .cf button { padding: 6px 13px; border-radius: 8px; border: 0; font-size: 13.5px; cursor: pointer; }
   .rst { background: #2b5278; color: #fff; }
@@ -9258,6 +9473,12 @@ function render() {
     b2.className = 'badge b-dim';
     b2.textContent = u.topic ? '有话题' : '无话题';
     sub2.appendChild(b2);
+    if (u.passExp && u.passExp > Date.now()) {
+      var bp = document.createElement('span');
+      bp.className = 'badge b-pass';
+      bp.textContent = '🎫 已发证 · 剩 ' + Math.max(1, Math.ceil((u.passExp - Date.now()) / 60000)) + ' 分钟';
+      sub2.appendChild(bp);
+    }
     var t = document.createElement('span');
     t.textContent = '最近活跃 ' + fmt(u.updated_at);
     sub2.appendChild(t);
@@ -9328,13 +9549,21 @@ function render() {
     if (u.state !== 'verified') {
       var pb = document.createElement('button');
       pb.className = 'ntb';
-      pb.textContent = '🎫 通行证';
+      var passLive = u.passExp && u.passExp > Date.now();
+      pb.textContent = passLive ? '🎫 重新发放' : '🎫 通行证';
       pb.onclick = function () {
         pb.disabled = true;
+        pb.textContent = '发送中…';
         act(u.id, 'pass', false).then(function (d) {
-          pb.disabled = false;
-          if (d.ok) toast('通行证已发送到对方私聊');
-          else toast('操作失败：' + (d.error || ''));
+          if (d.ok) {
+            u.passExp = d.passExp || (Date.now() + 30 * 60000);
+            toast('✅ 通行证已发送，30 分钟内有效');
+            render();
+          } else {
+            pb.disabled = false;
+            pb.textContent = passLive ? '🎫 重新发放' : '🎫 通行证';
+            toast('操作失败：' + (d.error || ''));
+          }
         });
       };
       ops.appendChild(pb);
