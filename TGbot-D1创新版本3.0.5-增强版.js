@@ -31,7 +31,7 @@
  * 台（原按钮菜单已下线，旧按钮回迁移提示）；新手引导 /guide；
  * 自动检查更新；服务熔断 /pause /resume（手动触发，闸门在去重之
  * 前；到期惰性恢复——由到期后第一条更新触发解除并通知，属刻意
- * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）。
+ * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、资料卡重建、话题内熔断开启/恢复/状态结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）。
  * 三页（指南 / 管理台 / 访客列表）约定
  * - 页眉 position:fixed + 脚本实测高度补偿 body padding-top，
  *   不要改回 sticky：iOS 上 sticky 在滚动中逐帧重定位会闪烁。
@@ -5480,18 +5480,20 @@ async function handleAdminCommand(
       const state = await getPauseState(env);
 
       if (!state) {
-        await sendTopicNotice(
+        await sendEphemeralTopicNotice(
           message,
           '当前没有处于暂停状态。',
-          env
+          env,
+          ctx
         );
       } else {
         await performResume(env, senderId);
 
-        await sendTopicNotice(
+        await sendEphemeralTopicNotice(
           message,
           '▶️ 机器人已恢复服务。',
-          env
+          env,
+          ctx
         );
       }
 
@@ -5502,10 +5504,11 @@ async function handleAdminCommand(
     const arg = String(parsed.argument || '').trim();
 
     if (!arg && state) {
-      await sendTopicNotice(
+      await sendEphemeralTopicNotice(
         message,
         `⏸ 服务熔断进行中，${describePauseRemaining(state)}。\nℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，服务熔断其实已经结束。`,
-        env
+        env,
+        ctx
       );
 
       return true;
@@ -5536,10 +5539,11 @@ async function handleAdminCommand(
       senderId
     );
 
-    await sendTopicNotice(
+    await sendEphemeralTopicNotice(
       message,
       `⏸ 服务熔断已开启，${describePauseRemaining(fresh)}。\nℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，服务熔断其实已经结束。`,
-      env
+      env,
+      ctx
     );
 
     return true;
@@ -5879,8 +5883,8 @@ async function handleAdminCommand(
       );
     }
 
-    // 连带删除客人私聊中的原消息（存在配对时）：
-    // 客人已自行删除（not found）视为已删、不提示；
+    // 连带删除访客私聊中的原消息（存在配对时）：
+    // 访客已自行删除（not found）视为已删、不提示；
     // 其余失败（如消息超过 48 小时、机器人被拉黑）
     // 在话题里留一行说明，话题侧删除结果不变。
     if (deletedPair) {
@@ -5903,7 +5907,7 @@ async function handleAdminCommand(
         if (!/not found/i.test(reason)) {
           await sendTopicNotice(
             message,
-            '⚠️ 话题侧已删除，但客人私聊中的' +
+            '⚠️ 话题侧已删除，但访客私聊中的' +
               `原消息删除失败：${reason}`,
             env
           );
@@ -6026,10 +6030,11 @@ if (parsed.command === 'card') {
       env
     );
 
-    await sendTopicNotice(
+    await sendEphemeralTopicNotice(
       message,
       `✅ 访客 ${userId} 的资料卡已重新创建。`,
-      env
+      env,
+      ctx
     );
   } catch (error) {
     console.error(
@@ -8568,7 +8573,7 @@ function buildGuidePage() {
       <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
       <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在；发出 ✅ 提醒的同时，之前那条 🚫 提醒会被一并删掉，话题里只留最新状态。</li>
-      <li><b class=\"k\">命令回执不留痕：</b>/note 的查看与保存、/notedelete、/reverify、/ban、/unban 的结果提示，还有打错命令时的「未识别的命令」提示，都是短暂显示，约 5 秒后自动删除，话题里不会堆积这类回执。</li>
+      <li><b class=\"k\">命令回执不留痕：</b>/note 的查看与保存、/notedelete、/reverify、/ban、/unban、/card 重建、话题里 /pause 与 /resume 的结果提示，还有打错命令时的「未识别的命令」提示，都是短暂显示，约 5 秒后自动删除，话题里不会堆积这类回执。</li>
       <li><b class=\"k\">被轰炸时先开启服务熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客新发的消息会被机器人当场删除、不补送——消息发出去就消失，就是还在暂停的信号；对熔断前已送达消息的编辑和反应照常同步到话题副本，两边记录保持一致；开启服务熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息；恢复服务时，那条「请稍后再试」会自动改成「✅ 服务已恢复」，访客一看便知。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
     </ul>
   </section>
