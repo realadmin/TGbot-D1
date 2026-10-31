@@ -31,7 +31,7 @@
  * 台（原按钮菜单已下线，旧按钮回迁移提示）；新手引导 /guide；
  * 自动检查更新；服务熔断 /pause /resume（手动触发，闸门在去重之
  * 前；到期惰性恢复——由到期后第一条更新触发解除并通知，属刻意
- * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、资料卡重建、话题内熔断开启/恢复/状态结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）；话题里管理员发出的命令消息在处理后一并撤回（未识别的命令同样），只短暂留回执、不留命令原文。
+ * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、资料卡重建、话题内熔断开启/恢复/状态结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）；话题里管理员发出的命令消息在处理后一并撤回（未识别的命令同样），只短暂留回执、不留命令原文；主菜单追踪记录带写入时间戳，超过 48 小时（记录里的消息号已过 Telegram 删除窗口）会被数据库清扫整行删掉，读到过期记录时也直接跳过注定失败的删除。
  * 三页（指南 / 管理台 / 访客列表）约定
  * - 页眉 position:fixed + 脚本实测高度补偿 body padding-top，
  *   不要改回 sticky：iOS 上 sticky 在滚动中逐帧重定位会闪烁。
@@ -681,11 +681,55 @@ async function cleanupDatabase(env) {
     ]);
 
     await cleanupExpiredUsers(env, now);
+
+    await cleanupStaleMenuTracks(env);
   } catch (error) {
     console.error(
       '清理数据库失败：',
       error?.message || error
     );
+  }
+}
+
+// 主菜单追踪（mainmenu:<chatId>）超过保鲜期后，里面的消息号
+// 已过 Telegram 删除窗口、留着也没用，整个记录删掉。
+// 没有时间戳的旧记录不动：下次打开菜单覆盖写入时会带上
+// 时间戳，之后自然进入清扫范围。
+async function cleanupStaleMenuTracks(env) {
+  let rows = [];
+
+  try {
+    const result = await env.TG_BOT_DB.prepare(
+      'SELECT key, value FROM config ' +
+        'WHERE key LIKE ?'
+    )
+      .bind('mainmenu:%')
+      .all();
+
+    rows = result?.results || [];
+  } catch (error) {
+    console.error(
+      '读取主菜单追踪记录失败：',
+      error?.message || error
+    );
+
+    return;
+  }
+
+  const nowMs = Date.now();
+
+  for (const row of rows) {
+    let t = 0;
+
+    try {
+      t = Number(JSON.parse(row.value)?.t) || 0;
+    } catch (_) {
+      t = 0;
+    }
+
+    if (t && nowMs - t > MENU_TRACK_TTL_MS) {
+      await dbConfigDelete(String(row.key), env);
+    }
   }
 }
 
@@ -3378,6 +3422,10 @@ async function renderMenu(
   return messageId;
 }
 
+// 主菜单追踪记录的保鲜期：超过后记录里的消息号已过
+// Telegram 的 48 小时删除窗口，读时作废、清扫时整行删除。
+const MENU_TRACK_TTL_MS = 48 * 60 * 60 * 1000;
+
 async function showMainMenu(
   chatId,
   env,
@@ -3511,6 +3559,18 @@ ${versionLine}${pauseLine}
 
           prevCmdId =
             parseInt(parsed?.c || '0', 10) || 0;
+
+          // 追踪超过保鲜期：里面的消息号已过 Telegram
+          // 删除窗口、删不动了，直接作废，跳过删除尝试。
+          const trackTs = Number(parsed?.t) || 0;
+
+          if (
+            trackTs &&
+            Date.now() - trackTs > MENU_TRACK_TTL_MS
+          ) {
+            prevMenuId = 0;
+            prevCmdId = 0;
+          }
         } catch (_) {
           // 旧格式：纯数字只记了菜单编号
           prevMenuId = parseInt(rawTrack, 10) || 0;
@@ -3530,7 +3590,8 @@ ${versionLine}${pauseLine}
           trackKey,
           JSON.stringify({
             m: menuMessageId,
-            c: triggerMessageId || 0
+            c: triggerMessageId || 0,
+            t: Date.now()
           }),
           env
         );
@@ -3539,7 +3600,8 @@ ${versionLine}${pauseLine}
           trackKey,
           JSON.stringify({
             m: menuMessageId,
-            c: prevCmdId
+            c: prevCmdId,
+            t: Date.now()
           }),
           env
         );
@@ -8556,7 +8618,7 @@ function buildGuidePage() {
   <section id=\"g-start\">
     <h2>🚀 开始使用</h2>
     <ol>
-      <li><b class=\"k\">打开主菜单：</b>在机器人私聊里发送 <code>/start</code>，网页管理台、访客列表和这本引导都在这里。菜单只留最新一份：再发一次 /start，上一次的 /start 和旧菜单会被自动删掉，不会在聊天里堆积；留下的这条 /start 点一下就能再发，网页链接过期时靠它刷新最方便。</li>
+      <li><b class=\"k\">打开主菜单：</b>在机器人私聊里发送 <code>/start</code>，网页管理台、访客列表和这本引导都在这里。菜单只留最新一份：再发一次 /start，上一次的 /start 和旧菜单会被自动删掉，不会在聊天里堆积（若隔了超过 48 小时才回来，旧菜单已过 Telegram 的删除期限、删不掉，会留在那里，手动删一下即可）；留下的这条 /start 点一下就能再发，网页链接过期时靠它刷新最方便。</li>
       <li><b class=\"k\">先定验证方式：</b>进「网页管理台 → 基础配置」，选一种验证方式（推荐 Turnstile，访客点一下就通过），顺便把欢迎消息改成你想对访客说的第一句话。</li>
       <li><b class=\"k\">把机器人发给访客：</b>访客打开私聊、完成验证之后给你发消息，你的群里就会自动多出一个以他名字命名的话题。</li>
       <li><b class=\"k\">在话题里直接回复：</b>不需要任何额外设置，在他的话题里打字、发图，就是发给他本人。</li>
