@@ -1,10 +1,11 @@
 # TGbot-D1 3.0.5 增强版说明
 
-本文件说明 3.0.5 增强版的改动与部署差异。增强版源自 realadmin 对原作者 [moistrr/TGbot-D1](https://github.com/moistrr/TGbot-D1) 的 Fork 自用改版，现以 PR 形式回馈原仓库；原项目未附开源许可证，分发与授权事宜见原仓库 Issue #16 的咨询。
+本文件是 Fork（realadmin/TGbot-D1）对原作者 [moistrr/TGbot-D1](https://github.com/moistrr/TGbot-D1) 的增强说明。
+原项目未附开源许可证，本 Fork 通过 GitHub 站内 Fork 机制分享，代码著作权归原作者所有；增强部分仅供个人学习与自用部署。
 
 增强版文件：`TGbot-D1创新版本3.0.5-增强版.js`（基于原版 `TGbot-D1创新版本3.0.5.js` 修改，原版文件未改动）。
 
-**部署请看专门为本增强版重写的教程：[部署教程-增强版.md](部署教程-增强版.md)（小白向）。** 原仓库自带的教程（3.0.0 教程与 PDF）是给原版用的，其 setWebhook 示例缺少 `secret_token` 与完整的 `allowed_updates`，照它部署增强版会导致功能缺失，请勿混用。
+**部署请看专门为本增强版重写的教程：[部署教程-增强版.md](部署教程-增强版.md)（小白向）。** 本仓库自带的原版教程（3.0.0 教程与 PDF）是给原版用的，其 setWebhook 示例缺少 `secret_token` 与完整的 `allowed_updates`，照它部署增强版会导致功能缺失，请勿混用。
 
 ## 增强内容
 
