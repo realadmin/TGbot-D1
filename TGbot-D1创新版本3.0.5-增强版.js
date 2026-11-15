@@ -12611,7 +12611,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.4.6';
+const BOT_VERSION = 'v1.5.0';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -14052,6 +14052,24 @@ async function handleUserListApi(request, env) {
     }
   }
 
+  // 页号取数模式（页码下拉直达）：带 page 参数时按
+  // OFFSET 取该页，筛选/搜索/排序口径与游标模式完全
+  // 一致，游标条件不叠加（同传 cursor 以 page 为准）。
+  // 页号 1 起：<1 按 1 处理，超总页数在 total 算出后
+  // 钳到最后一页；无 page 参数时本段与后续分支均不
+  // 生效，游标模式行为逐字节不变。
+  const pageParam = url.searchParams.get('page');
+  const pageMode = pageParam !== null;
+  let pageNo = 1;
+
+  if (pageMode) {
+    pageNo = Math.trunc(Number(pageParam));
+
+    if (!Number.isFinite(pageNo) || pageNo < 1) {
+      pageNo = 1;
+    }
+  }
+
   // 排除集合 = 主管理员 + 协管员（与 countUsersWhere 同
   // 口径）：他们是管理侧账号，不出现在访客列表里。
   const adminIds = [
@@ -14073,6 +14091,15 @@ async function handleUserListApi(request, env) {
     filterBinds
   );
 
+  if (pageMode) {
+    const totalPages =
+      total > 0 ? Math.ceil(total / limit) : 1;
+
+    if (pageNo > totalPages) {
+      pageNo = totalPages;
+    }
+  }
+
   const where = [];
   const binds = [];
 
@@ -14091,7 +14118,7 @@ async function handleUserListApi(request, env) {
     binds.push(...filterBinds);
   }
 
-  if (cursorSql) {
+  if (cursorSql && !pageMode) {
     where.push(cursorSql);
     binds.push(...cursorBinds);
   }
@@ -14106,9 +14133,13 @@ async function handleUserListApi(request, env) {
         ? 'WHERE ' + where.join(' AND ') + ' '
         : '') +
       `ORDER BY ${sortCol} ${sortDir}, user_id ${sortDir} ` +
-      'LIMIT ?'
+      (pageMode ? 'LIMIT ? OFFSET ?' : 'LIMIT ?')
   )
-    .bind(...binds, limit + 1)
+    .bind(
+      ...binds,
+      limit + 1,
+      ...(pageMode ? [(pageNo - 1) * limit] : [])
+    )
     .all();
 
   const fetched = result?.results || [];
@@ -14204,6 +14235,9 @@ async function handleUserListApi(request, env) {
     group: groupLinkId,
     users,
     total,
+    // 页号模式回显钳制后的实际页号；游标模式不带此
+    // 字段，响应与旧版逐字节一致。
+    ...(pageMode ? { page: pageNo } : {}),
     // 游标分页下没有「只看得到前 1000 人」的截断了：
     // 每一行都能翻页到达。字段保留兼容，恒 false；
     // total 是当前筛选口径下的精确总数。
@@ -14644,7 +14678,8 @@ function buildGuidePage(pageCtx = {}) {
     <h2>📋 访客列表与数据统计</h2>
     <ul>
       <li><b class=\"k\">两个标签页：</b>「访客列表」和「数据统计」，默认打开列表页，点顶部标签切换。</li>
-      <li><b class=\"k\">找人：</b>顶部搜索框可以按名字、用户名、数字 ID、甚至你写的备注来搜；下面的「全部 / 已验证 / 待验证 / 已屏蔽」是快速筛选；还能换排序顺序。</li>
+      <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。页眉下方的「全部 / 已验证 / 待验证 / 已屏蔽」是快速筛选；还能换排序顺序。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
+      <li><b class=\"k\">位置会记住：</b>每个筛选与搜索组合下翻到的页码和滚动位置都会被记住，切去别处再切回来，会自动回到离开时的位置（内容是重新拉取的新数据）；手动更换排序会清掉全部位置记忆，各视图都从第一页重新开始。</li>
       <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词封禁对他同样无效）和「🚫 屏蔽 / ✅ 解封」（与 /ban、/unban 同一套封禁：屏蔽后他再发来的新消息会被立即删掉；解封时他会收到一条解除通知）；设为信任的人行上会挂「🤝 已信任」徽标，屏蔽中的人挂「已屏蔽」徽标。</li>
       <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
     </ul>
@@ -17649,19 +17684,21 @@ function buildUserListPage(pageCtx = {}) {
 <title>访客列表</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-  body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 0; background: #0f141a; color: #e8edf2; padding-top: 104px; }
-  html { scroll-padding-top: 114px; overflow-x: hidden; overflow-x: clip; overflow-y: scroll; scrollbar-gutter: stable; }
-  header { position: fixed; top: 0; left: 0; right: 0; background: #17212b; padding: 12px 14px; z-index: 2; transform: translateZ(0); will-change: transform; }
+  body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 0; background: #0f141a; color: #e8edf2; height: 100%; overflow: hidden; display: flex; flex-direction: column; }
+  html { height: 100%; overflow-x: hidden; overflow-x: clip; }
+  header { background: #17212b; padding: 12px 14px; flex: none; }
   h1 { font-size: 17px; margin: 0 0 10px; }
-  input[type=search] { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px; border: 1px solid #2b3a47; background: #0f141a; color: #e8edf2; font-size: 15px; }
-  .chips { display: flex; gap: 8px; flex-wrap: nowrap; position: sticky; top: 0; z-index: 1; background: #0f141a; padding: 10px 0 8px; }
+  #pgsel { -webkit-appearance: none; appearance: none; margin-top: 0; padding: 7px 30px 7px 14px; border-radius: 8px; border: 1px solid #2b3a47; background-color: #17212b; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%239db2c5' stroke-width='1.8' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; color: #e8edf2; font-size: 13px; cursor: pointer; }
+  .chips { display: flex; gap: 8px; flex-wrap: nowrap; background: #0f141a; padding: 10px 12px 8px; flex: none; }
   .chip { flex: 1; padding: 8px 0; border-radius: 9px; border: 1px solid #2b3a47; background: transparent; color: #9db2c5; font-size: 14px; cursor: pointer; text-align: center; }
   .chip.on { background: #2b5278; color: #fff; border-color: #2b5278; }
   .tabs { display: flex; gap: 8px; margin-top: 10px; }
   .tab { flex: 1; padding: 8px 0; border-radius: 9px; border: 1px solid #2b3a47; background: transparent; color: #9db2c5; font-size: 14px; cursor: pointer; }
   .tab.on { background: #2b5278; color: #fff; border-color: #2b5278; }
   select { margin-top: 10px; padding: 6px; border-radius: 8px; background: #0f141a; color: #e8edf2; border: 1px solid #2b3a47; }
-  main { padding: 10px 12px 30px; }
+  #uscroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-gutter: stable; }
+  main { padding: 0 12px 30px; }
+  main { display: flex; flex-direction: column; min-height: 100%; box-sizing: border-box; }
   .card { background: #17212b; border-radius: 12px; padding: 11px 12px; margin-bottom: 9px; }
   .nm { font-weight: 600; font-size: 15px; }
   .sub { color: #9db2c5; font-size: 12.5px; margin-top: 2px; word-break: break-all; }
@@ -17692,11 +17729,29 @@ function buildUserListPage(pageCtx = {}) {
   .pager button { padding: 7px 16px; border-radius: 8px; border: 1px solid #2b3a47; background: #17212b; color: #e8edf2; cursor: pointer; }
   .pager button:disabled { opacity: .4; }
   #toast { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%); background: #2b5278; color: #fff; padding: 9px 16px; border-radius: 10px; display: none; font-size: 14px; }
-  #toTop { position: fixed; right: 18px; bottom: 18px; width: 48px; height: 48px; padding: 0; border: 1px solid rgba(255,255,255,.16); border-radius: 50%; background: rgba(38,56,74,.66); -webkit-backdrop-filter: blur(12px) saturate(1.5); backdrop-filter: blur(12px) saturate(1.5); color: #fff; cursor: pointer; box-shadow: 0 10px 28px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.15); z-index: 3; opacity: 0; visibility: hidden; pointer-events: none; display: flex; align-items: center; justify-content: center; transition: opacity .25s ease, visibility .25s ease, transform .15s ease; }
+  #ufloat { position: fixed; right: 18px; bottom: 18px; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); z-index: 3; display: flex; flex-direction: column; align-items: flex-end; transition: opacity .15s ease; }
+  #ufloat.kbtransit { opacity: 0; }
+  .glassbtn { border: 1px solid rgba(255,255,255,.22); background: rgba(38,56,74,.55); background: linear-gradient(135deg, rgba(255,255,255,.16), rgba(255,255,255,.06)), rgba(38,56,74,.55); -webkit-backdrop-filter: blur(18px) saturate(1.6); backdrop-filter: blur(18px) saturate(1.6); box-shadow: 0 10px 28px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.35), inset 0 -8px 16px rgba(255,255,255,.04); color: #fff; }
+  #toTop { width: 48px; height: 48px; padding: 0; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; opacity: 0; visibility: hidden; pointer-events: none; transition: opacity .25s ease, visibility .25s ease, transform .15s ease; }
   #toTop.show { opacity: 1; visibility: visible; pointer-events: auto; }
+  #ufloat.kbd #toTop { opacity: 0; visibility: hidden; pointer-events: none; }
   #toTop:active { transform: scale(.94); }
-  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) { #toTop { background: rgba(38,56,74,.88); } }
+  #usearch { position: relative; width: 48px; height: 48px; margin-top: 10px; border-radius: 999px; overflow: hidden; transition: width .32s ease; }
+  #usearch.open { width: 380px; width: min(84vw, 380px); }
+  #uq { position: absolute; left: 0; top: 0; width: 284px; width: calc(min(84vw, 380px) - 96px); height: 48px; box-sizing: border-box; border: 0; background: transparent; color: #e8edf2; font-size: 16px; padding: 0 2px 0 16px; opacity: 0; pointer-events: none; transition: opacity .18s ease; -webkit-appearance: none; appearance: none; outline: none; }
+  #uq::placeholder { color: #9db2c5; }
+  #usearch.open #uq { opacity: 1; pointer-events: auto; transition: opacity .18s ease .14s; }
+  .uicobtn { position: absolute; top: 0; width: 48px; height: 48px; padding: 0; border: 0; background: transparent; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+  #usbtn { right: 0; }
+  #usbtn:active { transform: scale(.94); }
+  #uxbtn { right: 48px; opacity: 0; visibility: hidden; pointer-events: none; transition: opacity .15s ease, visibility .15s ease; }
+  #usearch.open.hasq #uxbtn { opacity: 1; visibility: visible; pointer-events: auto; }
+  #usdot { position: absolute; top: 9px; right: 9px; width: 8px; height: 8px; border-radius: 50%; background: #8ecdf0; display: none; }
+  #usearch.dot:not(.open) #usdot { display: block; }
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) { .glassbtn { background: rgba(38,56,74,.88); } }
   .empty { text-align: center; color: #9db2c5; padding: 34px 0; }
+  #paneList { display: flex; flex-direction: column; flex: 1; }
+  #paneStats { padding-top: 10px; }
   #statsBox { margin-bottom: 14px; }
   .stitle { font-size: 15px; font-weight: 600; margin: 2px 0 4px; }
   .sgroup { color: #9db2c5; font-size: 12px; margin: 10px 0 6px; }
@@ -17706,11 +17761,12 @@ function buildUserListPage(pageCtx = {}) {
   .sl { color: #9db2c5; font-size: 11.5px; margin-top: 1px; }
   .snote { color: #5f7488; font-size: 11.5px; margin-top: 9px; line-height: 1.5; }
   .sloading { color: #9db2c5; font-size: 13px; padding: 6px 0; }
-  .loadingbox { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 40vh; gap: 12px; }
+  .loadingbox { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; gap: 12px; }
   .spinner { width: 28px; height: 28px; border-radius: 50%; border: 3px solid #2b3a47; border-top-color: #8ecdf0; animation: spinRot .8s linear infinite; }
   @keyframes spinRot { to { transform: rotate(360deg); } }
   .loadingtxt { color: #9db2c5; font-size: 13px; }
-  .listclip { overflow-x: hidden; overflow-x: clip; }
+  .listclip { overflow-x: hidden; overflow-x: clip; display: flex; flex-direction: column; flex: 1; }
+  #list { display: flex; flex-direction: column; flex: 1; }
   @keyframes slideFromRight { from { opacity: 0; transform: translateX(28px); } to { opacity: 1; transform: translateX(0); } }
   @keyframes slideFromLeft { from { opacity: 0; transform: translateX(-28px); } to { opacity: 1; transform: translateX(0); } }
   .in-r { animation: slideFromRight .32s ease; }
@@ -17725,15 +17781,15 @@ function buildUserListPage(pageCtx = {}) {
     <button class="tab" id="tabStats">📊 数据统计</button>
   </div>
 </header>
+<div class="chips" id="chips">
+  <button class="chip on" data-f="all">全部</button>
+  <button class="chip" data-f="verified">已验证</button>
+  <button class="chip" data-f="pending">待验证</button>
+  <button class="chip" data-f="blocked">已屏蔽</button>
+</div>
+<div id="uscroll">
 <main>
   <section id="paneList">
-  <input type="search" id="q" placeholder="搜索名字、用户名、ID 或备注…">
-  <div class="chips" id="chips">
-    <button class="chip on" data-f="all">全部</button>
-    <button class="chip" data-f="verified">已验证</button>
-    <button class="chip" data-f="pending">待验证</button>
-    <button class="chip" data-f="blocked">已屏蔽</button>
-  </div>
   <select id="sort">
     <option value="active">按最近活跃</option>
     <option value="new">按最新注册</option>
@@ -17742,7 +17798,7 @@ function buildUserListPage(pageCtx = {}) {
   <div class="listclip"><div id="list"><div class="loadingbox"><div class="spinner"></div><div class="loadingtxt">加载中…</div></div></div></div>
   <div class="pager">
     <button id="prev">← 上一页</button>
-    <span id="pinfo" style="color:#9db2c5;font-size:13px"></span>
+    <select id="pgsel" aria-label="选择页码"></select>
     <button id="next">下一页 →</button>
   </div>
   </section>
@@ -17752,8 +17808,17 @@ function buildUserListPage(pageCtx = {}) {
     <div class="snote">消息量按同步映射记录统计（仅保留最近 90 天）；新增与活跃为滚动窗口（过去 24 小时 / 7 天 / 30 天）。</div>
   </section>
 </main>
+</div>
 <div id="toast"></div>
-<button id="toTop" title="回到顶部" aria-label="回到顶部"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M5 15l7-7 7 7" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+<div id="ufloat">
+<button id="toTop" class="glassbtn" title="回到顶部" aria-label="回到顶部"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M5 15l7-7 7 7" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+<div id="usearch" class="glassbtn">
+<input id="uq" type="text" inputmode="search" enterkeyhint="search" placeholder="搜索名字、用户名、ID、备注" autocomplete="off">
+<button id="uxbtn" class="uicobtn" title="清除搜索" aria-label="清除搜索"><svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/></svg></button>
+<button id="usbtn" class="uicobtn" title="搜索" aria-label="搜索"><svg width="21" height="21" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="#fff" stroke-width="2.2"/><path d="M20 20l-3.8-3.8" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/></svg></button>
+<span id="usdot"></span>
+</div>
+</div>
 <script>
 var qs = new URLSearchParams(location.search);
 var AUTH = { u: qs.get('u'), e: qs.get('e'), s: qs.get('s') };
@@ -17794,27 +17859,49 @@ function fmt(ts) {
 var loadSeq = 0;
 var posMem = {};
 var pendingScrollY = null;
+// 页码下拉直达：pageAnchor>0 表示当前页由页号模式锚定
+// （值为页号），pageJumpNext 是跳页响应带回的 nextCursor
+// （「下一页」据此接回游标模式）；progScrollUntil 是程序
+// 滚动抑制窗口的截止时刻（搜索胶囊自动收缩豁免）。
+var pageAnchor = 0;
+var pageJumpNext = null;
+var progScrollUntil = 0;
+// 内层滚动容器（-v146b14）：列表页改容器滚动——窗
+// 口永不滚动，页眉与筛选行都是普通流内块，彻底退
+// 出键盘期 visualViewport 平移的射程（三轮探针实
+// 测：窗口滚动时 fixed 页眉被 offsetTop 1:1 带走，
+// 页内对抗——锁/镜像/冻结/glide/闭环钉——或被合
+// 成器惩罚、或因读数相位与滞留过期，全部判死）。
+// 本页一切滚动读/写（posMem、回顶判定、拖动监
+// 视、平滑回顶、位置回拉）自此只认 uScr.scrollTop。
+var uScr = document.getElementById('uscroll');
 function posKey() { return filt + '|' + query; }
 function memSave() {
   var m = posMem[posKey()] || (posMem[posKey()] = { stack: [], cursor: '', scrollY: 0 });
   m.stack = cursorStack.slice();
   m.cursor = curCursor;
+  m.page = pageAnchor;
+  m.jnext = pageJumpNext;
 }
 function memLeave() {
   var m = posMem[posKey()];
-  if (m) m.scrollY = window.pageYOffset || 0;
+  if (m) m.scrollY = uScr.scrollTop || 0;
 }
 function enterKey() {
   var m = posMem[posKey()];
   if (m) {
     cursorStack = m.stack.slice();
     curCursor = m.cursor;
+    pageAnchor = m.page || 0;
+    pageJumpNext = m.jnext || null;
     pendingScrollY = m.scrollY || 0;
     loadUsers();
     return true;
   }
   curCursor = '';
   cursorStack = [];
+  pageAnchor = 0;
+  pageJumpNext = null;
   pendingScrollY = null;
   loadUsers();
   return false;
@@ -17826,17 +17913,21 @@ function uTopBtn() {
   var b = document.getElementById('toTop');
   if (!b) return;
   var listOn = document.getElementById('paneList').style.display !== 'none';
-  b.className = listOn && (window.pageYOffset || 0) > 200 ? 'show' : '';
+  b.classList.toggle('show', listOn && (uScr.scrollTop || 0) > 200);
 }
 var scrollTick = 0;
-window.addEventListener('scroll', function () {
+uScr.addEventListener('scroll', function () {
   var now = Date.now();
   if (now - scrollTick < 120) return;
   scrollTick = now;
-  memLeave();
+  // 搜索展开期间不记滚动位：预定位落地若有残余
+  // 跳动，也不许污染 posMem 的位置记忆。
+  if (!document.getElementById('usearch').classList.contains('open')) memLeave();
   uTopBtn();
+  uSearchAutoHide();
 }, { passive: true });
 function showListLoading() {
+  progScrollUntil = Date.now() + 400;
   document.getElementById('list').innerHTML = '<div class="loadingbox"><div class="spinner"></div><div class="loadingtxt">加载中…</div></div>';
   var pg = document.querySelector('.pager');
   if (pg) pg.style.visibility = 'hidden';
@@ -17860,6 +17951,7 @@ function loadUsers() {
     params.set('limit', PAGE);
   }
   if (curCursor) params.set('cursor', curCursor);
+  if (pageAnchor > 0) params.set('page', pageAnchor);
   fetch('/api/users?' + params.toString())
     .then(function (r) { return r.json(); })
     .then(function (d) {
@@ -17872,6 +17964,13 @@ function loadUsers() {
       rows = d.users;
       listTotal = d.total || 0;
       nextCursor = d.nextCursor || null;
+      if (pageAnchor > 0) {
+        // 页号模式：以服务端回显的实际页号为准（超界钳到
+        // 末页时本地页号随之修正），接回游标模式的凭据就是
+        // 本次响应带回的 nextCursor。
+        if (d.page) pageAnchor = d.page;
+        pageJumpNext = nextCursor;
+      }
       GROUP_C = d.group || '';
       if (!booted) {
         booted = true;
@@ -17883,10 +17982,20 @@ function loadUsers() {
           }
         }
       }
-      if (!rows.length && cursorStack.length) {
+      if (!rows.length && (cursorStack.length || pageAnchor > 1)) {
         // 当前页被删空了：自动退回上一页。加载块保持不出，
         // 递归取数渲染后才收尾；滚动恢复也等最终渲染消费。
-        curCursor = cursorStack.pop();
+        // 锚定页按页号退一页；栈顶是跳页锚点标记时转页号
+        // 模式退回锚定页；其余沿旧游标栈退页。
+        if (pageAnchor > 1) {
+          pageAnchor--;
+        } else if (cursorStack.length && typeof cursorStack[cursorStack.length - 1] === 'string' && cursorStack[cursorStack.length - 1].indexOf('pg:') === 0) {
+          pageAnchor = Number(cursorStack.pop().slice(3)) || 1;
+          cursorStack = [];
+          curCursor = '';
+        } else {
+          curCursor = cursorStack.pop();
+        }
         loadUsers();
         return;
       }
@@ -17895,7 +18004,8 @@ function loadUsers() {
       if (pendingScrollY != null) {
         var ry = pendingScrollY;
         pendingScrollY = null;
-        requestAnimationFrame(function () { window.scrollTo(0, ry); });
+        progScrollUntil = Date.now() + 400;
+        requestAnimationFrame(function () { uScr.scrollTop = ry; });
       }
     })
     .catch(function () {
@@ -17908,6 +18018,8 @@ function loadUsers() {
 function resetAndLoad() {
   curCursor = '';
   cursorStack = [];
+  pageAnchor = 0;
+  pageJumpNext = null;
   loadUsers();
 }
 
@@ -17945,13 +18057,33 @@ function act(id, action, delTopic, note, extra) {
   });
 }
 
+function curPageNo() {
+  if (pageAnchor > 0) return pageAnchor;
+  // 栈底若是跳页锚点标记（'pg:N'），当前页号 = N + 其上
+  // 叠着的游标页数（栈长）；普通游标栈沿旧口径 栈长+1。
+  if (cursorStack.length && typeof cursorStack[0] === 'string' && cursorStack[0].indexOf('pg:') === 0) {
+    return (Number(cursorStack[0].slice(3)) || 1) + cursorStack.length;
+  }
+  return cursorStack.length + 1;
+}
 function render() {
   memSave();
   var list = rows;
   document.getElementById('cnt').textContent = '共 ' + listTotal + ' 人';
-  document.getElementById('pinfo').textContent = '第 ' + (cursorStack.length + 1) + ' 页' + (nextCursor ? ' · 还有更多' : '');
-  document.getElementById('prev').disabled = !cursorStack.length;
-  document.getElementById('next').disabled = !nextCursor;
+  var pgSel = document.getElementById('pgsel');
+  var totalPages = Math.max(1, Math.ceil((listTotal || 0) / PAGE));
+  var curPg = curPageNo();
+  if (curPg > totalPages) curPg = totalPages;
+  pgSel.innerHTML = '';
+  for (var pi = 1; pi <= totalPages; pi++) {
+    var op = document.createElement('option');
+    op.value = pi;
+    op.textContent = '第 ' + pi + ' 页';
+    pgSel.appendChild(op);
+  }
+  pgSel.value = curPg;
+  document.getElementById('prev').disabled = pageAnchor > 0 ? pageAnchor <= 1 : !cursorStack.length;
+  document.getElementById('next').disabled = pageAnchor > 0 ? !pageJumpNext : !nextCursor;
   var box = document.getElementById('list');
   box.textContent = '';
   if (!list.length) {
@@ -18157,7 +18289,200 @@ function render() {
 }
 
 var qTimer = 0;
-document.getElementById('q').addEventListener('input', function (e) {
+var uqEl = document.getElementById('uq');
+function uSyncSearchChrome() {
+  var box = document.getElementById('usearch');
+  var has = !!uqEl.value.trim();
+  box.classList.toggle('hasq', has);
+  box.classList.toggle('dot', has && !box.classList.contains('open'));
+}
+function uExpandSearch() {
+  var box = document.getElementById('usearch');
+  if (kbTransit) kbTransitEnd();
+  box.classList.add('open');
+  document.getElementById('ufloat').classList.add('kbd');
+  uSyncSearchChrome();
+  stW = window.innerWidth || 0;
+  stLanded = false;
+  if (window.innerHeight <= (window.visualViewport ? Math.round(window.visualViewport.height) : window.innerHeight) + 2) stFullIH = window.innerHeight;
+  if (stVVH > 40 && stVVH < window.innerHeight - 40) stStage(stVVH, false);
+  try { uqEl.focus({ preventScroll: true }); } catch (e) { uqEl.focus(); }
+  uDragWatchArm();
+}
+function uCollapseSearch() {
+  var box = document.getElementById('usearch');
+  if (!box.classList.contains('open')) return;
+  kbCollapsing = true;
+  kbWasStaged = stOn;
+  if (stOn) stUnstage();
+  stLanded = false;
+  uDragWatchStop();
+  kbTransitStart();
+  box.classList.remove('open');
+  if (!kbTransit) document.getElementById('ufloat').classList.remove('kbd');
+  uqEl.blur();
+  uSyncSearchChrome();
+  kbCollapsing = false;
+}
+// 预定位：两轮探针实测——点开搜索约 520ms 内页
+// 面几何不变；随后系统先经 vv-resize 报可视高
+// vvH（742→368），约 25ms 后 window resize 落
+// 地：窗口高塌缩到 vvH，并按塌缩前布局把位于旧
+// 视口底部的聚焦输入框捞回塌缩后视口，文档被滚
+// +Δ（Δ = 旧 ih − vvH − 7，与起始位置无关）；
+// 收起时系统不做反向滚动，这一跳是单向棘轮。
+// 故展开时先把浮动组滑到「塌缩后视口的底部」
+// ——正是键盘到位后它本该在的位置，系统落地时
+// 发现输入框已在视口内、调整量为零，页面纹丝
+// 不动。不拦、不追、不冻。键盘高经 localStorage
+// 学习；首开无记忆时 vv-resize 预警 snap 抢救
+// 并纠偏 glide 终点；落地由 window resize 解
+// 除预定位、恢复 bottom 锚（落点一致，无跳变）。
+var stVVH = 0;
+try { stVVH = parseInt(localStorage.getItem('usvvh') || '0', 10) || 0; } catch (e) {}
+function stLearn(v) {
+  if (!(v > 0)) return;
+  stVVH = v;
+  try { localStorage.setItem('usvvh', String(v)); } catch (e) {}
+}
+var stOn = false, stLanded = false, stW = 0, stTarget = 0, stGap = 0;
+var stFullIH = window.innerHeight || 0;
+function stStage(vvH, snap) {
+  var fl = document.getElementById('ufloat');
+  if (!fl) return;
+  var rect = fl.getBoundingClientRect();
+  var floatH = fl.offsetHeight;
+  var gap = window.innerHeight - rect.bottom;
+  stGap = gap;
+  stTarget = vvH;
+  var targetTop = vvH - floatH - gap;
+  fl.style.bottom = 'auto';
+  fl.style.top = rect.top + 'px';
+  if (snap) {
+    fl.style.transition = '';
+    fl.style.top = targetTop + 'px';
+  } else {
+    fl.style.transition = 'top .48s ease-out';
+    void fl.offsetHeight;
+    fl.style.top = targetTop + 'px';
+  }
+  stOn = true;
+}
+function stUnstage() {
+  var fl = document.getElementById('ufloat');
+  if (fl) { fl.style.transition = ''; fl.style.top = ''; fl.style.bottom = ''; }
+  stOn = false;
+}
+// 收起 transit 淡隐换位（-v146b10）：b8 收起的可见毛病是
+// 三件套叠加——.kbd 一摘、回顶钮就在半空（塌缩视口底部
+// 线）先淡入，与胶囊一前一后动；视口恢复落地时浮动组
+// 随 bottom 锚一次性跌落约 374px；胶囊宽度同时收缩。
+// b9 曾以 top 过渡 glide 收起，动画横跨视口尺寸变化瞬
+// 间、把页眉固定图层挤掉约一秒，已撤销——本版红线：
+// 只许动画 opacity（回顶钮自身的 opacity 淡入淡出自
+// v1.4.5 起天天运行、从未伤页眉，是安全通道）。键盘
+// 开着时收起：浮动组先经 #ufloat 的 CSS opacity 过渡
+// 150ms 淡出（.kbtransit），锚定解除、跌落、宽度收
+// 缩、.kbd 摘除全部在不可见期间完成；视口恢复落地
+// （b12 起改 120ms 轮询双量确认恢复，见下方 b12
+// 注）后由 kbTransitEnd 摘淡隐类，浮动组以最终形
+// 态在右下角淡入，用户只看到一次干净的淡隐淡现、没
+// 有任何可见位移。桌面/无键盘收起不入 transit（窗口
+// 高未塌缩），行为与 b8 逐字一致。淡出依赖 CSS 过
+// 渡：展开 glide 写在 inline 的 top 过渡会覆盖它，故
+// 收起流程里 stUnstage（清 inline）必须先于入 transit
+// ——uCollapseSearch 的调用顺序已保证，落地解除后
+// inline 亦已清。
+// b12 判据换血（收起侧探针实测）：blur/收起发生
+// 时 ih 总是先行恢复满值（742）、vvH 仍停在塌缩
+// 值（368），b10 的 ih 单量判据会误判「键盘没
+// 开」拒发淡隐；且其后 vv 的恢复提交能在一帧内
+// 完成（页眉 hd -187 跳回 0、胶囊 fl 378 跳回
+// 616 同帧），650ms 定时器与 resize 的 ih 单量
+// 结束都兜不住、全程可见——页眉与两按钮抽动的
+// 实锤。故入 transit 改三选一：ih 塌缩、vvH 塌
+// 缩、或本次收起前浮动组处于预定位（kbWasStaged，
+// 由 uCollapseSearch 在 stUnstage 之前捕获 stOn
+// 传入；本函数唯一调用方就是它）。结束改 120ms
+// 轮询：至少隐满 350ms、且 ih 与 vvH 双量齐满
+// 才 kbTransitEnd，1500ms 硬顶兜底；focus 与再
+// 展开两条用户主动路径仍可提前结束（它们直调
+// kbTransitEnd）。桌面/无键盘时三判据全假、不
+// 入 transit，行为与 b8 一致。
+var kbTransit = false, kbTransitPoll = 0, kbTransitAt = 0, kbCollapsing = false, kbWasStaged = false;
+function kbTransitStart() {
+  if (kbTransit) return;
+  var staged = kbWasStaged;
+  kbWasStaged = false;
+  var vvNow = window.visualViewport ? Math.round(window.visualViewport.height) : window.innerHeight;
+  if (!(window.innerHeight < stFullIH - 40 || vvNow < stFullIH - 40 || staged)) return;
+  kbTransit = true;
+  kbTransitAt = Date.now();
+  var fl = document.getElementById('ufloat');
+  if (fl) fl.classList.add('kbtransit');
+  clearInterval(kbTransitPoll);
+  kbTransitPoll = setInterval(kbTransitPollTick, 120);
+}
+function kbTransitPollTick() {
+  var el = Date.now() - kbTransitAt;
+  if (el >= 1500) { kbTransitEnd(); return; }
+  if (el < 350) return;
+  if (window.innerHeight < stFullIH - 2) return;
+  if (window.visualViewport && Math.round(window.visualViewport.height) < stFullIH - 2) return;
+  kbTransitEnd();
+}
+function kbTransitEnd() {
+  if (!kbTransit) return;
+  clearInterval(kbTransitPoll);
+  var fl = document.getElementById('ufloat');
+  if (fl) { fl.classList.remove('kbtransit'); fl.classList.remove('kbd'); }
+  uSyncSearchChrome();
+  kbTransit = false;
+}
+// vv-resize 预警纠偏：真塌缩先到先学键盘高；未
+// 预定位的 snap 抢救，已预定位但目标差过 4 的
+// 以展开时记下的 stGap 重算终点、snap 改写。
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', function () {
+    var box = document.getElementById('usearch');
+    if (!box || !box.classList.contains('open') || stLanded) return;
+    var v = Math.round(window.visualViewport.height);
+    if (!(v < window.innerHeight - 40)) return;
+    stLearn(v);
+    if (!stOn) { stStage(v, true); return; }
+    if (Math.abs(stTarget - v) > 4) {
+      var fl2 = document.getElementById('ufloat');
+      if (fl2) {
+        fl2.style.transition = '';
+        stTarget = v;
+        fl2.style.top = (v - fl2.offsetHeight - stGap) + 'px';
+      }
+    }
+  });
+}
+// 落地解除：窗口高塌缩到预定位目标即恢复 bottom
+// 锚（落点与预定位一致，无跳变）；若窗口高反而
+// 回到目标之上 40 有余（键盘未落地先被关、或预
+// 测偏差过大），同样解除，免得胶囊悬在半空。
+// （本页自 -v146b14 起已无页眉补偿写入，见下方
+// uFixPad 退役注。）
+window.addEventListener('resize', function () {
+  if (!stOn || stLanded) return;
+  if (!document.getElementById('usearch').classList.contains('open')) return;
+  if (window.innerHeight <= stTarget + 2) { stLanded = true; stUnstage(); return; }
+  if (window.innerHeight > stTarget + 40) stUnstage();
+});
+// 滚动自动收缩：挂在全页唯一的节流滚动监听尾部调用；
+// 程序滚动（位置恢复的一跳、平滑回顶动画、加载引起的
+// 滚动钳制）经 progScrollUntil 抑制窗口豁免，只认手动
+// 滚动。收缩只收形态：搜索词与结果保留、dot 留痕。
+function uSearchAutoHide() {
+  if (Date.now() < progScrollUntil) return;
+  if (document.activeElement === uqEl) return;
+  uCollapseSearch();
+}
+uqEl.addEventListener('input', function (e) {
+  uSyncSearchChrome();
   var v = e.target.value.trim();
   clearTimeout(qTimer);
   qTimer = setTimeout(function () {
@@ -18167,8 +18492,154 @@ document.getElementById('q').addEventListener('input', function (e) {
     enterKey();
   }, 300);
 });
+uqEl.addEventListener('keydown', function (e) {
+  if (e.key === 'Enter') { e.preventDefault(); uCollapseSearch(); }
+});
+// blur 并入统一收起（-v146b11）：b10 的 blur 监听只
+// 入 transit、不解锚也不收起——按键盘自带收起键
+// ⌄ 时键盘被系统收走、页面只收到 blur，胶囊以展开
+// 姿势被晾在塌缩视口底部线（top 锚）上悬停，等恢
+// 复 resize 的安全阀晚到才掉下去；blur 晚到时窗口
+// 高已恢复、kbTransitStart 的 ih 判据又直接放行，
+// 连淡隐都没有——与点按钮收起（走 uCollapseSearch：
+// 先解锚再淡隐）表现完全两样。本版 blur 改走同一
+// 条收起流水线：搜索还开着且不在收起流程中，就直
+// 接调 uCollapseSearch()，解锚/transit/摘 .kbd 全
+// 由它接管，只剩一条收起路径。防递归：
+// uCollapseSearch 入口置 kbCollapsing、函数尾清
+// 零，其内程序化 blur() 触发本监听时见标志直接跳
+// 过（且 .open 在 blur() 前已摘除，.open 守卫是第
+// 二重保险）。
+// 胶囊内失焦豁免：点 × 清除键（uxbtn）或放大镜钮
+// （usbtn）时焦点可能从输入框移开、触发 blur，绝
+// 不能因此收起。两层判读：① blur 的 relatedTarget
+// 落在 #usearch 内 → 跳过；② relatedTarget 在部分
+// WebView 为 null 不可靠，再看触摸兜底——kbTouchAt
+// 是最近一次 touchstart 的时刻、kbTouchOut 记其目
+// 标在胶囊外（true）/内（false）：仅当最近触摸在
+// 胶囊内且距今 <500ms 才跳过（点按引起的失焦必
+// 然紧随其 touchstart）。时近性不可省：⌄ 路径里
+// 最后一次页面触摸往往正是开搜索时点的放大镜/输
+// 入框（同在胶囊内），若只看「在内」不看时近，要
+// 修的 ⌄ 路径会被自己豁免掉。两层都判在外才收起。
+uqEl.addEventListener('blur', function (e) {
+  if (kbCollapsing) return;
+  var box = document.getElementById('usearch');
+  if (!box || !box.classList.contains('open')) return;
+  var rt = e ? e.relatedTarget : null;
+  if (rt && rt.closest && rt.closest('#usearch')) return;
+  if (!kbTouchOut && Date.now() - kbTouchAt < 500) return;
+  uCollapseSearch();
+});
+// 再聚焦兜底：键盘被系统收起键关掉、搜索还开着时，
+// 再点输入框要重新预定位（展开端点的 staging 只在
+// uExpandSearch 里发生，单独点输入框不会走）。tran-
+// sit 未尽先结束淡隐、恢复可见；.kbd 随聚焦补回
+// （键盘将起、回顶钮当藏，与展开端点口径一致）。
+uqEl.addEventListener('focus', function () {
+  var box = document.getElementById('usearch');
+  if (!box || !box.classList.contains('open')) return;
+  if (kbTransit) kbTransitEnd();
+  document.getElementById('ufloat').classList.add('kbd');
+  if (!stOn && stVVH > 40 && stVVH < window.innerHeight - 40) stStage(stVVH, false);
+  uDragWatchArm();
+});
+// 键盘期真实拖动收起：展开且聚焦时，在胶囊外拖动超
+// 过 12px 识别为「想滚动」的意图，即收起搜索（blur
+// 连带退键盘）；胶囊内的触摸（点输入框、点 ×）不触
+// 发。桌面滚轮同理：聚焦中滚轮即收起，对齐「滚动时
+// 收回」。
+var kbTouchY = null, kbTouchX = null, kbTouchOut = false, kbTouchAt = 0;
+document.addEventListener('touchstart', function (e) {
+  kbTouchOut = !(e.target && e.target.closest && e.target.closest('#usearch'));
+  kbTouchAt = Date.now();
+  kbTouchY = (e.touches && e.touches[0]) ? e.touches[0].clientY : null;
+  kbTouchX = (e.touches && e.touches[0]) ? e.touches[0].clientX : null;
+}, { passive: true });
+document.addEventListener('touchmove', function (e) {
+  if (!document.getElementById('usearch').classList.contains('open') || document.activeElement !== uqEl || kbTouchY === null || !kbTouchOut) return;
+  var y = (e.touches && e.touches[0]) ? e.touches[0].clientY : null;
+  if (y === null) return;
+  if (Math.abs(y - kbTouchY) > 12) { kbTouchY = null; uCollapseSearch(); }
+}, { passive: true });
+document.addEventListener('wheel', function () {
+  if (document.activeElement === uqEl) uCollapseSearch();
+}, { passive: true });
+// y 位移拖动监视（-v146b12）：收起侧探针实测——
+// 此 WebView 原生滚动期间 touchmove 根本不送达
+// （2.7s 连续滚动零条记录、y 变化只有采样能看
+// 见），而 uSearchAutoHide 对聚焦态豁免，于是键
+// 盘开着拖动时无人收起，vv 几何提交还被持续触
+// 摸推迟、页眉被 vv 平移带到 hd -187。故改以
+// 100ms 采样容器 scrollTop 对基准 y0：位移 >24px
+// 即判定真实拖动，收起并停表。y0 在武装时（展
+// 开端点与 focus 兜底）记当时滚动位；progScroll-
+// Until 抑制窗内只刷新 y0 不判位移（程序滚动/
+// 位置恢复不误触）；搜索关闭或输入框失焦由 tick
+// 自检停表（失焦后归 blur 与 AutoHide 路径管）。
+// 单实例：重复武装只刷新 y0、不叠表；收起流程
+// 内亦停表（uCollapseSearch）。
+var uDragY0 = 0, uDragTimer = 0;
+function uDragWatchArm() {
+  uDragY0 = uScr.scrollTop || 0;
+  if (uDragTimer) return;
+  uDragTimer = setInterval(function () {
+    var box = document.getElementById('usearch');
+    if (!box || !box.classList.contains('open') || document.activeElement !== uqEl) { uDragWatchStop(); return; }
+    var y = uScr.scrollTop || 0;
+    if (Date.now() < progScrollUntil) { uDragY0 = y; return; }
+    if (Math.abs(y - uDragY0) > 24) { uDragWatchStop(); uCollapseSearch(); }
+  }, 100);
+}
+function uDragWatchStop() {
+  if (uDragTimer) { clearInterval(uDragTimer); uDragTimer = 0; }
+}
+// 点空白收起（-v146b12）：空白处是非可聚焦元
+// 素、不产生 blur（点按钮会、rt=null 实测），
+// b11 的 blur 统一收起等不到信号。改以点按识别
+// 补位：touchstart 在胶囊外落点（kbTouchOut），
+// touchend 时搜索还开着、时长 <400ms、位移
+// <12px 即点按，调 uCollapseSearch()。胶囊内
+// 触摸不触发；点 chip/页签/分页同样会先经此路
+// 收起，与它们自身的收起调用重复、但被 .open
+// 守卫与 kbCollapsing 挡住，无害。
+document.addEventListener('touchend', function (e) {
+  if (!kbTouchOut || !kbTouchAt) return;
+  var box = document.getElementById('usearch');
+  if (!box || !box.classList.contains('open')) return;
+  if (Date.now() - kbTouchAt >= 400) return;
+  var t = (e.changedTouches && e.changedTouches[0]) ? e.changedTouches[0] : null;
+  if (!t || kbTouchX === null || kbTouchY === null) return;
+  var dx = t.clientX - kbTouchX, dy = t.clientY - kbTouchY;
+  if (Math.sqrt(dx * dx + dy * dy) < 12) uCollapseSearch();
+}, { passive: true });
+// 展开中途宽度突变（旋转屏幕）直接收起，保预定
+// 位假设成立；键盘开合只改高度、不动宽度，不会
+// 误触。
+window.addEventListener('resize', function () {
+  if (!document.getElementById('usearch').classList.contains('open')) return;
+  if (stW && (window.innerWidth || 0) !== stW) uCollapseSearch();
+});
+document.getElementById('usbtn').onclick = function () {
+  var box = document.getElementById('usearch');
+  if (box.classList.contains('open')) uCollapseSearch();
+  else uExpandSearch();
+};
+document.getElementById('uxbtn').onclick = function () {
+  if (!uqEl.value) return;
+  uqEl.value = '';
+  uSyncSearchChrome();
+  clearTimeout(qTimer);
+  if (query) {
+    memLeave();
+    query = '';
+    enterKey();
+  }
+  uqEl.focus();
+};
 document.getElementById('chips').addEventListener('click', function (e) {
   if (!e.target.dataset || !e.target.dataset.f) return;
+  uCollapseSearch();
   var nf = e.target.dataset.f;
   var order = ['all', 'verified', 'pending', 'blocked'];
   var ni = order.indexOf(nf);
@@ -18197,12 +18668,65 @@ document.getElementById('sort').addEventListener('change', function () {
   resetAndLoad();
   uScrollTop();
 });
-document.getElementById('prev').onclick = function () { if (cursorStack.length) { curCursor = cursorStack.pop(); loadUsers(); uScrollTop(); } };
-document.getElementById('next').onclick = function () { if (nextCursor) { cursorStack.push(curCursor); curCursor = nextCursor; loadUsers(); uScrollTop(); } };
+document.getElementById('prev').onclick = function () {
+  uCollapseSearch();
+  if (pageAnchor > 0) {
+    if (pageAnchor > 1) { pageAnchor--; loadUsers(); uScrollTop(); }
+    return;
+  }
+  if (!cursorStack.length) return;
+  var topItem = cursorStack[cursorStack.length - 1];
+  if (typeof topItem === 'string' && topItem.indexOf('pg:') === 0) {
+    // 栈顶是跳页锚点标记：回锚定页改走页号模式一次取回。
+    cursorStack = [];
+    curCursor = '';
+    pageAnchor = Number(topItem.slice(3)) || 1;
+    pageJumpNext = null;
+    loadUsers();
+    uScrollTop();
+    return;
+  }
+  curCursor = cursorStack.pop();
+  loadUsers();
+  uScrollTop();
+};
+document.getElementById('next').onclick = function () {
+  uCollapseSearch();
+  if (pageAnchor > 0) {
+    if (pageJumpNext) {
+      // 跳页后「下一页」接回游标模式：栈底垫跳页锚点标记，
+      // 回程「上一页」据此转页号模式取回锚定页。
+      cursorStack = ['pg:' + pageAnchor];
+      curCursor = pageJumpNext;
+      pageAnchor = 0;
+      pageJumpNext = null;
+      loadUsers();
+      uScrollTop();
+    }
+    return;
+  }
+  if (nextCursor) { cursorStack.push(curCursor); curCursor = nextCursor; loadUsers(); uScrollTop(); }
+};
+document.getElementById('pgsel').addEventListener('change', function () {
+  var n = Number(document.getElementById('pgsel').value) || 1;
+  uCollapseSearch();
+  if (n === curPageNo()) return;
+  if (n === 1) { resetAndLoad(); uScrollTop(); return; }
+  // 页码直达：清空游标栈，以页号锚定一次取回目标页。
+  curCursor = '';
+  cursorStack = [];
+  pageAnchor = n;
+  pageJumpNext = null;
+  loadUsers();
+  uScrollTop();
+});
 
 function showTab(which) {
   var isStats = which === 'stats';
+  if (isStats) uCollapseSearch();
+  document.getElementById('usearch').style.display = isStats ? 'none' : '';
   document.getElementById('paneList').style.display = isStats ? 'none' : '';
+  document.getElementById('chips').style.display = isStats ? 'none' : '';
   document.getElementById('paneStats').style.display = isStats ? '' : 'none';
   document.getElementById('tabList').className = 'tab' + (isStats ? '' : ' on');
   document.getElementById('tabStats').className = 'tab' + (isStats ? ' on' : '');
@@ -18284,25 +18808,12 @@ fetch('/api/stats?' + qs.toString())
   .catch(statsFail);
 
 loadUsers();
-var uPad = 0;
-function uFixPad() {
-  var hd = document.getElementById('uhead');
-  if (!hd) return;
-  var h = hd.offsetHeight;
-  if (h && h !== uPad) {
-    uPad = h;
-    document.body.style.paddingTop = h + 'px';
-    // 筛选行吸顶位置跟随实测页眉高度（boot 与 resize 防抖共用此函数）。
-    var cp = document.getElementById('chips');
-    if (cp) cp.style.top = h + 'px';
-  }
-}
-var uPadTimer = 0;
-window.addEventListener('resize', function () {
-  clearTimeout(uPadTimer);
-  uPadTimer = setTimeout(uFixPad, 120);
-});
-uFixPad();
+// 页眉补偿退役（-v146b14）：列表页改内层容器滚动
+// 后，页眉与筛选行都是普通流内块、位置由布局决
+// 定，不再需要实测页眉高写 body padding 与 chips
+// 吸顶 top；uFixPad 与其 resize 防抖监听整套删
+// 除。另两页不在本页脚本内，各自的版式逻辑不受
+// 影响。
 var uAnim = 0;
 function uStopAnim() {
   if (uAnim) { cancelAnimationFrame(uAnim); uAnim = 0; }
@@ -18317,18 +18828,18 @@ function slideIn(el, dir) {
   el.classList.add(dir >= 0 ? 'in-r' : 'in-l');
 }
 function uScrollTop() {
-  var startY = window.pageYOffset || 0;
-  var startX = window.pageXOffset || 0;
-  if (!startY && !startX) return;
+  var startY = uScr.scrollTop || 0;
+  if (!startY) return;
   uStopAnim();
-  var dist = Math.max(Math.abs(startY), Math.abs(startX));
+  var dist = Math.abs(startY);
   var dur = Math.min(600, Math.max(220, Math.round(dist * 0.35)));
+  progScrollUntil = Date.now() + dur + 200;
   var t0 = 0;
   function uStep(ts) {
     if (!t0) t0 = ts;
     var p = Math.min(1, (ts - t0) / dur);
     var e = 1 - Math.pow(1 - p, 3);
-    window.scrollTo(Math.round(startX * (1 - e)), Math.round(startY * (1 - e)));
+    uScr.scrollTop = Math.round(startY * (1 - e));
     uAnim = p < 1 ? requestAnimationFrame(uStep) : 0;
   }
   uAnim = requestAnimationFrame(uStep);
