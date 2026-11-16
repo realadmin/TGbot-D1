@@ -12626,7 +12626,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.5.3';
+const BOT_VERSION = 'v1.5.4';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -14693,7 +14693,7 @@ function buildGuidePage(pageCtx = {}) {
     <h2>📋 访客列表与数据统计</h2>
     <ul>
       <li><b class=\"k\">两个标签页：</b>「访客列表」和「数据统计」，默认打开列表页，点顶部标签切换。</li>
-      <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。页眉下方的「全部 / 已验证 / 待验证 / 已屏蔽」是快速筛选；还能换排序顺序。在列表上左右滑动，也能在四个筛选和「数据统计」之间切换。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
+      <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。这组按钮可以长按拖动摆放：按住任意一颗拖动、松手吸附到屏幕左侧或右侧，觉得挡住列表就把它挪开；展开搜索时它回到输入法上方（靠左时搜索框改为向右展开），收起回到放它的位置，拖回右下角原位会恢复自动避让分页条；关掉页面再打开则回到原位。页眉下方的「全部 / 已验证 / 待验证 / 已屏蔽」是快速筛选；还能换排序顺序。在列表上左右滑动，也能在四个筛选和「数据统计」之间切换。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
       <li><b class=\"k\">位置会记住：</b>每个筛选与搜索组合下翻到的页码和滚动位置都会被记住，切去别处再切回来，会自动回到离开时的位置（内容是重新拉取的新数据）；手动更换排序会清掉全部位置记忆，各视图都从第一页重新开始。</li>
       <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词封禁对他同样无效）和「🚫 屏蔽 / ✅ 解封」（与 /ban、/unban 同一套封禁：屏蔽后他再发来的新消息会被立即删掉；解封时他会收到一条解除通知）；设为信任的人行上会挂「🤝 已信任」徽标，屏蔽中的人挂「已屏蔽」徽标。</li>
       <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
@@ -17721,6 +17721,14 @@ function buildUserListPage(pageCtx = {}) {
   #ufloat { position: fixed; right: 18px; bottom: 18px; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); z-index: 3; display: flex; flex-direction: column; align-items: flex-end; transform: translate3d(0,0,0); transition: opacity .15s ease; }
   #ufloat.dodgesmooth { transition: transform .2s ease, opacity .15s ease; }
   #ufloat.kbtransit { opacity: 0; }
+  #ufloat.ufleft { align-items: flex-start; }
+  #ufloat.ufleft #usbtn { right: auto; left: 0; }
+  #ufloat.ufleft #uxbtn { left: auto; right: 0; }
+  #ufloat.ufleft #uq { right: auto; left: 48px; padding: 0 2px 0 8px; }
+  #ufloat.ufleft #usdot { right: auto; left: 9px; }
+  #ufloat.ufdrag #toTop { transform: scale(1.07); }
+  #ufloat.ufdrag #usearch { transform: scale(1.07); transition: width .32s ease, transform .15s ease; }
+  #ufloat.ufhome #toTop, #ufloat.ufhome #usearch { box-shadow: 0 0 0 2px rgba(142,205,240,.9), 0 10px 28px rgba(0,0,0,.45); }
   .glassbtn { border: 1px solid rgba(255,255,255,.22); background: rgba(38,56,74,.55); background: linear-gradient(135deg, rgba(255,255,255,.16), rgba(255,255,255,.06)), rgba(38,56,74,.55); -webkit-backdrop-filter: blur(18px) saturate(1.6); backdrop-filter: blur(18px) saturate(1.6); box-shadow: 0 10px 28px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.35), inset 0 -8px 16px rgba(255,255,255,.04); color: #fff; }
   #toTop { width: 48px; height: 48px; padding: 0; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; opacity: 0; visibility: hidden; pointer-events: none; transition: opacity .25s ease, visibility .25s ease, transform .15s ease; }
   #toTop.show { opacity: 1; visibility: visible; pointer-events: auto; }
@@ -18326,6 +18334,7 @@ function uExpandSearch() {
   if (window.innerHeight <= (window.visualViewport ? Math.round(window.visualViewport.height) : window.innerHeight) + 2) stFullIH = window.innerHeight;
   if (stVVH > 40 && stVVH < window.innerHeight - 40) stStage(stVVH);
   try { uqEl.focus({ preventScroll: true }); } catch (e) { uqEl.focus(); }
+  ufDockForOpen();
   uDragWatchArm();
 }
 function uCollapseSearch() {
@@ -18344,6 +18353,7 @@ function uCollapseSearch() {
   kbTransitStart();
   box.classList.remove('open');
   if (!kbTransit) { document.getElementById('ufloat').classList.remove('kbd'); kbDodgeOff = false; uFloatDodge(true); }
+  ufRestorePos();
   uqEl.blur();
   uSyncSearchChrome();
   kbCollapsing = false;
@@ -18450,10 +18460,21 @@ function stUnstage() {
   stOn = false;
 }
 var stShift = 0;
+// 拖动吸附分量（-v153p1 探针）：ufX/ufY 是浮动组相对
+// 原位的摆放偏移，与 stShift/stPair/kbDodgeY 并列、仍
+// 经唯一写入点推出；两者皆 0 时写入串与基线逐字相同。
+// ufSide/ufBottom 是所存位置（bottom = 组下沿距视口底
+// 的距离），ufHomeB/ufHomeR 为加载时实测的原位底距与
+// 右距，ufDragOn 为拖动态（避让在此期间让位）。
+var ufX = 0, ufY = 0;
+var ufSide = 'right', ufBottom = -1, ufHomeB = 18, ufHomeR = 18, ufDragOn = false;
 function uFloatTransform() {
   var fl = document.getElementById('ufloat');
   if (!fl) return;
-  fl.style.transform = 'translate3d(0,' + (-(stShift + stPair + kbDodgeY)) + 'px,0)';
+  fl.style.transform = 'translate3d(' + (ufX ? ufX + 'px' : '0') + ',' + (-(stShift + stPair + kbDodgeY) + ufY) + 'px,0)';
+}
+function ufIsHome() {
+  return ufSide === 'right' && (ufBottom < 0 || Math.abs(ufBottom - ufHomeB) < 1);
 }
 // 方案 A（-v151b9）：可信高度集 + 坏→好配对纠正。
 // iOS 26 宿主侧故障（真机+研究双定案）：某些第三
@@ -18655,6 +18676,7 @@ function uFloatDodge(animate) {
   if (!fl) return;
   var box = document.getElementById('usearch');
   if (kbDodgeOff || kbTransit || viewAnim || (box && box.classList.contains('open'))) return;
+  if (ufDragOn || !ufIsHome()) { if (kbDodgeY !== 0) kbDodgeApply(0, animate); return; }
   var pg = document.querySelector('.pager');
   if (!pg || document.getElementById('paneList').style.display === 'none' || pg.style.visibility === 'hidden') { kbDodgeApply(0, animate); return; }
   var fr = fl.getBoundingClientRect();
@@ -19317,6 +19339,262 @@ function uScrollTop() {
   }
   uAnim = requestAnimationFrame(uStep);
 }
+
+// ===== 浮动组拖动吸附 =====
+// 长按拖动 / 左右吸附 / 原位坞 / 左侧镜像展开 /
+// sessionStorage 记忆（键 ufpos1，绝不写 localStorage）。
+// 位置只存 {side, bottom}；模式（分页条避让是否生效）
+// 每次由 ufIsHome() 按当前位置现算、不单独存储，杜绝
+// 「拖过一次就永久手动」的闩锁。摆放全走唯一写入点
+// 的 ufX/ufY 分量，CSS 锚点终身不动。吸附、展开坞
+// 位、收起回位等一次性移动以 rAF 插值推进，不挂
+// CSS transform 过渡：免与展开淡入的 inline 过渡、
+// 键盘期的逐帧即时写入互相打架。
+var ufHomeW = 48;
+function ufDockX(w) {
+  if (ufSide !== 'left') return 0;
+  return Math.round(2 * ufHomeR + w - window.innerWidth);
+}
+function ufClosedY() {
+  return Math.round(ufHomeB - (ufBottom < 0 ? ufHomeB : ufBottom));
+}
+function ufSyncSideClass() {
+  var fl = document.getElementById('ufloat');
+  if (fl) fl.classList.toggle('ufleft', ufSide === 'left');
+}
+function ufApplyClosed() {
+  ufX = ufDockX(ufHomeW);
+  ufY = ufClosedY();
+  ufSyncSideClass();
+  uFloatTransform();
+}
+function ufSavePos() {
+  try { sessionStorage.setItem('ufpos1', JSON.stringify({ s: ufSide, b: Math.round(ufBottom) })); } catch (e) {}
+}
+var ufGlideTimer = 0, ufGlideFrom = null, ufGlideDst = null, ufGlideT0 = 0;
+function ufGlideStop() {
+  if (ufGlideTimer) { cancelAnimationFrame(ufGlideTimer); ufGlideTimer = 0; }
+  ufGlideFrom = null;
+  ufGlideDst = null;
+}
+function ufGlideTo(tx, ty, dur) {
+  ufGlideStop();
+  ufGlideFrom = { x: ufX, y: ufY };
+  ufGlideDst = { x: tx, y: ty };
+  ufGlideT0 = Date.now();
+  var step = function () {
+    if (!ufGlideFrom || !ufGlideDst) { ufGlideTimer = 0; return; }
+    var p = Math.min(1, (Date.now() - ufGlideT0) / dur);
+    var e = 1 - Math.pow(1 - p, 3);
+    ufX = Math.round(ufGlideFrom.x + (ufGlideDst.x - ufGlideFrom.x) * e);
+    ufY = Math.round(ufGlideFrom.y + (ufGlideDst.y - ufGlideFrom.y) * e);
+    uFloatTransform();
+    if (p < 1) { ufGlideTimer = requestAnimationFrame(step); return; }
+    ufGlideTimer = 0;
+    ufGlideFrom = null;
+    ufGlideDst = null;
+  };
+  ufGlideTimer = requestAnimationFrame(step);
+}
+// 左侧展开/收起时胶囊宽度在动：横向偏移须逐帧按当
+// 前组宽重算、把左缘钉在边距上；纵向同时朝目标收
+// 敛（展开 = 坞位 0，收起 = 所存底距）。宽度与纵
+// 向都稳住 3 帧后停表；开合状态翻转时自动改向。
+var ufTrackOn = false, ufTrackMode = 'open', ufTrackStable = 0, ufTrackLastW = -1;
+function ufTrackStart(mode) {
+  ufTrackMode = mode;
+  ufTrackStable = 0;
+  ufTrackLastW = -1;
+  if (ufTrackOn) return;
+  ufTrackOn = true;
+  requestAnimationFrame(ufTrackTick);
+}
+function ufTrackTick() {
+  if (!ufTrackOn) return;
+  var fl = document.getElementById('ufloat');
+  var box = document.getElementById('usearch');
+  if (!fl || !box) { ufTrackOn = false; return; }
+  var open = box.classList.contains('open');
+  if (ufTrackMode === 'open' && !open) ufTrackMode = 'closed';
+  if (ufTrackMode === 'closed' && open) ufTrackMode = 'open';
+  var w = fl.offsetWidth || 48;
+  var targetY = ufTrackMode === 'open' ? 0 : ufClosedY();
+  ufX = ufDockX(w);
+  if (Math.abs(ufY - targetY) <= 1) ufY = targetY;
+  else ufY = Math.round(ufY + (targetY - ufY) * 0.35);
+  uFloatTransform();
+  if (w === ufTrackLastW && ufY === targetY) ufTrackStable += 1;
+  else ufTrackStable = 0;
+  ufTrackLastW = w;
+  if (ufTrackStable >= 3) { ufTrackOn = false; return; }
+  requestAnimationFrame(ufTrackTick);
+}
+function ufDockForOpen() {
+  if (ufSide === 'left') { ufGlideStop(); ufTrackStart('open'); return; }
+  ufGlideTo(0, 0, 280);
+}
+function ufRestorePos() {
+  if (kbTransit) {
+    // 淡隐窗口内瞬时回位（不可见期完成，与基线收起
+    // 编排同口径）；横向按收起后组宽（原位实测宽）算。
+    ufGlideStop();
+    ufTrackOn = false;
+    ufX = ufDockX(ufHomeW);
+    ufY = ufClosedY();
+    ufSyncSideClass();
+    uFloatTransform();
+    return;
+  }
+  if (ufSide === 'left') { ufTrackStart('closed'); return; }
+  ufGlideTo(0, ufClosedY(), 280);
+}
+var ufPressTimer = 0, ufPressPt = null, ufDragCtx = null, ufSwallowAt = 0;
+function ufPt(e) {
+  if (e.touches && e.touches[0]) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  if (e.changedTouches && e.changedTouches[0]) return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+  return { x: e.clientX, y: e.clientY };
+}
+function ufPressCancel() {
+  if (ufPressTimer) { clearTimeout(ufPressTimer); ufPressTimer = 0; }
+  ufPressPt = null;
+}
+function ufOnPressStart(e) {
+  if (e.type === 'mousedown' && e.button) return;
+  var box = document.getElementById('usearch');
+  if (!box || box.classList.contains('open')) return;
+  var pane = document.getElementById('paneList');
+  if (pane && pane.style.display === 'none') return;
+  var t = e.target;
+  if (!t || !t.closest || !t.closest('#ufloat')) return;
+  if (t.closest('#uq')) return;
+  ufPressPt = ufPt(e);
+  if (ufPressTimer) clearTimeout(ufPressTimer);
+  var p0 = ufPressPt;
+  ufPressTimer = setTimeout(function () { ufDragBegin(p0); }, 250);
+}
+function ufDragBegin(p) {
+  ufPressTimer = 0;
+  var fl = document.getElementById('ufloat');
+  if (!fl) return;
+  var box = document.getElementById('usearch');
+  if (box && box.classList.contains('open')) return;
+  ufGlideStop();
+  ufTrackOn = false;
+  // 避让正顶着时先把避让量折进 ufY 初值再归零：
+  // 合成偏移 -(stShift + stPair + kbDodgeY) + ufY
+  // 在抓取帧前后逐像素不变，按钮组停在眼睛看到的
+  // 位置开始跟手（收起态 stShift/stPair 恒 0，折
+  // 入只动纵向分量）；拖动期间 kbDodgeY 恒 0，
+  // 落点存的位置仍按拖动坐标系现算、不含避让
+  // 量；拖动期间避让由 uFloatDodge 的门让位。
+  if (kbDodgeY !== 0) { ufY -= kbDodgeY; kbDodgeApply(0); }
+  ufDragOn = true;
+  swipeOff = true;
+  var r = fl.getBoundingClientRect();
+  ufDragCtx = { sx: p.x, sy: p.y, x0: ufX, y0: ufY, left: r.left, top: r.top, w: r.width, h: r.height };
+  fl.classList.add('ufdrag');
+}
+function ufOnMove(e) {
+  if (ufDragOn && ufDragCtx) {
+    if (e.cancelable) e.preventDefault();
+    var p = ufPt(e);
+    var vw = window.innerWidth, ih = window.innerHeight;
+    var nl = ufDragCtx.left + (p.x - ufDragCtx.sx);
+    var nt = ufDragCtx.top + (p.y - ufDragCtx.sy);
+    if (nl < 6) nl = 6;
+    if (nl > vw - ufDragCtx.w - 6) nl = vw - ufDragCtx.w - 6;
+    if (nt < 6) nt = 6;
+    if (nt > ih - ufDragCtx.h - 6) nt = ih - ufDragCtx.h - 6;
+    ufX = ufDragCtx.x0 + Math.round(nl - ufDragCtx.left);
+    ufY = ufDragCtx.y0 + Math.round(nt - ufDragCtx.top);
+    uFloatTransform();
+    var bd = ih - (nt + ufDragCtx.h);
+    var hint = (nl + ufDragCtx.w / 2) >= vw / 2 && bd <= ufHomeB + 36;
+    var fl = document.getElementById('ufloat');
+    if (fl) fl.classList.toggle('ufhome', hint);
+    return;
+  }
+  if (ufPressPt) {
+    var q = ufPt(e);
+    var dx = q.x - ufPressPt.x, dy = q.y - ufPressPt.y;
+    if (Math.sqrt(dx * dx + dy * dy) > 10) ufPressCancel();
+  }
+}
+function ufOnEnd() {
+  if (!ufDragOn) { ufPressCancel(); return; }
+  ufDragOn = false;
+  ufSwallowAt = Date.now();
+  var fl = document.getElementById('ufloat');
+  var ctx = ufDragCtx;
+  ufDragCtx = null;
+  if (!fl || !ctx) return;
+  fl.classList.remove('ufdrag');
+  fl.classList.remove('ufhome');
+  var r = fl.getBoundingClientRect();
+  var vw = window.innerWidth, ih = window.innerHeight;
+  var bd = Math.round(ih - r.bottom);
+  var side = (r.left + r.width / 2) >= vw / 2 ? 'right' : 'left';
+  var docked = false;
+  if (side === 'right' && bd <= ufHomeB + 36) {
+    ufSide = 'right';
+    ufBottom = ufHomeB;
+    docked = true;
+  } else {
+    ufSide = side;
+    ufBottom = bd;
+  }
+  ufSyncSideClass();
+  ufSavePos();
+  ufGlideTo(ufDockX(fl.offsetWidth || 48), ufClosedY(), 280);
+  setTimeout(function () { uFloatDodge(true); }, 300);
+}
+function ufPosInit() {
+  var fl = document.getElementById('ufloat');
+  if (!fl) return;
+  var r = fl.getBoundingClientRect();
+  if (r && r.width > 10) {
+    ufHomeW = Math.round(r.width);
+    ufHomeB = Math.round(window.innerHeight - r.bottom);
+    ufHomeR = Math.round(window.innerWidth - r.right);
+  }
+  var raw = null;
+  try { raw = sessionStorage.getItem('ufpos1'); } catch (e) {}
+  if (raw) {
+    try {
+      var o = JSON.parse(raw);
+      if (o && (o.s === 'left' || o.s === 'right') && isFinite(Number(o.b))) {
+        ufSide = o.s;
+        ufBottom = Number(o.b);
+      }
+    } catch (e) {}
+  }
+  if (ufSide === 'right' && ufBottom >= 0 && Math.abs(ufBottom - ufHomeB) <= 2) ufBottom = ufHomeB;
+  ufApplyClosed();
+}
+var ufFlEl = document.getElementById('ufloat');
+if (ufFlEl) {
+  ufFlEl.addEventListener('touchstart', ufOnPressStart, { passive: true });
+  ufFlEl.addEventListener('mousedown', ufOnPressStart);
+  ufFlEl.addEventListener('click', function (e) {
+    if (Date.now() - ufSwallowAt < 600) {
+      e.stopPropagation();
+      e.preventDefault();
+      ufSwallowAt = 0;
+    }
+  }, true);
+}
+document.addEventListener('touchmove', ufOnMove, { passive: false });
+document.addEventListener('mousemove', ufOnMove);
+document.addEventListener('touchend', ufOnEnd);
+document.addEventListener('touchcancel', ufOnEnd);
+document.addEventListener('mouseup', ufOnEnd);
+window.addEventListener('resize', function () {
+  var box = document.getElementById('usearch');
+  if (box && box.classList.contains('open')) return;
+  if (ufDragOn) return;
+  ufApplyClosed();
+});
+ufPosInit();
 </script>
 ${expiryBannerScript(pageCtx.botUsername)}
 </body>
