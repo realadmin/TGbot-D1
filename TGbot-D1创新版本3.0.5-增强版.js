@@ -17733,7 +17733,7 @@ function buildUserListPage(pageCtx = {}) {
   .pager button { padding: 7px 16px; border-radius: 8px; border: 1px solid #2b3a47; background: #17212b; color: #e8edf2; cursor: pointer; }
   .pager button:disabled { opacity: .4; }
   #toast { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%); background: #2b5278; color: #fff; padding: 9px 16px; border-radius: 10px; display: none; font-size: 14px; }
-  #ufloat { position: fixed; right: 18px; bottom: 18px; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); z-index: 3; display: flex; flex-direction: column; align-items: flex-end; transition: opacity .15s ease; }
+  #ufloat { position: fixed; right: 18px; bottom: 18px; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); z-index: 3; display: flex; flex-direction: column; align-items: flex-end; transform: translate3d(0,0,0); transition: opacity .15s ease; }
   #ufloat.dodgesmooth { transition: transform .2s ease, opacity .15s ease; }
   #ufloat.kbtransit { opacity: 0; }
   .glassbtn { border: 1px solid rgba(255,255,255,.22); background: rgba(38,56,74,.55); background: linear-gradient(135deg, rgba(255,255,255,.16), rgba(255,255,255,.06)), rgba(38,56,74,.55); -webkit-backdrop-filter: blur(18px) saturate(1.6); backdrop-filter: blur(18px) saturate(1.6); box-shadow: 0 10px 28px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.35), inset 0 -8px 16px rgba(255,255,255,.04); color: #fff; }
@@ -18336,6 +18336,8 @@ function uExpandSearch() {
   uSyncSearchChrome();
   stW = window.innerWidth || 0;
   stLanded = false;
+  stPair = 0;
+  stFresh = (window.innerHeight - (window.visualViewport ? Math.round(window.visualViewport.height) : window.innerHeight) <= 2) && document.activeElement !== uqEl;
   if (window.innerHeight <= (window.visualViewport ? Math.round(window.visualViewport.height) : window.innerHeight) + 2) stFullIH = window.innerHeight;
   if (stVVH > 40 && stVVH < window.innerHeight - 40) stStage(stVVH);
   try { uqEl.focus({ preventScroll: true }); } catch (e) { uqEl.focus(); }
@@ -18348,6 +18350,11 @@ function uCollapseSearch() {
   kbWasStaged = stOn;
   if (stOn) stUnstage();
   stLanded = false;
+  if (stPair !== 0) { stPair = 0; uFloatTransform(); }
+  clearTimeout(stPairTimer);
+  sqResetAll();
+  if (stPendingBad) stLearnArm = true;
+  stFresh = false;
   uDragWatchStop();
   kbTransitStart();
   box.classList.remove('open');
@@ -18402,6 +18409,27 @@ var stFullIH = window.innerHeight || 0;
 // 现与回落形态不受残留影响。附带收益：展开
 // 中途收起时 unstage 再无 transform 可 snap
 // （探针第 2 次展开的脆弱点随 FLIP 一并消失）。
+// -v151b7 载体换血（架构级）：240fps 外拍定罪
+// 落地换锚丢层之后，b6 的淡隐掩护只是把丢帧
+// 藏起来——锚切换本身仍在。本版釜底抽薪：
+// bottom 锚终身不变，预定位改走 transform 补
+// 偿（合成器矩阵更新、层不重建、不存在可丢
+// 的 flush；WebKit 170280/146485 同类机制，
+// backdrop-filter 在锚切换时再加重丢层）。展
+// 开时以 stShift = max(0, innerHeight - vvH)
+// 把浮动组提前顶到落地位（挡 scroll-into-
+// view 平移的原理不变）；视口塌缩落地时锚自
+// 身骑到目标位，stUnstage 把 stShift 归零，
+// 屏幕位置全程不变，落地时刻的风格变更只剩
+// 一个 transform 数值。#ufloat 的 transform
+// 自此由单一写入点 uFloatTransform 统管：总
+// 偏移 = -(stShift + kbDodgeY)，两分量各自
+// 维护、永不写空（层常驻，CSS 基础规则已预
+// 置 translate3d(0,0,0)）。rect 读数含全部
+// transform 偏移，凡推算自然位置处一律加回
+// 总偏移（stStage 的 gap 与 uFloatDodge 的
+// 自然带各一处）。淡入整套不变（opacity 是
+// 合成器属性、安全）。
 var stFadeTimer = 0;
 function stFadeDone() {
   var fl = document.getElementById('ufloat');
@@ -18411,15 +18439,12 @@ function stStage(vvH) {
   var fl = document.getElementById('ufloat');
   if (!fl) return;
   var rect = fl.getBoundingClientRect();
-  var floatH = fl.offsetHeight;
-  var gap = window.innerHeight - (rect.bottom + kbDodgeY);
+  var gap = window.innerHeight - (rect.bottom + stShift + kbDodgeY);
   stGap = gap;
   stTarget = vvH;
-  var targetTop = vvH - floatH - gap;
+  stShift = Math.max(0, window.innerHeight - vvH);
   clearTimeout(stFadeTimer);
   kbDodgeApply(0);
-  fl.style.bottom = 'auto';
-  fl.style.top = targetTop + 'px';
   if (!stOn) {
     fl.style.transition = 'none';
     fl.style.opacity = '0';
@@ -18432,10 +18457,99 @@ function stStage(vvH) {
 }
 function stUnstage() {
   var fl = document.getElementById('ufloat');
-  if (fl) { fl.style.transition = ''; fl.style.top = ''; fl.style.bottom = ''; fl.style.transform = ''; fl.style.opacity = ''; }
+  stShift = 0;
+  stPair = 0;
+  uFloatTransform();
+  if (fl) { fl.style.transition = ''; fl.style.opacity = ''; }
   clearTimeout(stFadeTimer);
   stOn = false;
 }
+var stShift = 0;
+function uFloatTransform() {
+  var fl = document.getElementById('ufloat');
+  if (!fl) return;
+  fl.style.transform = 'translate3d(0,' + (-(stShift + stPair + kbDodgeY)) + 'px,0)';
+}
+// 方案 A（-v151b9）：可信高度集 + 坏→好配对纠正。
+// iOS 26 宿主侧故障（真机+研究双定案）：某些第三
+// 方键盘（如微信输入法）在会话中切换进入时按基
+// 础高度上报视口（vvH=417），其工具栏（42px）
+// 画在上报框外、盖住页面底部；而新鲜展开时按完
+// 整高度上报（vvH=375）、位置正确。覆盖条对页
+// 面一切几何读数（ih/vvH/宿主 tgH）不可见，无从
+// 直接测量——只能学：只信任新鲜展开（键盘关闭
+// 态点开）落地的高度（usgood 可信集）；切换落地
+// 停稳到曾被证坏的高度（uspair 有配对）时，按
+// 差额以 stPair 分量把胶囊顶起。配对的学法：切
+// 换落到未知高度先记 stPendingBad（不猜、不
+// 顶），收起时武装，其后下一次新鲜落地若高度
+// 不同，就记成一对（坏→好）；若相同，该高度新
+// 鲜态本就干净、只补记可信集。防串扰：停稳到
+// 别的高度（可信或已有配对）时清掉不相干的
+// stPendingBad，免得把甲键盘的坏高度配到乙键
+// 盘头上。对从未见过、又无配对的切换高度不做
+// 任何猜测性顶起（防误伤正常新键盘）；不按
+// UA/键盘名分支；不写死任何具体数值。存储读
+// 写全程 try/catch，不可用时静默降级为不纠正。
+// stPair 与 stShift/kbDodgeY 并列，仍经唯一写
+// 入点 uFloatTransform 推出（总偏移三者之和）。
+var stPair = 0, stPendingBad = 0, stLearnArm = false, stFresh = false, stPairTimer = 0;
+var stGood = [], stPairs = {};
+try { stGood = JSON.parse(localStorage.getItem('usgood') || '[]') || []; if (!Array.isArray(stGood)) stGood = []; } catch (e) {}
+try { stPairs = JSON.parse(localStorage.getItem('uspair') || '{}') || {}; if (typeof stPairs !== 'object' || Array.isArray(stPairs)) stPairs = {}; } catch (e) {}
+function stTrust(v) {
+  var i = stGood.indexOf(v);
+  if (i >= 0) stGood.splice(i, 1);
+  stGood.push(v);
+  while (stGood.length > 12) stGood.shift();
+  try { localStorage.setItem('usgood', JSON.stringify(stGood)); } catch (e) {}
+}
+function stSetPair(bad, good) {
+  stPairs[bad] = good;
+  var ks = Object.keys(stPairs);
+  while (ks.length > 8) { delete stPairs[ks[0]]; ks.shift(); }
+  try { localStorage.setItem('uspair', JSON.stringify(stPairs)); } catch (e) {}
+}
+function stFreshLand() {
+  if (!stFresh) return;
+  stFresh = false;
+  var arm = stLearnArm, bad = stPendingBad;
+  stLearnArm = false; stPendingBad = 0;
+  var v = window.visualViewport ? Math.round(window.visualViewport.height) : 0;
+  if (!(v > 40)) return;
+  stTrust(v);
+  // -v151b10：新鲜落地即地面真值——本高度若挂着坏配对，
+  // 当场删除并持久化自愈，免得日后切换落到它时被误顶。
+  if (stPairs[v]) { delete stPairs[v]; try { localStorage.setItem('uspair', JSON.stringify(stPairs)); } catch (e) {} }
+  if (arm && bad && bad !== v) { stSetPair(bad, v); }
+}
+function stPairArm() {
+  clearTimeout(stPairTimer);
+  stPairTimer = setTimeout(stPairSettle, 700);
+}
+function stPairSettle() {
+  var box = document.getElementById('usearch');
+  if (!box || !box.classList.contains('open')) return;
+  if (!stLanded || stOn) return;
+  if (!window.visualViewport) return;
+  var v = Math.round(window.visualViewport.height);
+  // -v151b10：开启判定改以 stFullIH（键盘关闭态记下的全高）
+  // 为基准——本机布局随键盘同步收缩、开启态 ih 与 vvH 恒
+  // 等，旧基准下三分支永不达；v > 40 下限另挡 ih=1 挤压态。
+  if (!(v > 40 && stFullIH > 0 && v < stFullIH - 40)) { if (stPair !== 0) { stPair = 0; uFloatTransform(); } return; }
+  if (stGood.indexOf(v) >= 0) { if (stPendingBad !== v) stPendingBad = 0; if (stPair !== 0) { stPair = 0; uFloatTransform(); } return; }
+  var good = stPairs[v];
+  if (good) {
+    if (stPendingBad !== v) stPendingBad = 0;
+    var lift = v - good;
+    var np = lift > 2 ? lift : 0;
+    if (np !== stPair) { stPair = np; uFloatTransform(); }
+    return;
+  }
+  if (stPair !== 0) { stPair = 0; uFloatTransform(); }
+  stPendingBad = v;
+}
+// 键盘高度分叉探针日志层（历版真机验数用）已于 v1.5.1 干净版整层剥离；机制本体（transform 补偿、方案 A 配对纠正、1px 挤压看守）逐字不变。
 // 收起 transit 淡隐换位（-v146b10）：b8 收起的可见毛病是
 // 三件套叠加——.kbd 一摘、回顶钮就在半空（塌缩视口底部
 // 线）先淡入，与胶囊一前一后动；视口恢复落地时浮动组
@@ -18549,7 +18663,7 @@ function kbDodgeApply(v, animate) {
     clearTimeout(kbDodgeAnimTimer);
   }
   kbDodgeY = v;
-  if (fl) fl.style.transform = v ? 'translateY(' + (-v) + 'px)' : '';
+  uFloatTransform();
 }
 function uFloatDodge(animate) {
   var fl = document.getElementById('ufloat');
@@ -18559,7 +18673,7 @@ function uFloatDodge(animate) {
   var pg = document.querySelector('.pager');
   if (!pg || document.getElementById('paneList').style.display === 'none' || pg.style.visibility === 'hidden') { kbDodgeApply(0, animate); return; }
   var fr = fl.getBoundingClientRect();
-  var natTop = fr.top + kbDodgeY, natBot = fr.bottom + kbDodgeY;
+  var natTop = fr.top + stShift + kbDodgeY, natBot = fr.bottom + stShift + kbDodgeY;
   var pr = pg.getBoundingClientRect();
   var need = 0;
   if (pr.bottom > natTop && pr.top < natBot) need = Math.round(natBot - pr.top + 8);
@@ -18579,6 +18693,50 @@ function dodgeLoop() {
   if (Date.now() - dodgeScrollAt > 150 && same) { dodgeRaf = 0; dodgeScrolling = false; return; }
   dodgeRaf = requestAnimationFrame(dodgeLoop);
 }
+// 1px 挤压看守（-v151b11 实验）：微信键盘在本页
+// 会话首次唤出时，落地正确后约 350ms ih 与 vvH
+// 同时塌为 1 并保持数秒（页面全黑），切换键盘才
+// 恢复（真机两录定案）；深度研究无公开先例、
+// 页面 CSS 救不了 1px 的原生框，唯一够得着的
+// 动作是 provoke 宿主重算——候选
+// Telegram.WebApp.expand()。看守挂在下方既有
+// vv-resize 处理函数内（不新增任何监听器），对
+// 既有机制只读：不碰 stShift/stPair/kbDodge 的
+// 任何判定与写入；挤压期间 stPairSettle 的
+// v>40 下限自保、不受影响。
+var sqTimer = 0, sqResetTimer = 0, sqPending = false, sqEpisode = false, sqNudged = false;
+function sqWatch(v) {
+  var ih = window.innerHeight;
+  if (ih <= 2 && v <= 2) {
+    if (sqResetTimer) { clearTimeout(sqResetTimer); sqResetTimer = 0; }
+    if (!sqPending && !sqEpisode) { sqPending = true; sqTimer = setTimeout(sqConfirm, 300); }
+    return;
+  }
+  if (sqPending) { clearTimeout(sqTimer); sqTimer = 0; sqPending = false; }
+  if (ih > 2 && v > 2) {
+    if (sqNudged) { sqNudged = false; }
+    if (sqEpisode && !sqResetTimer) sqResetTimer = setTimeout(sqResetDone, 1000);
+  } else if (sqResetTimer) { clearTimeout(sqResetTimer); sqResetTimer = 0; }
+}
+function sqConfirm() {
+  sqTimer = 0; sqPending = false;
+  var box = document.getElementById('usearch');
+  if (!box || !box.classList.contains('open')) return;
+  if (!window.visualViewport) return;
+  var v = Math.round(window.visualViewport.height);
+  if (!(window.innerHeight <= 2 && v <= 2)) return;
+  if (sqEpisode) return;
+  sqEpisode = true; sqNudged = true;
+  try {
+    if (window.Telegram && Telegram.WebApp && typeof Telegram.WebApp.expand === 'function') { Telegram.WebApp.expand(); }
+  } catch (e) {}
+}
+function sqResetDone() { sqResetTimer = 0; sqEpisode = false; }
+function sqResetAll() {
+  if (sqTimer) { clearTimeout(sqTimer); sqTimer = 0; }
+  if (sqResetTimer) { clearTimeout(sqResetTimer); sqResetTimer = 0; }
+  sqPending = false; sqEpisode = false; sqNudged = false;
+}
 // vv-resize 预警纠偏：真塌缩先到先学键盘高；未
 // 预定位的直接重钉 top 抢救定位，已预定位但目
 // 标差过 4 的重调 stStage 纠偏（-v150b9：FLIP
@@ -18587,8 +18745,30 @@ function dodgeLoop() {
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', function () {
     var box = document.getElementById('usearch');
-    if (!box || !box.classList.contains('open') || stLanded) return;
+    if (!box || !box.classList.contains('open')) return;
     var v = Math.round(window.visualViewport.height);
+    sqWatch(v);
+    // 落地后追踪（-v151b8）：落地后 staging 关闭、浮
+    // 动组只靠 bottom 锚，而会话中切换键盘时布局视
+    // 口高度不跟随变化、锚停在旧键盘位置，新键盘高
+    // 出的一截压住胶囊下部（真机定案；同键盘下收起
+    // 重开按当前几何重算则完整）。故 open 且已落地
+    // （且不在 staging——staging 期 stShift 由本处
+    // 理器后段的纠偏分支独占）时，每次 vv-resize 以布
+    // 局高与可视高之差重算补偿，经唯一写入点 uFloatTransform
+    // 推出；差回落（切回矮键盘、或键盘收起 vvH 涨
+    // 回全高）时 ns 归零、补偿自动放松。材质门 2px
+    // 防抖。门控双保险：open 类由 uCollapseSearch
+    // 同步摘除、stLanded 亦在收起时清零，收起后本
+    // 分支永不执行，偏移不会复活。
+    if (stLanded) {
+      if (!stOn) {
+        var ns = Math.max(0, window.innerHeight - v);
+        if (Math.abs(ns - stShift) > 2) { stShift = ns; uFloatTransform(); }
+        stPairArm();
+      }
+      return;
+    }
     if (!(v < window.innerHeight - 40)) return;
     stLearn(v);
     if (!stOn) { stStage(v); return; }
@@ -18604,7 +18784,7 @@ if (window.visualViewport) {
 window.addEventListener('resize', function () {
   if (!stOn || stLanded) return;
   if (!document.getElementById('usearch').classList.contains('open')) return;
-  if (window.innerHeight <= stTarget + 2) { stLanded = true; stUnstage(); return; }
+  if (window.innerHeight <= stTarget + 2) { stLanded = true; stUnstage(); stFreshLand(); stPairArm(); return; }
   if (window.innerHeight > stTarget + 40) stUnstage();
 });
 // 滚动自动收缩：挂在全页唯一的节流滚动监听尾部调用；
