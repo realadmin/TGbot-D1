@@ -33,7 +33,7 @@
  *   改回待验证，档案、备注与话题都保留，回来重验后还在原话题。
  * 功能清单（与仓库 README-增强版 条目对应）
  * Turnstile / 静态问答 / 顺序点击多验证方式与回退；管理员一次性通行证（网页访客列表发放，机器人私聊送达，30 分钟有效、凭 Telegram 身份确认、用后即焚，救济怎么也过不了验证的访客）；验证提示、通行证与成功回执都会记录消息 ID 并自动清理：通过验证即撤回提示与未用通行证，成功回执在访客发出首条消息时撤回（转发成功后亦有兜底清理，记账失败则回执自删不留孤儿），过期通行证在访客下次互动时清扫，状态类消息只保留最新一条；访客列表会显示待验证访客的通行证状态（已发证剩余分钟），发证动作返回到期时间并即时刷新行内徽标；第三轮三路审计修复：删人/重置/超时清理连带作废通行证、Turnstile 确认补封禁检查、删证与发证改原子条件操作、熔断到期通知与熔断回复改原子占用、验证提示加 3 分钟节流、反应镜像补访客状态检查、初始化错误不外泄细节、节流标记在验证成功/删人/超时清理时一并清掉；引用转发（含部分引用，三级降级）；
- * 反应双向同步；原地编辑同步 + 回复关联的「✍🏼已编辑」提示行（带「系统提示」按钮防伪造，Bot API 编辑
+ * 反应双向同步；原地编辑同步 + 被改副本下方附「✍🏼已编辑」内联按钮标记（与普通聊天编辑一样静默、无新消息提醒，Bot API 编辑
  * 无原生标记）；拉黑 / 取消拉黑提醒（my_chat_member + 403 兜底、
  * 标记去重）；/delete 按配对连带删除私聊原消息（原生删除无机器人
  * 事件、无法同步，属平台限制）；管理员备注 /note 同步到话题名
@@ -42,7 +42,7 @@
  * 台（原按钮菜单已下线，旧按钮回迁移提示）；新手引导 /guide；
  * 自动检查更新；服务熔断 /pause /resume（手动触发，闸门在去重之
  * 前；到期惰性恢复——由到期后第一条更新触发解除并通知，属刻意
- * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应同样拒收（编辑等于变相发新消息），被拒时每位访客每轮至多收到一张独立警告（pausewarn 记账、恢复时自动删除、文案可配，是否发送跟随熔断回复开关），不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」，该恢复提示会在访客下一次发消息时自动撤回）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、资料卡重建、话题内熔断开启/恢复/状态结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）；话题里管理员发出的命令消息在处理后一并撤回（未识别的命令同样），只短暂留回执、不留命令原文；主菜单追踪记录带写入时间戳，超过 48 小时（记录里的消息号已过 Telegram 删除窗口）会被数据库清扫整行删掉，读到过期记录时也直接跳过注定失败的删除。第四轮审计修复：问答验证答错 5 次锁定 30 分钟防穷举；三页签名链接按用途分权（引导/列表/管理台互不通用），签名密钥可改用独立的 LINK_SECRET 与 webhook 校验值解耦（未配置时回退 WEBHOOK_SECRET）；整段对话清空仅主管理员可操作、确认防重复执行、访客记录已删时点确认不再把空档案建回来，且清空只删开始那一刻收集到的快照记录（清空期间新到的消息配对不受影响），提示行改分块批量查询与批量删除；拉黑提醒记账竞态收尾，删档与超时清理一并清记账；主菜单追踪清扫按值条件删防误删新鲜记录、原地编辑不再刷新追踪时间戳（时间戳只记消息号的出生时刻）、旧格式纯数字追踪恢复解析；话题被手动关闭时先重开原话题再投递、不再误判失效重建；转发失败（内容受保护等）会在话题里提醒、群权限丢失时改走主管理员私聊告警；已验证访客发送过频会被限流丢弃并提醒；反应同步补匿名管理员处理，付费/自定义 emoji 不再误清已镜像的普通反应；短暂通知落 ephem 记账，定时删除没赶上时由数据库清扫补删；菜单签名链接的来源地址改为随请求传递（去掉可被任意请求覆盖的全局变量）；以频道身份发帖等没有 from 的消息直接忽略、不再抛错；命令 @ 的机器人名不是本机器人时完全忽略；/note 保存失败时保留命令原文便于改了重发。定制化扩展：管理台「基础配置」含参数与开关（转发限流强度、通行证/验证链接有效期、问答锁定次数与时长、命令回执停留秒数可调，均带范围校验；功能开关含编辑提示——已拆为「访客编辑是否提醒我」「我编辑是否提醒访客」两项，外加反应同步、转发失败提醒、拉黑提醒），另有「文案与呈现」（验证成功/答错、熔断恢复、拉黑/解封五句文案可改；话题名四种样式；主菜单五个按钮逐个显隐；访客列表默认排序与每页条数存服务端配置）；按访客例外：信任开关（is_trusted 与 relay_exempt 已合并为一个概念、两标记同写同清：列表/资料卡设置即置已验证并按验证成功收尾，闸门处对未验证的信任访客自动放行，一并免转发限流与类型过滤、免两种超时清理，屏蔽关键词与关键词自动封禁同样豁免；重置验证与 /reverify 连带撤销，资料卡按钮仅主管理员），列表行带「🤝 已信任」徽标与切换按钮，/api/users 附 uiDefaults 供列表页套用默认排序与页大小。
+ * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应同样拒收（编辑等于变相发新消息），被拒时每位访客每轮至多收到一张独立警告（pausewarn 记账、恢复时自动删除、文案可配，是否发送跟随熔断回复开关），不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」，该恢复提示会在访客下一次发消息时自动撤回）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、资料卡重建、话题内熔断开启/恢复/状态结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）；话题里管理员发出的命令消息在处理后一并撤回（未识别的命令同样），只短暂留回执、不留命令原文；主菜单追踪记录带写入时间戳，超过 48 小时（记录里的消息号已过 Telegram 删除窗口）会被数据库清扫整行删掉，读到过期记录时也直接跳过注定失败的删除。第四轮审计修复：问答验证答错 5 次锁定 30 分钟防穷举；三页签名链接按用途分权（引导/列表/管理台互不通用），签名密钥可改用独立的 LINK_SECRET 与 webhook 校验值解耦（未配置时回退 WEBHOOK_SECRET）；整段对话清空仅主管理员可操作、确认防重复执行、访客记录已删时点确认不再把空档案建回来，且清空只删开始那一刻收集到的快照记录（清空期间新到的消息配对不受影响），提示行改分块批量查询与批量删除；拉黑提醒记账竞态收尾，删档与超时清理一并清记账；主菜单追踪清扫按值条件删防误删新鲜记录、原地编辑不再刷新追踪时间戳（时间戳只记消息号的出生时刻）、旧格式纯数字追踪恢复解析；话题被手动关闭时先重开原话题再投递、不再误判失效重建；转发失败（内容受保护等）会在话题里提醒、群权限丢失时改走主管理员私聊告警；已验证访客发送过频会被限流丢弃并提醒；反应同步补匿名管理员处理，付费/自定义 emoji 不再误清已镜像的普通反应；短暂通知落 ephem 记账，定时删除没赶上时由数据库清扫补删；菜单签名链接的来源地址改为随请求传递（去掉可被任意请求覆盖的全局变量）；以频道身份发帖等没有 from 的消息直接忽略、不再抛错；命令 @ 的机器人名不是本机器人时完全忽略；/note 保存失败时保留命令原文便于改了重发。定制化扩展：管理台「基础配置」含参数与开关（转发限流强度、通行证/验证链接有效期、问答锁定次数与时长、命令回执停留秒数可调，均带范围校验；功能开关含反应同步、转发失败提醒、拉黑提醒（编辑标记为写死特性、不设开关）），另有「文案与呈现」（验证成功/答错、熔断恢复、拉黑/解封五句文案可改；话题名四种样式；主菜单五个按钮逐个显隐；访客列表默认排序与每页条数存服务端配置）；按访客例外：信任开关（is_trusted 与 relay_exempt 已合并为一个概念、两标记同写同清：列表/资料卡设置即置已验证并按验证成功收尾，闸门处对未验证的信任访客自动放行，一并免转发限流与类型过滤、免两种超时清理，屏蔽关键词与关键词自动封禁同样豁免；重置验证与 /reverify 连带撤销，资料卡按钮仅主管理员），列表行带「🤝 已信任」徽标与切换按钮，/api/users 附 uiDefaults 供列表页套用默认排序与页大小。
  * 三页（指南 / 管理台 / 访客列表）约定
  * - 页眉 position:fixed + 脚本实测高度补偿 body padding-top，
  *   不要改回 sticky：iOS 上 sticky 在滚动中逐帧重定位会闪烁。
@@ -85,9 +85,6 @@ const DEFAULTS = {
   quiz_lock_min: '30',
   notice_stay_sec: '5',
 
-  hint_enabled: 'true',
-  hint_on_visitor_edit: 'true',
-  hint_on_admin_edit: 'true',
   reaction_sync_enabled: 'true',
   relay_fail_notice_enabled: 'true',
   block_notice_enabled: 'true',
@@ -1106,7 +1103,8 @@ async function cleanupDatabase(env) {
       () => sweepEphemeralNotices(env),
       () => cleanupOldAuditRows(env),
       () => sweepExpiredNonces(env),
-      () => sweepStaleUpdateClaims(env)
+      () => sweepStaleUpdateClaims(env),
+      () => sweepRetiredMarkConfigKeys(env)
     ]) {
       try {
         await sweep();
@@ -1122,6 +1120,22 @@ async function cleanupDatabase(env) {
       '清理数据库失败：',
       error?.message || error
     );
+  }
+}
+
+// 一次性存量清理（-v151b14）：编辑标记的双向开关已取
+// 消、标记写死为常开特性，旧总开关与两个方向键不再有
+// 任何读点；存量库里若还存着它们的值，随概率清扫逐个
+// 删行，不留惰性孤儿。删除幂等：无行即空操作，删净后
+// 每轮清扫只是三次空删，故可长期挂在清扫链上、不设
+// 完成标记。
+async function sweepRetiredMarkConfigKeys(env) {
+  for (const key of [
+    'hint_enabled',
+    'hint_on_visitor_edit',
+    'hint_on_admin_edit'
+  ]) {
+    await dbConfigDelete(key, env);
   }
 }
 
@@ -4420,8 +4434,21 @@ async function relayAdminMessageToUser(
 
 const REACTION_MAP_USER = 'rxmap';
 
-const EDIT_HINT_TEXT = '✍🏼已编辑';
-const EDIT_HINT_BUTTON_TEXT = '系统提示';
+// 已编辑标记（原生一致式）：编辑同步成功后，直接在被改
+// 的副本下方附一颗「✍🏼已编辑」内联按钮——与 Telegram
+// 普通聊天的编辑一样静默，不再另发独立提示行。按钮纯
+// 作标记，hint:info 回调只空应答（分支在管理员校验前）。
+const EDIT_MARK_BUTTON_TEXT = '✍🏼已编辑';
+const EDIT_MARK_MARKUP = {
+  inline_keyboard: [
+    [
+      {
+        text: EDIT_MARK_BUTTON_TEXT,
+        callback_data: 'hint:info'
+      }
+    ]
+  ]
+};
 
 // 配对持久化失败标记：复制已成功但配对没落库（或复制前
 // 读/写意向行失败）时抛出。两个中继调用方不得把它按
@@ -4498,25 +4525,23 @@ async function fillRelayPair(
   }
 }
 
-// 编辑提示按方向分别开关（面板两项）：新键已存以新键
-// 为准，未存时回退旧总开关 hint_enabled——存量关过总开
-// 关的继续两边都关。旧键面板不再写入，仅只读兼容。
-async function editHintEnabled(configKey, env) {
-  const own = await dbConfigGet(configKey, env);
+// 已编辑标记为写死特性（-v151b14 起）：编辑同步成功即
+// 无条件附标记，不再有方向开关与门控函数；三键的存量
+// 配置行由清扫链 sweepRetiredMarkConfigKeys 删净。
 
-  if (own !== null) {
-    return own === 'true';
-  }
-
-  return (
-    (await getConfig('hint_enabled', env, 'true')) ===
-    'true'
-  );
-}
-
-async function replaceEditHint(
+// 存量迁移：旧模型把独立提示行的消息号记在 rxmap 的
+// hint:p:<uid>:<mid> / hint:t:<topicMid> 键上。新模型
+// 不再发提示行；某配对下一次编辑同步成功时，顺手把
+// 那条旧提示删掉并清记账（至多一次性 +1 子请求/配
+// 对），之后不再产生任何提示记账。删除失败按错误分
+// 级：终局错误（消息早已被手动删掉等明确拒绝）照样
+// 清记账——留着只会让每次编辑都重复尝试删除一个不
+// 存在的消息号；瞬时错误（限流、网络抖动）不清记
+// 账，留待该配对下一次编辑时重试，免得一次抖动就
+// 把旧提示行永久孤儿化。
+async function cleanupLegacyEditHint(
   env,
-  { chatId, threadId, replyToMessageId, hintKey, configKey }
+  { chatId, hintKey }
 ) {
   const oldHint = await dbMessageDataGet(
     REACTION_MAP_USER,
@@ -4524,116 +4549,35 @@ async function replaceEditHint(
     env
   );
 
-  if (oldHint?.text) {
-    try {
-      await telegramApi(
-        env.BOT_TOKEN,
-        'deleteMessage',
-        {
-          chat_id: chatId,
-          message_id: Number(oldHint.text)
-        }
-      );
-    } catch (error) {
-      console.error(
-        '删除旧编辑提示失败：',
-        error?.message || error
-      );
-    }
-  }
-
-  if (!(await editHintEnabled(configKey, env))) {
-    // 关着的时候旧提示上面已经删了：指针记录一并清掉，
-    // 否则之后每次编辑都会对那个已不存在的消息号重复发删除。
-    if (oldHint?.text) {
-      await dbMessageDataDelete(
-        REACTION_MAP_USER,
-        hintKey,
-        env
-      );
-    }
-
+  if (!oldHint?.text) {
     return;
   }
 
   try {
-    const params = {
-      chat_id: chatId,
-      text: EDIT_HINT_TEXT,
-      reply_parameters: {
-        message_id: Number(replyToMessageId)
-      },
-      // 防伪按钮：访客消息经 copyMessage 搬运永远带不了
-      // 内联按钮，带按钮的提示行必是机器人真迹。按钮纯作
-      // 标记，hint:info 回调只空应答。
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: EDIT_HINT_BUTTON_TEXT,
-              callback_data: 'hint:info'
-            }
-          ]
-        ]
-      }
-    };
-
-    if (threadId !== undefined) {
-      params.message_thread_id = threadId;
-    }
-
-    const sentHint = await telegramApi(
+    await telegramApi(
       env.BOT_TOKEN,
-      'sendMessage',
-      params
-    );
-
-    if (sentHint?.message_id) {
-      await dbMessageDataPut(
-        REACTION_MAP_USER,
-        hintKey,
-        {
-          text: String(sentHint.message_id),
-          date: Math.floor(Date.now() / 1000)
-        },
-        env
-      );
-
-      // 并发编辑竞态收尾：提示指针若已被后来的编辑
-      // 改写，本次这条就是落败者，删掉以保持恒一条。
-      const currentHint =
-        await dbMessageDataGet(
-          REACTION_MAP_USER,
-          hintKey,
-          env
-        );
-
-      if (
-        currentHint &&
-        currentHint.text !==
-          String(sentHint.message_id)
-      ) {
-        try {
-          await telegramApi(
-            env.BOT_TOKEN,
-            'deleteMessage',
-            {
-              chat_id: chatId,
-              message_id:
-                Number(sentHint.message_id)
-            }
-          );
-        } catch (error) {
-          /* 收尾失败无妨 */
-        }
+      'deleteMessage',
+      {
+        chat_id: chatId,
+        message_id: Number(oldHint.text)
       }
-    }
+    );
   } catch (error) {
     console.error(
-      '发送编辑提示失败：',
+      '删除存量编辑提示失败：',
       error?.message || error
     );
+
+    if (isTransientTelegramError(error)) {
+      return;
+    }
   }
+
+  await dbMessageDataDelete(
+    REACTION_MAP_USER,
+    hintKey,
+    env
+  );
 }
 
 async function tombstoneTopicMessage(
@@ -4906,11 +4850,73 @@ function buildEditedMedia(source) {
   return null;
 }
 
+// 带标记的编辑调用：首选把「✍🏼已编辑」按钮随编辑本
+// 体一次带过去（零额外子请求）。若 Telegram 以明确的
+// 终局错误（带 errorCode、非瞬时——如个别消息类型不
+// 许挂按钮栏）拒掉带标记的调用，则无标记重发一次保
+// 住编辑本体，再单独补挂一次标记；补挂失败静默吞
+// 掉——编辑同步的结果不受标记成败影响，也绝不回退
+// 发提示行。瞬时错误（网络 / 429 / 5xx）与「未修改」
+// 不重试，原样抛给调用方走既有口径。
+async function callEditWithMark(
+  env,
+  method,
+  params,
+  markEdited
+) {
+  if (!markEdited) {
+    return telegramApi(env.BOT_TOKEN, method, params);
+  }
+
+  try {
+    return await telegramApi(env.BOT_TOKEN, method, {
+      ...params,
+      reply_markup: EDIT_MARK_MARKUP
+    });
+  } catch (error) {
+    if (
+      isNotModifiedError(error) ||
+      isTransientTelegramError(error) ||
+      !Number(error?.errorCode || 0)
+    ) {
+      throw error;
+    }
+
+    const result = await telegramApi(
+      env.BOT_TOKEN,
+      method,
+      params
+    );
+
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'editMessageReplyMarkup',
+        {
+          chat_id: params.chat_id,
+          message_id: params.message_id,
+          reply_markup: EDIT_MARK_MARKUP
+        }
+      );
+    } catch (markError) {
+      if (!isNotModifiedError(markError)) {
+        console.warn(
+          '附已编辑标记失败（已忽略）：',
+          markError?.message || markError
+        );
+      }
+    }
+
+    return result;
+  }
+}
+
 async function tryEditCounterpartMessage(
   env,
   targetChatId,
   targetMessageId,
-  source
+  source,
+  markEdited
 ) {
   const chatId = String(targetChatId);
   const messageId =
@@ -4932,10 +4938,11 @@ async function tryEditCounterpartMessage(
         params.entities = source.entities;
       }
 
-      await telegramApi(
-        env.BOT_TOKEN,
+      await callEditWithMark(
+        env,
         'editMessageText',
-        params
+        params,
+        markEdited
       );
 
       return true;
@@ -4945,14 +4952,15 @@ async function tryEditCounterpartMessage(
 
     if (media) {
       try {
-        await telegramApi(
-          env.BOT_TOKEN,
+        await callEditWithMark(
+          env,
           'editMessageMedia',
           {
             chat_id: chatId,
             message_id: messageId,
             media
-          }
+          },
+          markEdited
         );
 
         return true;
@@ -4980,10 +4988,11 @@ async function tryEditCounterpartMessage(
           source.caption_entities;
       }
 
-      await telegramApi(
-        env.BOT_TOKEN,
+      await callEditWithMark(
+        env,
         'editMessageCaption',
-        params
+        params,
+        markEdited
       );
 
       return true;
@@ -10506,7 +10515,8 @@ ${capEscapedText(escapeHtml(newContent), 2600)}
         env,
         env.ADMIN_GROUP_ID,
         pair.text,
-        editedMessage
+        editedMessage,
+        true
       );
   }
 
@@ -10515,12 +10525,9 @@ ${capEscapedText(escapeHtml(newContent), 2600)}
       `hint:p:${userId}:` +
       `${editedMessage.message_id}`;
 
-    await replaceEditHint(env, {
+    await cleanupLegacyEditHint(env, {
       chatId: env.ADMIN_GROUP_ID,
-      threadId: Number(user.topic_id),
-      replyToMessageId: Number(pair.text),
-      hintKey,
-      configKey: 'hint_on_visitor_edit'
+      hintKey
     });
 
     try {
@@ -10695,7 +10702,8 @@ ${capEscapedText(escapeHtml(newText), 2600)}
           env,
           userId,
           counterpartId,
-          editedMessage
+          editedMessage,
+          true
         );
     }
   }
@@ -10704,11 +10712,9 @@ ${capEscapedText(escapeHtml(newText), 2600)}
     const hintKey =
       `hint:t:${editedMessage.message_id}`;
 
-    await replaceEditHint(env, {
+    await cleanupLegacyEditHint(env, {
       chatId: userId,
-      replyToMessageId: Number(counterpartId),
-      hintKey,
-      configKey: 'hint_on_admin_edit'
+      hintKey
     });
 
     return;
@@ -11099,10 +11105,10 @@ async function handleCallbackQuery(
     return;
   }
 
-  // 编辑提示的防伪按钮纯作视觉标记：话题侧点击者是管理
+  // 已编辑标记按钮纯作视觉标记：话题侧点击者是管理
   // 员、私聊侧是访客本人，后者过不了下面的管理员校验
-  // ——与 seq: 同理须在此前分发；点击只空应答，不做任何
-  // 核对或写操作。
+  // ——与 seq: 同理须在此前分发；点击只空应答，不做任
+  // 何核对或写操作。
   if (data === 'hint:info') {
     await answerCallback(callbackQuery.id, env);
 
@@ -11818,7 +11824,7 @@ async function handleGroupChatMember(chatMember, env) {
 }
 
 // 整段对话清空：按 rxmap 配对收集一位访客在私聊与话题两侧的全部消息编号
-// （含「✍🏼已编辑」提示行），供批量删除使用。配对值 'gone'（已单独删除的墓碑）跳过。
+// （含存量 hint 提示行记账指向的旧提示消息），供批量删除使用。配对值 'gone'（已单独删除的墓碑）跳过。
 async function collectConversationMessageIds(
   userId,
   env
@@ -11839,7 +11845,7 @@ async function collectConversationMessageIds(
   const pairKeys = [];
 
   // 「组」：一对配对（私聊侧 + 话题侧）连同挂在它上面的
-  // 提示行。清空按组推进——一组双边都删过，才删这一组
+  // 存量提示行。清空按组推进——一组双边都删过，才删这一组
   // 的记录行；中途停下时没轮到的组整组保留，下次接着删。
   const units = [];
   const unitByPriv = new Map();
@@ -12611,7 +12617,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.5.1';
+const BOT_VERSION = 'v1.5.2';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -14626,7 +14632,7 @@ function buildGuidePage(pageCtx = {}) {
     <ul>
       <li><b class=\"k\">资料卡：</b>每个话题顶部都钉着访客的资料卡（名字、ID、状态、你的备注）。卡片不见了就在话题里发 <code>/card</code> 重新生成；卡片上的按钮可以直接屏蔽 / 解除屏蔽、设为信任、刷新。</li>
       <li><b class=\"k\">引用回复会跟着走：</b>你在话题里引用某条消息再回复，访客那边看到的也是引用着他原话的回复；访客引用着回复你时同理，连他框选一小段文字的「部分引用」都会原样带过去。</li>
-      <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，旁边出现一行「✍🏼已编辑」的小提示，提示下还挂着一颗「系统提示」按钮：按钮只有机器人能给消息挂上，访客自己发的消息带不了，所以同文案、没按钮的就是仿冒的，不用理会。Telegram 不给机器人提供官方的「已编辑」标记，这行提示就是补这个用的；访客编辑他的消息时，你这边也一样。两个方向的提示可以在管理台里分别开关：「访客编辑是否提醒我」与「我编辑是否提醒访客」。</li>
+      <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，被改好的那条消息下方会出现一颗「✍🏼已编辑」标记按钮（点它不会有任何反应，只是标记）。Telegram 不给机器人提供官方的「已编辑」标记，这颗按钮就是补这个用的；它和普通聊天里的编辑一样安静——不会有新消息、不会弹窗提醒，没留意的话可能根本发现不了对方改过。访客编辑他的消息时，你这边也一样。这是写死的固定行为：两个方向的编辑都会自动附上标记，管理台里没有它的开关。</li>
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。注意：访客私聊那边的原消息只能删 48 小时以内的，超了删不掉时会在话题里留一行说明。</li>
       <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。这个操作只有主管理员能做，协管员发命令或点确认都会被拦下。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
@@ -14662,7 +14668,7 @@ function buildGuidePage(pageCtx = {}) {
     <h2>🛠 网页管理台</h2>
     <p>从主菜单打开，<b class=\"k\">只有主管理员能进</b>。所有设置都集中在这里，改完点对应的「保存」立即生效：</p>
     <ul>
-      <li><b class=\"k\">基础配置：</b>欢迎消息、验证方式与题目、已验证超时清理（两种）。删档版填一个天数（比如 90），长期没动静的访客会被自动清除并释放位置；填 0 表示永不自动清。注意：被清掉的人下次再来会新建一个话题，老话题会留着当存档。另有温和版「改回待验证」：同样在基础配置里填天数，到期只把人改回待验证，档案、备注与话题都留着，对方回来重新验证后还在原话题继续聊；两种可以同时开，一般温和版的天数设得更小。这一区还管参数与开关：转发限流的强度、通行证与验证链接的有效期、问答锁定的次数与时长、命令回执停留几秒（数字都带安全范围，填超了不保存），以及功能开关：编辑提示已经拆成两项——「访客编辑是否提醒我」和「我编辑是否提醒访客」，两个方向可以只关一个；外加反应同步、转发失败提醒、拉黑提醒，用不上哪个就关掉。</li>
+      <li><b class=\"k\">基础配置：</b>欢迎消息、验证方式与题目、已验证超时清理（两种）。删档版填一个天数（比如 90），长期没动静的访客会被自动清除并释放位置；填 0 表示永不自动清。注意：被清掉的人下次再来会新建一个话题，老话题会留着当存档。另有温和版「改回待验证」：同样在基础配置里填天数，到期只把人改回待验证，档案、备注与话题都留着，对方回来重新验证后还在原话题继续聊；两种可以同时开，一般温和版的天数设得更小。这一区还管参数与开关：转发限流的强度、通行证与验证链接的有效期、问答锁定的次数与时长、命令回执停留几秒（数字都带安全范围，填超了不保存），以及功能开关：反应同步、转发失败提醒、拉黑提醒，用不上哪个就关掉。（编辑标记不在开关之列：编辑同步成功就自动在被改消息下方附上「✍🏼已编辑」标记，两个方向都一样。）</li>
       <li><b class=\"k\">类型过滤：</b>不想转发的消息类型（贴纸、语音、视频等）在这里关掉，对方发了也不会过到对面去。</li>
       <li><b class=\"k\">屏蔽关键词：</b>访客的话里出现关键词会被拦下并记一次数，次数达到你设的阈值就自动封禁他，口径与手动封禁完全一致（新消息即删、同样发送封禁通知）。已信任的访客不在此列：对他们不拦截、不计数、不自动封禁。不会写正则表达式也没关系，直接填普通词句就行。</li>
       <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
@@ -14712,7 +14718,7 @@ function buildGuidePage(pageCtx = {}) {
     <p class=\"q\">输入 / 时，/note 这些新命令不出现在候选里？</p>
     <p>那是 Telegram App 自己缓存了旧的命令名单，彻底关掉 App 再重开就会刷新；等不及也可以把命令手打全，一样有效。</p>
     <p class=\"q\">编辑过的消息为什么没有官方的「已编辑」小字？</p>
-    <p>Telegram 不允许机器人给消息加官方编辑标记，所以机器人用一行「✍🏼已编辑」的提示代替；提示下挂着一颗「系统提示」按钮，访客自己发的消息带不了按钮，同文案又没按钮的就是仿冒提示，一眼可辨。</p>
+    <p>Telegram 不允许机器人给消息加官方编辑标记，所以机器人改用一颗附在被改消息下方的「✍🏼已编辑」按钮代替（按钮只有机器人能挂，访客自己发的消息带不了）。和普通聊天的编辑一样，改动是静默的：不会有新消息提醒，留意消息下方的这颗标记才能看出它被改过。</p>
     <p class=\"q\">贴的表情为什么显示成机器人贴的？</p>
     <p>Telegram 只允许机器人以自己的名义贴表情，同步到对方那边自然显示机器人名字，这个改不了。</p>
     <p class=\"q\">访客说验证一直过不了，怎么办？</p>
@@ -14932,13 +14938,6 @@ function buildPanelPage(pageCtx = {}) {
     <label>命令回执停留秒数（1～120）</label>
     <input type="number" id="t_stay" min="1" max="120" step="1">
     <button class="save" data-k="notice_stay_sec" data-t="t_stay">保存</button>
-    <label>访客编辑是否提醒我</label>
-    <input type="checkbox" class="chk" id="t_hint_visitor">
-    <button class="save" data-k="hint_on_visitor_edit" data-t="t_hint_visitor">保存</button>
-    <label>我编辑是否提醒访客</label>
-    <input type="checkbox" class="chk" id="t_hint_admin">
-    <button class="save" data-k="hint_on_admin_edit" data-t="t_hint_admin">保存</button>
-    <div class="hint">编辑同步成功后，对侧会出现一行「✍🏼已编辑」小提示（带「系统提示」按钮防伪）。上面两项分别控制两个方向。</div>
     <label>表情反应双向同步</label>
     <select id="t_reaction"><option value="true">开启</option><option value="false">关闭</option></select>
     <button class="save" data-k="reaction_sync_enabled" data-t="t_reaction">保存</button>
@@ -15401,8 +15400,6 @@ fetch('/api/config?' + qs.toString())
     setVal('t_quizmax', d.quiz_max_attempts);
     setVal('t_quizlock', d.quiz_lock_min);
     setVal('t_stay', d.notice_stay_sec);
-    setChk('t_hint_visitor', d.hint_on_visitor_edit);
-    setChk('t_hint_admin', d.hint_on_admin_edit);
     setVal('t_reaction', d.reaction_sync_enabled ? 'true' : 'false');
     setVal('t_relayfail', d.relay_fail_notice_enabled ? 'true' : 'false');
     setVal('t_blocknotice', d.block_notice_enabled ? 'true' : 'false');
@@ -15731,9 +15728,6 @@ function validateScalarConfig(key, rawValue) {
   }
 
   const BOOL_KEYS = new Set([
-    'hint_enabled',
-    'hint_on_visitor_edit',
-    'hint_on_admin_edit',
     'reaction_sync_enabled',
     'relay_fail_notice_enabled',
     'block_notice_enabled',
@@ -16054,18 +16048,6 @@ async function handleConfigApi(request, env) {
     cfg('keyword_responses', '[]')
   );
 
-  // 编辑提示双向开关的展示值：新键已存以新键为准，未存
-  // 时回退旧总开关 hint_enabled（与运行时门控同一口径）。
-  const hintShow = (key) => {
-    const own = cfgAll[key];
-
-    if (own !== undefined && own !== null) {
-      return own === 'true';
-    }
-
-    return (cfg('hint_enabled', 'true')) === 'true';
-  };
-
   return Response.json({
     ok: true,
     welcome_msg: cfg('welcome_msg'),
@@ -16116,12 +16098,6 @@ async function handleConfigApi(request, env) {
       clampShow('quiz_max_attempts', 5, 1, 20),
     quiz_lock_min: clampShow('quiz_lock_min', 30, 1, 1440),
     notice_stay_sec: clampShow('notice_stay_sec', 5, 1, 120),
-    hint_enabled:
-      (cfg('hint_enabled', 'true')) === 'true',
-    hint_on_visitor_edit:
-      hintShow('hint_on_visitor_edit'),
-    hint_on_admin_edit:
-      hintShow('hint_on_admin_edit'),
     reaction_sync_enabled:
       (cfg('reaction_sync_enabled', 'true')) === 'true',
     relay_fail_notice_enabled:
