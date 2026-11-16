@@ -311,7 +311,7 @@ function toBoolText(value, defaultValue = true) {
   return value.toLowerCase() === 'true';
 }
 
-// 展示时区（资料卡 / 编辑对比通知 / 更新状态行的渲染时区）：
+// 展示时区（资料卡 / 更新状态行等的渲染时区）：
 // 默认 Asia/Singapore，管理台「文案与呈现」可改（config
 // display_tz）。formatTimestamp 是同步函数，时区由 async
 // 调用点先读好再透传进来；这里只做合法性收口——带外写
@@ -3560,14 +3560,20 @@ async function maybeAutoRefreshUserCard(
 // 里的 ID；message.quote 存在时把部分引用片段原样带上。
 function buildReplyParameters(
   message,
-  counterpartId
+  counterpartId,
+  includeQuote = true
 ) {
   const replyParameters = {
     message_id: Number(counterpartId),
     allow_sending_without_reply: true
   };
 
-  const quote = message?.quote;
+  // includeQuote=false 时剥掉 quote：编辑回退的锚点是被
+  // 编辑消息自己的副本，与源消息自带的 quote 不是同一
+  // 条消息，带上会语义错位（中继路径默认带 quote 不变）。
+  const quote = includeQuote
+    ? message?.quote
+    : null;
 
   if (
     quote &&
@@ -4586,7 +4592,7 @@ async function tombstoneTopicMessage(
 ) {
   // 管理员用 /delete 删掉话题侧消息后调用：把该消息的同步
   // 映射标记为 gone 并清掉路由行与提示，之后对它的编辑/反应
-  // 一律静默丢弃，防止被删内容借回退通知重新出现。
+  // 一律静默丢弃，防止被删内容借回退消息重新出现。
   let resolvedPair = null;
 
   try {
@@ -4619,7 +4625,7 @@ async function tombstoneTopicMessage(
 
         // 两行墓碑一次 batch 写完：分开写时第二写失败
         // 会留下半边墓碑，
-        // 已删消息的编辑会走回退路径借通知「复活」。
+        // 已删消息的编辑会走回退路径借回退消息「复活」。
         await env.TG_BOT_DB.batch([
           messageDataPutStatement(
             REACTION_MAP_USER,
@@ -5005,7 +5011,7 @@ async function tryEditCounterpartMessage(
     }
 
     console.warn(
-      '原地编辑对应消息失败，改用通知方式：',
+      '原地编辑对应消息失败，改用回退消息：',
       error?.message || error
     );
 
@@ -10360,8 +10366,8 @@ const topicId =
 /*                               编辑消息处理                                    */
 /* -------------------------------------------------------------------------- */
 
-// 回退通知的正文截断：转义后的文本按预算截断并避开切碎
-// HTML 实体，保证整条通知不超过 Telegram 的 4096 字上限。
+// 回退消息的正文截断：转义后的文本按预算截断并避开切碎
+// HTML 实体，保证整条消息不超过 Telegram 的 4096 字上限。
 function capEscapedText(escaped, max) {
   const chars = [...String(escaped)];
 
@@ -10378,6 +10384,65 @@ function capEscapedText(escaped, max) {
   }
 
   return out + '…（内容过长，已截断）';
+}
+
+// 编辑回退消息（方案 B）：原地同步失败或无配对时，把新
+// 内容作为一条「回复对侧旧副本」的消息发过去——上下文
+// 由回复引用自带，正文只留新内容，下方附与原地编辑成
+// 功时同形的「✍🏼已编辑」标记；原副本保持不动。无配对
+// 时没有副本可锚，照发不带锚。带锚发送被 Telegram 以
+// 终局错误拒绝（副本已被手动删除等）时，降级为不带锚
+// 重发一次，保住消息本身；瞬时错误（限流延迟、429、
+// 5xx、无码网络错，与 isTransientTelegramError 同口
+// 径）不降级——结果未知或本应延后重来，按既有口径上
+// 抛给调用方。建锚时剥掉源消息自带的 quote：锚点是被
+// 编辑消息自己的副本，与 quote 指向的不是同一条。
+async function sendEditFallbackMessage(
+  env,
+  params,
+  anchorMessageId,
+  sourceMessage
+) {
+  const base = {
+    ...params,
+    reply_markup: EDIT_MARK_MARKUP
+  };
+
+  const anchor = Number(anchorMessageId);
+
+  if (!anchor) {
+    return telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      base
+    );
+  }
+
+  try {
+    return await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        ...base,
+        reply_parameters:
+          buildReplyParameters(
+            sourceMessage,
+            anchor,
+            false
+          )
+      }
+    );
+  } catch (error) {
+    if (isTransientTelegramError(error)) {
+      throw error;
+    }
+
+    return telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      base
+    );
+  }
 }
 
 async function handleRelayEditedMessage(
@@ -10455,46 +10520,10 @@ async function handleRelayEditedMessage(
     return;
   }
 
-  const storageKey =
-    getMessageStorageKey(
-      'user',
-      editedMessage.message_id
-    );
-
-  const stored =
-    await dbMessageDataGet(
-      userId,
-      storageKey,
-      env
-    );
-
-  const originalText =
-    stored?.text ||
-    '[原始内容无法获取或不是文本内容]';
-
-  const displayTz = await getDisplayTimeZone(env);
-
-  const originalDate = stored?.date
-    ? formatTimestamp(stored.date, displayTz)
-    : '[发送时间无法获取]';
-
   const newContent =
     editedMessage.text ||
     editedMessage.caption ||
     '[非文本或媒体内容]';
-
-  const notificationText = `
-⚠️ <b>访客消息已修改</b>
-
-<b>原消息发送时间：</b>
-<code>${escapeHtml(originalDate)}</code>
-
-<b>原始内容：</b>
-${capEscapedText(escapeHtml(originalText), 1000)}
-
-<b>修改后的内容：</b>
-${capEscapedText(escapeHtml(newContent), 2600)}
-  `.trim();
 
   const pair = await dbMessageDataGet(
     REACTION_MAP_USER,
@@ -10502,7 +10531,7 @@ ${capEscapedText(escapeHtml(newContent), 2600)}
     env
   );
 
-  // 对侧消息已被管理员删除：静默丢弃，不走回退通知。
+  // 对侧消息已被管理员删除：静默丢弃，不走回退消息。
   if (pair?.text === 'gone') {
     return;
   }
@@ -10551,16 +10580,20 @@ ${capEscapedText(escapeHtml(newContent), 2600)}
       env
     );
 
-    await telegramApi(
-      env.BOT_TOKEN,
-      'sendMessage',
+    await sendEditFallbackMessage(
+      env,
       {
         chat_id: env.ADMIN_GROUP_ID,
         message_thread_id:
           Number(user.topic_id),
-        text: notificationText,
+        text: capEscapedText(
+          escapeHtml(newContent),
+          2600
+        ),
         parse_mode: 'HTML'
-      }
+      },
+      pair?.text,
+      editedMessage
     );
   } catch (error) {
     console.error(
@@ -10643,41 +10676,13 @@ async function handleAdminEditedReply(
     editedMessage.caption ||
     '[媒体内容]';
 
-  const displayTz = await getDisplayTimeZone(env);
-
-  const originalTime =
-    formatTimestamp(stored.date, displayTz);
-
-  const editTime =
-    formatTimestamp(
-      editedMessage.edit_date ||
-      editedMessage.date,
-      displayTz
-    );
-
-  const notificationText = `
-⚠️ <b>管理员编辑了之前的回复</b>
-
-<b>原发送或上次编辑时间：</b>
-<code>${escapeHtml(originalTime)}</code>
-
-<b>本次编辑时间：</b>
-<code>${escapeHtml(editTime)}</code>
-
-<b>原消息内容：</b>
-${capEscapedText(escapeHtml(stored.text || '[原始内容未保存]'), 1000)}
-
-<b>新消息内容：</b>
-${capEscapedText(escapeHtml(newText), 2600)}
-  `.trim();
-
   const pair = await dbMessageDataGet(
     REACTION_MAP_USER,
     `t:${editedMessage.message_id}`,
     env
   );
 
-  // 对侧消息已被管理员删除：静默丢弃，不走回退通知。
+  // 对侧消息已被管理员删除：静默丢弃，不走回退消息。
   if (pair?.text === 'gone') {
     return;
   }
@@ -10721,14 +10726,18 @@ ${capEscapedText(escapeHtml(newText), 2600)}
   }
 
   try {
-    await telegramApi(
-      env.BOT_TOKEN,
-      'sendMessage',
+    await sendEditFallbackMessage(
+      env,
       {
         chat_id: userId,
-        text: notificationText,
+        text: capEscapedText(
+          escapeHtml(newText),
+          2600
+        ),
         parse_mode: 'HTML'
-      }
+      },
+      counterpartId,
+      editedMessage
     );
 
   } catch (error) {
@@ -12617,7 +12626,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.5.2';
+const BOT_VERSION = 'v1.5.3';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -14737,7 +14746,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">联系人名片、骰子动画等特殊类型：</b>复制失败时同样落占位卡；能正常复制的（骰子动画通常可以）一切照旧，不会出现占位卡。</li>
       <li><b class=\"k\">受保护内容：</b>来源聊天开了「禁止转发 / 保存」时，消息无法被复制，占位卡会标明是『受保护内容』。</li>
     </ul>
-    <p>另外一句：机器人里的时间显示（资料卡、编辑对比通知、更新检查时间等）按管理台「文案与呈现」里的<b class=\"k\">时间显示时区</b>渲染，默认 Asia/Singapore；访客列表页的「最近活跃」按打开页面那台设备的浏览器时区显示，与这个设置无关。</p>
+    <p>另外一句：机器人里的时间显示（资料卡、更新检查时间等）按管理台「文案与呈现」里的<b class=\"k\">时间显示时区</b>渲染，默认 Asia/Singapore；访客列表页的「最近活跃」按打开页面那台设备的浏览器时区显示，与这个设置无关。</p>
 
 </main>
 <script>
@@ -15069,7 +15078,7 @@ function buildPanelPage(pageCtx = {}) {
     <button class="save" data-k="userlist_page_size" data-t="s_pagesize">保存</button>
     <label>时间显示时区（IANA 时区名）</label>
     <input type="text" id="s_tz">
-    <div class="hint">影响资料卡的首次消息时间、编辑对比通知、主菜单更新检查时间等机器人内的时间显示；访客列表页的「最近活跃」按打开页面那台设备的浏览器时区显示，不受这里影响。</div>
+    <div class="hint">影响资料卡的首次消息时间、主菜单更新检查时间等机器人内的时间显示；访客列表页的「最近活跃」按打开页面那台设备的浏览器时区显示，不受这里影响。</div>
     <button class="save" data-k="display_tz" data-t="s_tz">保存</button>
   </section>
 
