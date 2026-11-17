@@ -3740,7 +3740,8 @@ async function notifyVisitorUnsupported(message, env) {
 
     await telegramApi(env.BOT_TOKEN, 'sendMessage', {
       chat_id: message.chat.id,
-      text: '这类消息机器人暂时无法转达，已提醒管理员。'
+      text: '这类消息机器人暂时无法转达，已提醒管理员。',
+      reply_markup: SYS_TAG_MARKUP
     });
   } catch (_) {
     /* 提示失败不影响主流程 */
@@ -3979,7 +3980,8 @@ async function relayUnsupportedPlaceholder(
           : ''),
       disable_notification: Boolean(
         user.is_blocked
-      )
+      ),
+      reply_markup: SYS_TAG_MARKUP
     });
   } catch (sendError) {
     console.error(
@@ -4445,6 +4447,22 @@ const EDIT_MARK_MARKUP = {
     [
       {
         text: EDIT_MARK_BUTTON_TEXT,
+        callback_data: 'hint:info'
+      }
+    ]
+  ]
+};
+
+// 系统提示标签：系统自动发出的消息若本身不带内联
+// 按钮，统一附一颗「系统提示」标签钮，让访客/管理员
+// 一眼分清这是系统自动回复而非真人打字。按钮纯作
+// 标记，与已编辑标记共用 hint:info 回调（只空应答）。
+const SYS_TAG_BUTTON_TEXT = '系统提示';
+const SYS_TAG_MARKUP = {
+  inline_keyboard: [
+    [
+      {
+        text: SYS_TAG_BUTTON_TEXT,
         callback_data: 'hint:info'
       }
     ]
@@ -5492,7 +5510,8 @@ async function handleStart(
     'sendMessage',
     {
       chat_id: chatId,
-      text: welcomeMessage
+      text: welcomeMessage,
+      reply_markup: SYS_TAG_MARKUP
     }
   );
 
@@ -5535,7 +5554,8 @@ async function handleStart(
         'sendMessage',
         {
           chat_id: chatId,
-          text: verificationQuestion
+          text: verificationQuestion,
+          reply_markup: SYS_TAG_MARKUP
         }
       );
 
@@ -5726,7 +5746,8 @@ async function handleVerification(
           chat_id: chatId,
           text:
             '🚫 答错次数过多，验证已锁定 ' +
-            `${quizLockMin} 分钟，请稍后再试。`
+            `${quizLockMin} 分钟，请稍后再试。`,
+            reply_markup: SYS_TAG_MARKUP
         }
       );
 
@@ -5738,7 +5759,8 @@ async function handleVerification(
       'sendMessage',
       {
         chat_id: chatId,
-        text: await textConfig('quiz_wrong_text', env)
+        text: await textConfig('quiz_wrong_text', env),
+        reply_markup: SYS_TAG_MARKUP
       }
     );
 
@@ -6037,7 +6059,8 @@ async function sendSequencePrompt(
         chat_id: chatId,
         text:
           '🚫 答错次数过多，验证已锁定 ' +
-          `${remainMin} 分钟，请稍后再试。`
+          `${remainMin} 分钟，请稍后再试。`,
+          reply_markup: SYS_TAG_MARKUP
       }
     );
 
@@ -6384,7 +6407,8 @@ async function handleSequenceCallback(
             {
               chat_id: senderId,
               message_id: Number(messageId),
-              text: lockText
+              text: lockText,
+              reply_markup: SYS_TAG_MARKUP
             }
           );
 
@@ -6400,7 +6424,8 @@ async function handleSequenceCallback(
           'sendMessage',
           {
             chat_id: senderId,
-            text: lockText
+            text: lockText,
+            reply_markup: SYS_TAG_MARKUP
           }
         );
 
@@ -6619,7 +6644,8 @@ async function alertAdminsVerifyUnconfigured(env) {
           '⚠️ 验证服务未配置：当前验证方式选的是 ' +
           'Turnstile，但 TURNSTILE 密钥未配齐，' +
           '访客暂时无法完成验证。请补齐密钥，' +
-          '或在网页管理台把验证方式改成静态问答 / 顺序点击。'
+          '或在网页管理台把验证方式改成静态问答 / 顺序点击。',
+          reply_markup: SYS_TAG_MARKUP
       });
     }
   } catch (error) {
@@ -6648,7 +6674,8 @@ async function sendVerifyUnconfiguredPrompt(
     'sendMessage',
     {
       chat_id: chatId,
-      text: VERIFY_UNCONFIGURED_TEXT
+      text: VERIFY_UNCONFIGURED_TEXT,
+      reply_markup: SYS_TAG_MARKUP
     }
   );
 
@@ -6944,7 +6971,8 @@ async function sendVerifySuccessReceipt(env, userId) {
       'sendMessage',
       {
         chat_id: userId,
-        text: await textConfig('verify_success_text', env)
+        text: await textConfig('verify_success_text', env),
+        reply_markup: SYS_TAG_MARKUP
       }
     );
   } catch (error) {
@@ -7268,7 +7296,8 @@ async function sendTestVerifyPrompt(
         chat_id: chatId,
         text:
           '⚠️ 尚未配置 Turnstile 密钥，' +
-          '无法打开测试验证页。'
+          '无法打开测试验证页。',
+          reply_markup: SYS_TAG_MARKUP
       }
     );
 
@@ -7288,7 +7317,8 @@ async function sendTestVerifyPrompt(
         chat_id: chatId,
         text:
           '⚠️ 无法确定验证页地址，' +
-          '无法打开测试验证页。'
+          '无法打开测试验证页。',
+          reply_markup: SYS_TAG_MARKUP
       }
     );
 
@@ -7354,7 +7384,8 @@ async function sendTurnstilePrompt(
       'sendMessage',
       {
         chat_id: chatId,
-        text: VERIFY_UNCONFIGURED_TEXT
+        text: VERIFY_UNCONFIGURED_TEXT,
+        reply_markup: SYS_TAG_MARKUP
       }
     );
 
@@ -8158,7 +8189,8 @@ async function applyBlockState(userId, blocked, env) {
             chat_id: uid,
             text:
               '⚠️ 您已被管理员封禁，' +
-              '无法继续发送消息。'
+              '无法继续发送消息。',
+              reply_markup: SYS_TAG_MARKUP
           }
         );
 
@@ -8229,7 +8261,8 @@ async function applyBlockState(userId, blocked, env) {
         chat_id: uid,
         text:
           '✅ 管理员已解除对您的封禁，' +
-          '现在可以继续发送消息。'
+          '现在可以继续发送消息。',
+          reply_markup: SYS_TAG_MARKUP
       }
     );
 
@@ -8271,7 +8304,8 @@ async function handleBlockedKeyword(
       text:
         `⚠️ 您的消息触发了关键词过滤器 ` +
         `(${result.currentCount}/${threshold} 次)，` +
-        `消息已丢弃。`
+        `消息已丢弃。`,
+        reply_markup: SYS_TAG_MARKUP
     }
   );
 
@@ -8382,7 +8416,8 @@ async function notifyRelayFailure(
             text:
               '⚠️ 访客发来的一条消息未能转发到话题' +
               '（内容可能受保护限制或接口异常），' +
-              '对方以为已发送成功，请留意。'
+              '对方以为已发送成功，请留意。',
+              reply_markup: SYS_TAG_MARKUP
           }
         );
 
@@ -8480,7 +8515,8 @@ async function notifyRelayRateLimited(user, env) {
         message_thread_id: Number(user.topic_id),
         text:
           '⚠️ 该访客发送消息过于频繁，' +
-          '超出部分已被限流丢弃。'
+          '超出部分已被限流丢弃。',
+          reply_markup: SYS_TAG_MARKUP
       }
     );
   } catch (_) {
@@ -8605,7 +8641,8 @@ async function handlePrivateMessage(
         {
           chat_id: chatId,
           text:
-            '✅ 您是已授权协管员，可以在管理群访客话题中回复消息。'
+            '✅ 您是已授权协管员，可以在管理群访客话题中回复消息。',
+            reply_markup: SYS_TAG_MARKUP
         }
       );
 
@@ -8646,7 +8683,8 @@ async function handlePrivateMessage(
         {
           chat_id: chatId,
           text:
-            '您已通过验证，可以直接发送消息。'
+            '您已通过验证，可以直接发送消息。',
+            reply_markup: SYS_TAG_MARKUP
         }
       );
 
@@ -8728,7 +8766,8 @@ async function handlePrivateMessage(
               ? '\n⚠️ 最近一次检查失败，请稍后再试。'
               : ''),
           parse_mode: 'HTML',
-          disable_web_page_preview: true
+          disable_web_page_preview: true,
+          reply_markup: SYS_TAG_MARKUP
         }
       );
     }
@@ -8782,7 +8821,8 @@ async function handlePrivateMessage(
             'sendMessage',
             {
               chat_id: chatId,
-              text: '当前没有处于暂停状态。'
+              text: '当前没有处于暂停状态。',
+              reply_markup: SYS_TAG_MARKUP
             }
           );
         } else {
@@ -8795,7 +8835,8 @@ async function handlePrivateMessage(
               chat_id: chatId,
               text:
                 '▶️ 机器人已恢复服务，' +
-                '访客消息恢复正常转发。'
+                '访客消息恢复正常转发。',
+                reply_markup: SYS_TAG_MARKUP
             }
           );
         }
@@ -8813,7 +8854,8 @@ async function handlePrivateMessage(
                 `⏸ 服务熔断进行中，${describePauseRemaining(state)}。\n` +
                 '重新计时发送 /pause 分钟数，' +
                 '立即恢复发送 /resume。\n' +
-                'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；若一直没人发消息，收不到通知是正常的——服务熔断其实已经结束，只是没通知。'
+                'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；若一直没人发消息，收不到通知是正常的——服务熔断其实已经结束，只是没通知。',
+                reply_markup: SYS_TAG_MARKUP
             }
           );
         } else {
@@ -8834,7 +8876,8 @@ async function handlePrivateMessage(
                 text:
                   '⚠️ 用法：/pause [分钟数]，' +
                   '例如 /pause 30；不带数字默认 60 分钟，' +
-                  '最大 10080 分钟（7 天）。'
+                  '最大 10080 分钟（7 天）。',
+                  reply_markup: SYS_TAG_MARKUP
               }
             );
           } else {
@@ -8863,7 +8906,8 @@ async function handlePrivateMessage(
                     ? '，每位访客会收到一条回复提醒'
                     : '，且不会收到任何回复') +
                   '。恢复请发送 /resume。\n' +
-                  'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；若一直没人发消息，收不到通知是正常的——服务熔断其实已经结束，只是没通知。'
+                  'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；若一直没人发消息，收不到通知是正常的——服务熔断其实已经结束，只是没通知。',
+                  reply_markup: SYS_TAG_MARKUP
               }
             );
           }
@@ -8994,7 +9038,8 @@ async function handlePrivateMessage(
         {
           chat_id: chatId,
           text:
-            '请使用文字回答验证问题。'
+            '请使用文字回答验证问题。',
+            reply_markup: SYS_TAG_MARKUP
         }
       );
 
@@ -9020,7 +9065,8 @@ async function handlePrivateMessage(
       {
         chat_id: chatId,
         text:
-          '请使用 /start 命令开始验证。'
+          '请使用 /start 命令开始验证。',
+          reply_markup: SYS_TAG_MARKUP
       }
     );
 
@@ -9053,7 +9099,8 @@ async function handlePrivateMessage(
           chat_id: chatId,
           text:
             '您是管理员，私聊里请使用命令或菜单；' +
-            '要回复访客，请到管理群的话题里发送。'
+            '要回复访客，请到管理群的话题里发送。',
+            reply_markup: SYS_TAG_MARKUP
         }
       );
     }
@@ -9127,7 +9174,8 @@ async function handlePrivateMessage(
       {
         chat_id: chatId,
         text:
-          `⚠️ ${filterResult.reason}`
+          `⚠️ ${filterResult.reason}`,
+          reply_markup: SYS_TAG_MARKUP
       }
     );
 
@@ -9146,7 +9194,8 @@ async function handlePrivateMessage(
         'sendMessage',
         {
           chat_id: chatId,
-          text: autoReply
+          text: autoReply,
+          reply_markup: SYS_TAG_MARKUP
         }
       );
     } catch (error) {
@@ -9314,6 +9363,9 @@ async function resolveTopicUserId(
   );
 }
 
+// 话题内系统通知的统一发送口：调用方全是命令回执与
+// 错误提示类自动消息（本身都不带按钮），故在此统一
+// 附「系统提示」标签（SYS_TAG_MARKUP），一处覆盖全部。
 async function sendTopicNotice(
   message,
   text,
@@ -9326,7 +9378,8 @@ async function sendTopicNotice(
       chat_id: env.ADMIN_GROUP_ID,
       message_thread_id:
         Number(message.message_thread_id),
-      text
+      text,
+      reply_markup: SYS_TAG_MARKUP
     }
   );
 }
@@ -9546,7 +9599,8 @@ async function handleAdminCommand(
       {
         chat_id: env.ADMIN_GROUP_ID,
         text:
-          '⚠️ 这些命令只能在访客话题中使用。'
+          '⚠️ 这些命令只能在访客话题中使用。',
+          reply_markup: SYS_TAG_MARKUP
       }
     );
 
@@ -10272,7 +10326,8 @@ const topicId =
         message_thread_id:
           Number(topicId),
         text:
-          '❌ 找不到该话题对应的访客 ID，无法转发消息。'
+          '❌ 找不到该话题对应的访客 ID，无法转发消息。',
+          reply_markup: SYS_TAG_MARKUP
       }
     );
 
@@ -10334,7 +10389,8 @@ const topicId =
               Number(topicId),
             text:
               '❌ 对方已拉黑机器人，' +
-              '这条消息未能送达。'
+              '这条消息未能送达。',
+              reply_markup: SYS_TAG_MARKUP
           }
         );
       }
@@ -10351,7 +10407,8 @@ const topicId =
           Number(topicId),
         text:
           `❌ 转发消息给访客 ${userId} 失败：` +
-          `${error?.message || error}`
+          `${error?.message || error}`,
+          reply_markup: SYS_TAG_MARKUP
       }
     );
   }
@@ -10502,7 +10559,8 @@ async function handleRelayEditedMessage(
             String(editedMessage.chat.id),
           text:
             `⚠️ 编辑后的消息未通过过滤：` +
-            `${filterResult.reason}`
+            `${filterResult.reason}`,
+            reply_markup: SYS_TAG_MARKUP
         }
       );
     } catch (error) {
@@ -11266,7 +11324,8 @@ async function noteBotBlocked(
         chat_id: env.ADMIN_GROUP_ID,
         message_thread_id:
           Number(user.topic_id),
-        text: await textConfig('block_notice_text', env)
+        text: await textConfig('block_notice_text', env),
+        reply_markup: SYS_TAG_MARKUP
       }
     );
   } catch (error) {
@@ -11388,7 +11447,8 @@ async function noteBotUnblocked(
         chat_id: env.ADMIN_GROUP_ID,
         message_thread_id:
           Number(user.topic_id),
-        text: await textConfig('unblock_notice_text', env)
+        text: await textConfig('unblock_notice_text', env),
+        reply_markup: SYS_TAG_MARKUP
       }
     );
   } catch (error) {
@@ -12619,7 +12679,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.6.0';
+const BOT_VERSION = 'v1.6.1';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -12791,7 +12851,8 @@ async function checkForUpdates(env, force = false) {
                 '到 GitHub 仓库的 Release 页下载新版代码，' +
                 '粘贴到 Worker 里部署即可（与平时部署方法相同）。',
               parse_mode: 'HTML',
-              disable_web_page_preview: true
+              disable_web_page_preview: true,
+              reply_markup: SYS_TAG_MARKUP
             }
           );
 
@@ -14768,6 +14829,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">资料卡：</b>每个话题顶部都钉着访客的资料卡（名字、ID、状态、你的备注）。卡片不见了就在话题里发 <code>/card</code> 重新生成；卡片上的按钮可以直接屏蔽 / 解除屏蔽、设为信任、刷新。</li>
       <li><b class=\"k\">引用回复会跟着走：</b>你在话题里引用某条消息再回复，访客那边看到的也是引用着他原话的回复；访客引用着回复你时同理，连他框选一小段文字的「部分引用」都会原样带过去。</li>
       <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，被改好的那条消息下方会出现一颗「✍🏼已编辑」标记按钮（点它不会有任何反应，只是标记）。Telegram 不给机器人提供官方的「已编辑」标记，这颗按钮就是补这个用的；它和普通聊天里的编辑一样安静——不会有新消息、不会弹窗提醒，没留意的话可能根本发现不了对方改过。访客编辑他的消息时，你这边也一样。这是写死的固定行为：两个方向的编辑都会自动附上标记，管理台里没有它的开关。只有原地改不动的极少数情况例外（比如转发配对已过期被清理、原地修改被拒绝）：这时机器人会以「回复旧副本」的形式补发一条只含新内容的消息，下方照样附「✍🏼已编辑」标记，原来的副本保留不动——这种时候才会多出一条新消息，顺着回复关系就能对上是哪条被改了。</li>
+      <li><b class=\"k\">自动消息带「系统提示」牌：</b>机器人自动发出的提示消息（欢迎语、验证提示、自动回复、熔断期间的回复、拉黑 / 解封通知这类），只要本身没有功能按钮，下方都会带一颗「系统提示」按钮，用来和真人发送的消息区分，点它不会有任何动作；验证按钮、通行证、资料卡、菜单这些本来就带按钮的消息不再另加。消息被原地改写时牌子也在——比如熔断恢复后，「请稍后再试」会原地改成「✅ 服务已恢复」，下方的「系统提示」照样保留。</li>
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。注意：访客私聊那边的原消息只能删 48 小时以内的，超了删不掉时会在话题里留一行说明。</li>
       <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。这个操作只有主管理员能做，协管员发命令或点确认都会被拦下。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
@@ -14822,7 +14884,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。这组按钮可以长按拖动摆放：按住任意一颗拖动、松手吸附到屏幕左侧或右侧，觉得挡住列表就把它挪开；展开搜索时它回到输入法上方（靠左时搜索框改为向右展开），收起回到放它的位置，拖回右下角原位会恢复自动避让分页条；关掉页面再打开则回到原位。页眉下方的「全部 / 已验证 / 待验证 / 已屏蔽 / 被屏蔽」是快速筛选（「被屏蔽」列的是拉黑了机器人的人）；筛选下方的一行按钮管排序——左半选按最后活跃还是首次来访（第一次与机器人互动的时间）排，右半选倒序还是正序。在列表上左右滑动，也能在五个筛选和「数据统计」之间切换。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
       <li><b class=\"k\">位置会记住：</b>每个筛选与搜索组合下翻到的页码和滚动位置都会被记住，切去别处再切回来，会自动回到离开时的位置（内容是重新拉取的新数据）；手动更换排序会清掉全部位置记忆，各视图都从第一页重新开始。</li>
       <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词封禁对他同样无效）和「🚫 屏蔽 / ✅ 解封」（与 /ban、/unban 同一套封禁：屏蔽后他再发来的新消息会被立即删掉；解封时他会收到一条解除通知）；设为信任的人行上会挂「🤝 已信任」徽标，屏蔽中的人挂「已屏蔽」徽标。</li>
-      <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证 / 未开始人数，已信任、建有专属话题、已屏蔽和被屏蔽人数，还有没用掉的通行证数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃（活跃还分新客和老客）、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
+      <li><b class=\"k\">统计页：</b>总览一排九个数字，排在前面的是和列表筛选对应的五个：访客总数、已验证、待验证、已屏蔽、被屏蔽，后面是未开始、已信任、建有专属话题的人数和没用掉的通行证数；再往下是过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃（活跃还分新客和老客）、收发了多少条消息。这九个数字都能点：前五个点开会直接切到访客列表并选中对应筛选；后四个在列表里没有单独的筛选，点开会整页推入一个只属于这批人的名单页——顶部只剩一个返回箭头、人群名和紧跟在名字后面的人数，排序固定按最后活跃倒序，点返回箭头回到统计页。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
     </ul>
   </section>
 
@@ -17894,7 +17956,6 @@ function buildUserListPage(pageCtx = {}) {
   #l2head { background: #17212b; padding: 13px 14px; flex: none; display: none; align-items: center; gap: 10px; }
   #l2back { color: #9db2c5; font-size: 24px; line-height: 1; cursor: pointer; padding-right: 2px; }
   #l2title { font-size: 17px; font-weight: 700; flex: 1; }
-  #l2from { display: block; color: #5f7488; font-size: 11.5px; font-weight: 400; margin-top: 1px; }
   #l2cnt { color: #9db2c5; font-size: 13px; }
   .ss { color: #5f7488; font-size: 11px; margin-top: 2px; }
   .sv { font-size: 19px; font-weight: 700; }
@@ -17922,8 +17983,7 @@ function buildUserListPage(pageCtx = {}) {
 </header>
 <div id=\"l2head\">
   <span id=\"l2back\">‹</span>
-  <span id=\"l2title\"><span id=\"l2name\"></span><span id=\"l2from\">来自数据统计</span></span>
-  <span id=\"l2cnt\"></span>
+  <span id=\"l2title\"><span id=\"l2name\"></span> <span id=\"l2cnt\"></span></span>
 </div>
 <div class="chips" id="chips">
   <button class="chip on" data-f="all">全部</button>
@@ -19267,10 +19327,18 @@ function viewSlideFinish() {
   clearTimeout(viewFallbackTimer);
   clearTimeout(viewBodyTimer);
   clearTimeout(viewEnterTimer);
+  clearTimeout(l2AnimTimer);
   viewEnterPending = null;
   var pl = document.getElementById('paneList'), ps = document.getElementById('paneStats');
   if (pl) { pl.style.transition = ''; pl.style.transform = ''; pl.style.opacity = ''; }
   if (ps) { ps.style.transition = ''; ps.style.transform = ''; ps.style.opacity = ''; }
+  // 二级推入/滑出的落地与收滑板也收口在这里（二
+  // 级转场同样持 viewAnim 锁）：先按 l2LandFn 落地
+  // （落地里 showTabBody 的 slideIn 在锁未释放时天
+  // 然短路、不与推入叠加），再经 l2SlabOff 把滑板
+  // 两元素恢复流内。
+  if (l2LandFn) { var l2Lf = l2LandFn; l2LandFn = null; l2Lf(); }
+  if (l2Anim) { l2Anim = 0; l2SlabOff(); }
   viewAnim = false;
   uFloatDodge(true);
 }
@@ -19413,6 +19481,9 @@ function showTabBody(which) {
   document.getElementById('paneList').style.display = isStats ? 'none' : '';
   document.getElementById('chips').style.display = isStats ? 'none' : '';
   document.getElementById('paneStats').style.display = isStats ? '' : 'none';
+  // 页眉「共 N 人」只归列表页：统计页签下隐藏，
+  // 免得把列表最后一次的数字带过去（-v160b6）。
+  document.getElementById('cnt').style.display = isStats ? 'none' : '';
   document.getElementById('tabList').className = 'tab' + (isStats ? '' : ' on');
   document.getElementById('tabStats').className = 'tab' + (isStats ? ' on' : '');
   slideIn(document.getElementById(isStats ? 'paneStats' : 'paneList'), isStats ? 1 : -1);
@@ -19448,34 +19519,167 @@ function statsGo(act) {
   }
   swipeSelf = false;
 }
-function enterL2(nf) {
-  if (l2Mode === nf) return;
-  uCollapseSearch();
-  memLeave();
-  if (!l2Mode) l2PrevFilt = filt;
-  l2Mode = nf;
-  filt = nf;
-  document.getElementById('l2name').textContent = L2_NAMES[nf] || '';
+// ===== 二级转场：整页自右推入（-v160b5）=====
+// 二级不是横滑序列里的一站（左右方向语义不成立），
+// 进出不再借 showTabBody 的 slideIn 写死方向、也不
+// 再让表头硬切：转场期把二级页做成一块覆在当前页
+// 之上的整页滑板——#l2head 与 #paneList 同步
+// position:fixed、同一条 transform 过渡、同起同
+// 落（.l2ov 标记成对出现/消失），进入自右推入
+// .26s、退出向右滑出 .22s（与整页滑动的入场/退
+// 场同族时长）。滑板实底（#0f141a）不透底；底下
+// 的页面在滑板升起前先摆回目标布局，滑入时逐格
+// 被盖、滑出时逐格露出，页头与内容不存在谁先谁
+// 后的分离。动画锁仍是 viewAnim、释放仍只走
+// viewSlideFinish 一个出口（它按 l2LandFn 执行落
+// 地、再经 l2SlabOff 收滑板），1400ms 兜底同现行
+// 口径；转场中被打断（动画中点 ‹、点页签、再点
+// 统计块）先 viewSlideFinish 就地结算再走下一步，
+// 不落错格、不残留状态。取数时机不变：进入点块
+// 即 resetAndLoad，转圈在滑入的页面里转。
+var l2Anim = 0, l2LandFn = null, l2AnimTimer = 0;
+function l2SlabOn(topPx) {
+  var hd = document.getElementById('l2head');
+  var pl = document.getElementById('paneList');
+  hd.classList.add('l2ov');
+  pl.classList.add('l2ov');
+  hd.style.position = 'fixed';
+  hd.style.top = '0';
+  hd.style.left = '0';
+  hd.style.right = '0';
+  hd.style.zIndex = '4';
+  pl.style.position = 'fixed';
+  pl.style.top = topPx + 'px';
+  pl.style.left = '0';
+  pl.style.right = '0';
+  pl.style.bottom = '0';
+  pl.style.zIndex = '4';
+  pl.style.background = '#0f141a';
+}
+function l2SlabOff() {
+  var hd = document.getElementById('l2head');
+  var pl = document.getElementById('paneList');
+  hd.classList.remove('l2ov');
+  pl.classList.remove('l2ov');
+  hd.style.position = '';
+  hd.style.top = '';
+  hd.style.left = '';
+  hd.style.right = '';
+  hd.style.zIndex = '';
+  hd.style.transition = '';
+  hd.style.transform = '';
+  pl.style.position = '';
+  pl.style.top = '';
+  pl.style.left = '';
+  pl.style.right = '';
+  pl.style.bottom = '';
+  pl.style.zIndex = '';
+  pl.style.transition = '';
+  pl.style.transform = '';
+  pl.style.background = '';
+}
+function l2PushIn() {
+  viewAnim = true;
+  l2Anim = 1;
+  l2LandFn = l2PushLand;
+  clearTimeout(viewFallbackTimer);
+  viewFallbackTimer = setTimeout(viewSlideFinish, 1400);
+  var hd = document.getElementById('l2head');
+  var pl = document.getElementById('paneList');
+  pl.style.display = '';
+  document.getElementById('l2name').textContent = L2_NAMES[l2Mode] || '';
   document.getElementById('l2cnt').textContent = '';
+  document.getElementById('l2head').style.display = 'flex';
+  var hdH = hd.offsetHeight || 0;
+  l2SlabOn(hdH);
+  hd.style.transform = 'translateX(100%)';
+  pl.style.transform = 'translateX(100%)';
+  void pl.offsetWidth;
+  hd.style.transition = 'transform .26s ease';
+  pl.style.transition = 'transform .26s ease';
+  hd.style.transform = 'translateX(0px)';
+  pl.style.transform = 'translateX(0px)';
+  clearTimeout(l2AnimTimer);
+  l2AnimTimer = setTimeout(viewSlideFinish, 280);
+}
+function l2PushLand() {
+  // 滑板完全盖住后，底下换成二级布局（slideIn 在
+  // 锁未释放时短路，不与推入叠加），滑板随即由
+  // viewSlideFinish 收回流内、无缝接上。
   showTabBody('list');
   document.getElementById('uhead').style.display = 'none';
   document.getElementById('chips').style.display = 'none';
-  document.getElementById('sortrow').style.display = 'none';
-  document.getElementById('l2head').style.display = 'flex';
-  resetAndLoad();
-  uScrollTop();
 }
-function exitL2() {
-  if (!l2Mode) return;
-  uCollapseSearch();
-  memLeave();
-  l2Mode = null;
-  filt = l2PrevFilt;
+function l2PopOut() {
+  viewAnim = true;
+  l2Anim = 2;
+  l2LandFn = l2PopLand;
+  clearTimeout(viewFallbackTimer);
+  viewFallbackTimer = setTimeout(viewSlideFinish, 1400);
+  var pl = document.getElementById('paneList');
+  var topPx = Math.round(pl.getBoundingClientRect().top);
+  // 底下先把统计页摆回原位（页眉与页签复位、统计
+  // pane 显示并回顶），滑板仍顶着名单整页向右滑
+  // 出、逐格露出。
+  document.getElementById('paneStats').style.display = '';
+  document.getElementById('tabList').className = 'tab';
+  document.getElementById('tabStats').className = 'tab on';
+  document.getElementById('usearch').style.display = 'none';
+  document.getElementById('cnt').style.display = 'none';
+  document.getElementById('uhead').style.display = '';
+  l2SlabOn(topPx);
+  uStopAnim();
+  uScr.scrollTop = 0;
+  var hd = document.getElementById('l2head');
+  hd.style.transition = 'transform .22s ease';
+  pl.style.transition = 'transform .22s ease';
+  hd.style.transform = 'translateX(100%)';
+  pl.style.transform = 'translateX(100%)';
+  clearTimeout(l2AnimTimer);
+  l2AnimTimer = setTimeout(viewSlideFinish, 240);
+}
+function l2PopLand() {
   document.getElementById('l2head').style.display = 'none';
   document.getElementById('uhead').style.display = '';
   document.getElementById('sortrow').style.display = '';
   showTabBody('stats');
   enterKey();
+}
+function enterL2(nf) {
+  if (l2Mode === nf) return;
+  // 转场未落定先结算（释放只走 viewSlideFinish），
+  // 再从稳态进入，不叠两场动画。
+  if (viewAnim) viewSlideFinish();
+  uCollapseSearch();
+  memLeave();
+  if (!l2Mode) l2PrevFilt = filt;
+  var wasL2 = !!l2Mode;
+  l2Mode = nf;
+  filt = nf;
+  document.getElementById('sortrow').style.display = 'none';
+  if (wasL2) {
+    // 已在二级里换人群（界面上无此入口，程序兜
+    // 底）：不走转场，原地换名单。
+    document.getElementById('l2name').textContent = L2_NAMES[nf] || '';
+    document.getElementById('l2cnt').textContent = '';
+    resetAndLoad();
+    uStopAnim();
+    uScr.scrollTop = 0;
+    return;
+  }
+  uStopAnim();
+  uScr.scrollTop = 0;
+  l2PushIn();
+  resetAndLoad();
+}
+function exitL2() {
+  if (!l2Mode) return;
+  if (viewAnim) viewSlideFinish();
+  uCollapseSearch();
+  memLeave();
+  l2Mode = null;
+  filt = l2PrevFilt;
+  l2PopOut();
 }
 document.getElementById('l2back').onclick = function () { exitL2(); };
 
@@ -19542,11 +19746,11 @@ fetch('/api/stats?' + qs.toString())
       stile(d.users.total, '访客总数', null, 'all'),
       stile(d.users.verified, '已验证', null, 'verified'),
       stile(d.users.pending, '待验证', null, 'pending'),
+      stile(d.users.blocked, '已屏蔽', null, 'blocked'),
+      stile(d.users.botBlocked, '被屏蔽', null, 'botblocked'),
       stile(d.users.fresh, '未开始', null, 'fresh'),
       stile(d.users.trusted, '已信任', null, 'trusted'),
       stile(d.users.withTopic, '有话题', null, 'topic'),
-      stile(d.users.blocked, '已屏蔽', null, 'blocked'),
-      stile(d.users.botBlocked, '被屏蔽', null, 'botblocked'),
       stile(d.users.passes, '待用通行证', null, 'passes')
     ]));
     box.appendChild(sgroup('新增访客', [
@@ -19874,6 +20078,9 @@ const PAUSE_STATE_KEY = 'sys:pause';
 const PAUSE_DEFAULT_MINUTES = 60;
 const PAUSE_MAX_MINUTES = 10080;
 
+// 主管理员告警的统一发送口：调用方全是无按钮的系统
+// 告警（熔断通知、看门狗、死信、限流、更新等），故在
+// 此统一附「系统提示」标签（SYS_TAG_MARKUP）。
 async function notifyPrimaryAdmins(
   env,
   text,
@@ -19894,7 +20101,8 @@ async function notifyPrimaryAdmins(
         {
           chat_id: adminId,
           text,
-          parse_mode: 'HTML'
+          parse_mode: 'HTML',
+          reply_markup: SYS_TAG_MARKUP
         }
       );
     } catch (error) {
@@ -20114,7 +20322,8 @@ async function flipPauseCards(env, limit = 10) {
           {
             chat_id: userId,
             message_id: messageId,
-            text: restoredText
+            text: restoredText,
+            reply_markup: SYS_TAG_MARKUP
           }
         );
       }
@@ -20461,7 +20670,8 @@ async function maybeSendPauseWarn(env, userId, episode) {
         'sendMessage',
         {
           chat_id: userId,
-          text: warnText
+          text: warnText,
+          reply_markup: SYS_TAG_MARKUP
         }
       );
 
@@ -20660,7 +20870,8 @@ async function pauseGateDrops(update, env) {
           'sendMessage',
           {
             chat_id: actorId,
-            text: replyText
+            text: replyText,
+            reply_markup: SYS_TAG_MARKUP
           }
         );
 
