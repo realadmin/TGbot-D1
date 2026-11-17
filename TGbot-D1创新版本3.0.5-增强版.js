@@ -14013,6 +14013,39 @@ async function handleUserListApi(request, env) {
     // 数，total / 页号 / 游标三处共用同一 filterSql
     // 自动生效，搜索与排序照常叠加。
     stateSql = "EXISTS (SELECT 1 FROM config WHERE key = 'botblocked:' || user_id AND value = '1')";
+  } else if (stateParam === 'fresh') {
+    // 未开始（二级筛选）：与数据统计的未开始计数逐
+    // 字同口径——user_state = NEW，不附加封禁条件；
+    // 管理员/协管员的排除由 countUsersWhere 与取数
+    // WHERE 的统一排除集合处理，两边数字恒等。
+    stateSql = 'user_state = ?';
+    stateBinds.push(USER_STATE.NEW);
+  } else if (stateParam === 'trusted') {
+    // 已信任（二级筛选）：与统计的已信任计数同口
+    // 径（is_trusted = 1，排除集合统一处理）。
+    stateSql = 'is_trusted = 1';
+  } else if (stateParam === 'topic') {
+    // 有话题（二级筛选）：与统计的同口径谓词逐字
+    // 一致（topic_id 非 NULL 且非空串）。
+    stateSql = "topic_id IS NOT NULL AND topic_id != ''";
+  } else if (stateParam === 'passes') {
+    // 待用通行证（二级筛选）：有效证判定与统计共
+    // 用 listOutstandingPassUserIds（记录 {n, e}、
+    // n 在且 e 未到期），命中者以 user_id IN 列表
+    // 进谓词——total / 页号 / 游标三处共用同一
+    // filterSql 自动生效，搜索照常叠加。无人持证
+    // 时用不存在的占位 ID 保谓词为空集。
+    const passIds = await listOutstandingPassUserIds(env);
+    const holders = passIds.length
+      ? passIds
+      : ['__no_pass_holder__'];
+
+    stateSql =
+      'user_id IN (' +
+      holders.map(() => '?').join(',') +
+      ')';
+
+    stateBinds.push(...holders);
   }
 
   // 搜索：备注 / 姓名 / 用户名 / ID 子串匹配。姓名与用户
@@ -14396,32 +14429,39 @@ async function countUsersWhere(env, extraSql, binds) {
   return countRows(env, sql, allBinds);
 }
 
-// 待用通行证数：pass:<uid> 记录还在即未消费（消费 /
+// 待用通行证：pass:<uid> 记录还在即未消费（消费 /
 // 作废都会删键）；记录值 {n, e}，e 为毫秒到期时刻，
-// 未过期才算。过期记录要等访客下次互动才清扫，统计
-// 这里按 e 现场过滤，口径与列表页的证状态徽标一致。
-async function countOutstandingPasses(env) {
+// 未过期才算。过期记录要等访客下次互动才清扫，这里
+// 按 e 现场过滤，口径与列表页的证状态徽标一致。判
+// 定收口在 listOutstandingPassUserIds：数据统计的待
+// 用通行证数与访客列表 state=passes 的持证人集合共
+// 用它，两边数字恒等。
+async function listOutstandingPassUserIds(env) {
   const result = await env.TG_BOT_DB.prepare(
     'SELECT key, value FROM config WHERE key LIKE ?'
   )
     .bind('pass:%')
     .all();
 
-  let n = 0;
+  const ids = [];
 
   for (const row of result?.results || []) {
     try {
       const rec = JSON.parse(row.value);
 
       if (rec && rec.n && Number(rec.e) > Date.now()) {
-        n += 1;
+        ids.push(String(row.key).slice('pass:'.length));
       }
     } catch {
       /* 坏记录按无证处理 */
     }
   }
 
-  return n;
+  return ids;
+}
+
+async function countOutstandingPasses(env) {
+  return (await listOutstandingPassUserIds(env)).length;
 }
 
 async function handleStatsApi(request, env) {
@@ -14782,7 +14822,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。这组按钮可以长按拖动摆放：按住任意一颗拖动、松手吸附到屏幕左侧或右侧，觉得挡住列表就把它挪开；展开搜索时它回到输入法上方（靠左时搜索框改为向右展开），收起回到放它的位置，拖回右下角原位会恢复自动避让分页条；关掉页面再打开则回到原位。页眉下方的「全部 / 已验证 / 待验证 / 已屏蔽 / 被屏蔽」是快速筛选（「被屏蔽」列的是拉黑了机器人的人）；筛选下方的一行按钮管排序——左半选按最后活跃还是首次来访（第一次与机器人互动的时间）排，右半选倒序还是正序。在列表上左右滑动，也能在五个筛选和「数据统计」之间切换。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
       <li><b class=\"k\">位置会记住：</b>每个筛选与搜索组合下翻到的页码和滚动位置都会被记住，切去别处再切回来，会自动回到离开时的位置（内容是重新拉取的新数据）；手动更换排序会清掉全部位置记忆，各视图都从第一页重新开始。</li>
       <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词封禁对他同样无效）和「🚫 屏蔽 / ✅ 解封」（与 /ban、/unban 同一套封禁：屏蔽后他再发来的新消息会被立即删掉；解封时他会收到一条解除通知）；设为信任的人行上会挂「🤝 已信任」徽标，屏蔽中的人挂「已屏蔽」徽标。</li>
-      <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证 / 未开始人数，已信任、建有专属话题、已封禁和被屏蔽人数，还有没用掉的通行证数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃（活跃还分新客和老客）、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
+      <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证 / 未开始人数，已信任、建有专属话题、已屏蔽和被屏蔽人数，还有没用掉的通行证数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃（活跃还分新客和老客）、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
     </ul>
   </section>
 
@@ -17849,6 +17889,13 @@ function buildUserListPage(pageCtx = {}) {
   .sgroup { color: #9db2c5; font-size: 12px; margin: 10px 0 6px; }
   .srow { display: grid; grid-template-columns: repeat(auto-fit, minmax(94px, 1fr)); gap: 8px; }
   .stile { background: #17212b; border-radius: 10px; padding: 8px 10px; }
+  .stlink { position: relative; cursor: pointer; padding-right: 22px; }
+  .stchev { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); color: #5f7488; font-size: 16px; line-height: 1; }
+  #l2head { background: #17212b; padding: 13px 14px; flex: none; display: none; align-items: center; gap: 10px; }
+  #l2back { color: #9db2c5; font-size: 24px; line-height: 1; cursor: pointer; padding-right: 2px; }
+  #l2title { font-size: 17px; font-weight: 700; flex: 1; }
+  #l2from { display: block; color: #5f7488; font-size: 11.5px; font-weight: 400; margin-top: 1px; }
+  #l2cnt { color: #9db2c5; font-size: 13px; }
   .ss { color: #5f7488; font-size: 11px; margin-top: 2px; }
   .sv { font-size: 19px; font-weight: 700; }
   .sl { color: #9db2c5; font-size: 11.5px; margin-top: 1px; }
@@ -17873,6 +17920,11 @@ function buildUserListPage(pageCtx = {}) {
     <button class="tab" id="tabStats">📊 数据统计</button>
   </div>
 </header>
+<div id=\"l2head\">
+  <span id=\"l2back\">‹</span>
+  <span id=\"l2title\"><span id=\"l2name\"></span><span id=\"l2from\">来自数据统计</span></span>
+  <span id=\"l2cnt\"></span>
+</div>
 <div class="chips" id="chips">
   <button class="chip on" data-f="all">全部</button>
   <button class="chip" data-f="verified">已验证</button>
@@ -18091,8 +18143,12 @@ function loadUsers() {
   params.set('state', filt);
   if (query) params.set('q', query);
   if (booted) {
-    params.set('sort', sortMode);
+    // 二级模式排序固定最后活跃·倒序：只改本次取数
+    // 的 sort 参数，不动一级的 sortMode 选择状态。
+    params.set('sort', l2Mode ? 'act_desc' : sortMode);
     params.set('limit', PAGE);
+  } else if (l2Mode) {
+    params.set('sort', 'act_desc');
   }
   if (curCursor) params.set('cursor', curCursor);
   if (pageAnchor > 0) params.set('page', pageAnchor);
@@ -18214,6 +18270,8 @@ function render() {
   memSave();
   var list = rows;
   document.getElementById('cnt').textContent = '共 ' + listTotal + ' 人';
+  var l2c = document.getElementById('l2cnt');
+  if (l2c) l2c.textContent = '共 ' + listTotal + ' 人';
   var pgSel = document.getElementById('pgsel');
   var totalPages = Math.max(1, Math.ceil((listTotal || 0) / PAGE));
   var curPg = curPageNo();
@@ -19108,7 +19166,9 @@ document.addEventListener('touchstart', function (e) {
   if (el && el.closest && (el.closest('#usearch') || el.closest('select'))) swipeOff = true;
 }, { passive: true });
 document.addEventListener('touchmove', function (e) {
-  if (swipeOff || swipeLock || swipeX0 === null || swipeY0 === null) return;
+  // 二级模式下横滑切视图禁用（站序本身不变，进出
+  // 二级只走统计块点击与 #l2back 返回）。
+  if (l2Mode || swipeOff || swipeLock || swipeX0 === null || swipeY0 === null) return;
   var t = (e.touches && e.touches[0]) ? e.touches[0] : null;
   if (!t) return;
   var dx = t.clientX - swipeX0, dy = t.clientY - swipeY0;
@@ -19364,7 +19424,62 @@ document.getElementById('tabList').onclick = function () { showTab('list'); };
 document.getElementById('tabStats').onclick = function () { showTab('stats'); };
 document.getElementById('toTop').onclick = function () { uScrollTop(); };
 
-function stile(v, l, sub) {
+// ===== 二级模式（数据统计人群块直达名单）=====
+// 一级筛选仍是五个常用钮；统计总览的人群块是二级
+// 入口：与一级钮同集的（全部 / 已验证 / 待验证 /
+// 已屏蔽 / 被屏蔽）经 statsGo 借道现行 chip 路径，
+// 一级里没有的（未开始 / 已信任 / 有话题 / 待用通
+// 行证）进二级模式：filt 换成二级 state（posMem
+// 按 filt 键天然隔离），顶栏换成 #l2head（‹ 返回
+// + 人群名 + 共 N 人），页眉 / 筛选行 / 排序行隐
+// 藏；排序固定最后活跃·倒序（loadUsers 只改取数
+// 参数、不动 sortMode）；横滑在二级下禁用。点 ‹
+// 回数据统计页签，并把 filt 还原为进入前的一级筛
+// 选重取，二级状态不残留。
+var L2_NAMES = { fresh: '未开始', trusted: '🤝 已信任', topic: '有话题', passes: '🎫 待用通行证' };
+var l2Mode = null, l2PrevFilt = 'all';
+function statsGo(act) {
+  if (act === 'fresh' || act === 'trusted' || act === 'topic' || act === 'passes') { enterL2(act); return; }
+  swipeSelf = true;
+  if (document.getElementById('paneStats').style.display !== 'none') showTab('list');
+  var cs = document.querySelectorAll('.chip');
+  for (var i = 0; i < cs.length; i++) {
+    if (cs[i].dataset.f === act) { cs[i].click(); break; }
+  }
+  swipeSelf = false;
+}
+function enterL2(nf) {
+  if (l2Mode === nf) return;
+  uCollapseSearch();
+  memLeave();
+  if (!l2Mode) l2PrevFilt = filt;
+  l2Mode = nf;
+  filt = nf;
+  document.getElementById('l2name').textContent = L2_NAMES[nf] || '';
+  document.getElementById('l2cnt').textContent = '';
+  showTabBody('list');
+  document.getElementById('uhead').style.display = 'none';
+  document.getElementById('chips').style.display = 'none';
+  document.getElementById('sortrow').style.display = 'none';
+  document.getElementById('l2head').style.display = 'flex';
+  resetAndLoad();
+  uScrollTop();
+}
+function exitL2() {
+  if (!l2Mode) return;
+  uCollapseSearch();
+  memLeave();
+  l2Mode = null;
+  filt = l2PrevFilt;
+  document.getElementById('l2head').style.display = 'none';
+  document.getElementById('uhead').style.display = '';
+  document.getElementById('sortrow').style.display = '';
+  showTabBody('stats');
+  enterKey();
+}
+document.getElementById('l2back').onclick = function () { exitL2(); };
+
+function stile(v, l, sub, act) {
   var d = document.createElement('div');
   d.className = 'stile';
   var a = document.createElement('div');
@@ -19380,6 +19495,17 @@ function stile(v, l, sub) {
     c.className = 'ss';
     c.textContent = sub;
     d.appendChild(c);
+  }
+  if (act) {
+    // 可点人群块（仅访客总览组）：右侧 › 标记，点
+    // 击经 statsGo 进对应名单；新增 / 活跃 / 消息
+    // 量三组不传 act，保持只读、无标记。
+    d.className = 'stile stlink';
+    var ch = document.createElement('span');
+    ch.className = 'stchev';
+    ch.textContent = '›';
+    d.appendChild(ch);
+    d.onclick = function () { statsGo(act); };
   }
   return d;
 }
@@ -19413,15 +19539,15 @@ fetch('/api/stats?' + qs.toString())
     var box = document.getElementById('sgrid');
     box.textContent = '';
     box.appendChild(sgroup('访客总览', [
-      stile(d.users.total, '访客总数'),
-      stile(d.users.verified, '已验证'),
-      stile(d.users.pending, '待验证'),
-      stile(d.users.fresh, '未开始'),
-      stile(d.users.trusted, '已信任'),
-      stile(d.users.withTopic, '有话题'),
-      stile(d.users.blocked, '已封禁'),
-      stile(d.users.botBlocked, '被屏蔽'),
-      stile(d.users.passes, '待用通行证')
+      stile(d.users.total, '访客总数', null, 'all'),
+      stile(d.users.verified, '已验证', null, 'verified'),
+      stile(d.users.pending, '待验证', null, 'pending'),
+      stile(d.users.fresh, '未开始', null, 'fresh'),
+      stile(d.users.trusted, '已信任', null, 'trusted'),
+      stile(d.users.withTopic, '有话题', null, 'topic'),
+      stile(d.users.blocked, '已屏蔽', null, 'blocked'),
+      stile(d.users.botBlocked, '被屏蔽', null, 'botblocked'),
+      stile(d.users.passes, '待用通行证', null, 'passes')
     ]));
     box.appendChild(sgroup('新增访客', [
       stile(d.growth.d1, '过去 24 小时'),
