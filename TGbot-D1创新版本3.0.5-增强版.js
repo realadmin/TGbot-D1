@@ -141,7 +141,6 @@ const DATABASE_RETENTION_SECONDS = 90 * 24 * 60 * 60;
 const USER_UPDATE_FIELDS = new Set([
   'user_state',
   'is_blocked',
-  'is_muted',
   'block_count',
   'topic_id',
   'info_card_message_id',
@@ -1104,7 +1103,8 @@ async function cleanupDatabase(env) {
       () => cleanupOldAuditRows(env),
       () => sweepExpiredNonces(env),
       () => sweepStaleUpdateClaims(env),
-      () => sweepRetiredMarkConfigKeys(env)
+      () => sweepRetiredMarkConfigKeys(env),
+      () => sweepRetiredMutedFlags(env)
     ]) {
       try {
         await sweep();
@@ -1137,6 +1137,19 @@ async function sweepRetiredMarkConfigKeys(env) {
   ]) {
     await dbConfigDelete(key, env);
   }
+}
+
+// 一次性存量清理（-v160b2）：is_muted（已静音）标记彻底
+// 退役——统计、转发静默投递与超时清理豁免都不再读它，
+// 界面与接口也不再暴露；存量库里还挂着 1 的行随概率清
+// 扫一次清零，免得标记无声残留。清零幂等：清净后每轮
+// 清扫只是一次零命中更新，故可长期挂在清扫链上、不设
+// 完成标记（物理列保留不动，无害）。
+async function sweepRetiredMutedFlags(env) {
+  await env.TG_BOT_DB.prepare(
+    'UPDATE users SET is_muted = 0 ' +
+    'WHERE is_muted != 0'
+  ).run();
 }
 
 // 卡死占位清扫：同步处理模型下，一条更新 10 分钟还没
@@ -1230,7 +1243,7 @@ async function cleanupReverifyExpiredUsers(env, now) {
     await env.TG_BOT_DB.prepare(
       'SELECT user_id, is_trusted FROM users ' +
       'WHERE user_state IN (?, ?) ' +
-      'AND is_blocked = 0 AND is_muted = 0 ' +
+      'AND is_blocked = 0 ' +
       'AND updated_at IS NOT NULL ' +
       'AND updated_at < ? LIMIT 200'
     )
@@ -1268,7 +1281,7 @@ async function cleanupReverifyExpiredUsers(env, now) {
     await env.TG_BOT_DB.prepare(
       'UPDATE users SET user_state = ? ' +
       'WHERE user_state = ? ' +
-      'AND is_blocked = 0 AND is_muted = 0 ' +
+      'AND is_blocked = 0 ' +
       'AND updated_at < ? AND user_id = ?'
     )
       .bind(
@@ -1304,7 +1317,7 @@ async function cleanupExpiredUsers(env, now) {
     await env.TG_BOT_DB.prepare(
       'SELECT user_id, is_trusted FROM users ' +
       'WHERE user_state IN (?, ?) ' +
-      'AND is_blocked = 0 AND is_muted = 0 ' +
+      'AND is_blocked = 0 ' +
       'AND updated_at IS NOT NULL ' +
       'AND updated_at < ? LIMIT 200'
     )
@@ -1347,7 +1360,7 @@ async function cleanupExpiredUsers(env, now) {
       await env.TG_BOT_DB.prepare(
         'DELETE FROM users WHERE user_id = ? ' +
         'AND user_state IN (?, ?) ' +
-        'AND is_blocked = 0 AND is_muted = 0 ' +
+        'AND is_blocked = 0 ' +
         'AND updated_at < ?'
       )
         .bind(
@@ -1881,7 +1894,6 @@ function normalizeUser(user) {
   return {
     ...user,
     is_blocked: Number(user.is_blocked) === 1,
-    is_muted: Number(user.is_muted) === 1,
     is_trusted: Number(user.is_trusted) === 1,
     relay_exempt:
       Number(user.relay_exempt) === 1,
@@ -1951,12 +1963,11 @@ async function dbUserGetOrCreate(userId, env) {
       user_id,
       user_state,
       is_blocked,
-      is_muted,
       block_count,
       topic_creating,
       created_at,
       updated_at
-    ) VALUES (?, ?, 0, 0, 0, 0, ?, ?)
+    ) VALUES (?, ?, 0, 0, 0, ?, ?)
   `).bind(
     normalizedId,
     USER_STATE.NEW,
@@ -2086,7 +2097,6 @@ async function dbUserUpdate(userId, data, env) {
 
     if (
       key === 'is_blocked' ||
-      key === 'is_muted' ||
       key === 'topic_creating'
     ) {
       if (typeof value === 'boolean') {
@@ -2799,14 +2809,10 @@ function getProfileUrl(usernameRaw) {
 function getInfoCardButtons(
   userId,
   isBlocked,
-  isMuted,
   usernameRaw = '',
   isTrusted = false,
   isExempt = false
 ) {
-  // 静音按钮已下线：「静音通知」与 Telegram 原生免打扰
-  // 不是一回事、误导性太强。is_muted 字段本身、转发副本
-  // 的静默投递与超时清理豁免口径全部保留（存量冻结）。
   const rows = [
     [
       {
@@ -2989,7 +2995,6 @@ async function refreshUserInfoCard(
         reply_markup: getInfoCardButtons(
           userId,
           user.is_blocked,
-          user.is_muted,
           payload.usernameRaw,
           user.is_trusted,
           user.relay_exempt
@@ -3109,7 +3114,6 @@ async function createInfoCard(
       reply_markup: getInfoCardButtons(
         payload.userId,
         user.is_blocked,
-        user.is_muted,
         payload.usernameRaw,
         user.is_trusted,
         user.relay_exempt
@@ -3974,7 +3978,7 @@ async function relayUnsupportedPlaceholder(
           ? `\n${buildUnsupportedSummary(message)}`
           : ''),
       disable_notification: Boolean(
-        user.is_blocked || user.is_muted
+        user.is_blocked
       )
     });
   } catch (sendError) {
@@ -4134,10 +4138,7 @@ async function relayUserMessageToTopic(
         message_id:
           message.message_id,
         disable_notification:
-          Boolean(
-            freshUser.is_blocked ||
-            freshUser.is_muted
-          )
+          Boolean(freshUser.is_blocked)
       },
       replyParameters
     );
@@ -4174,10 +4175,7 @@ async function relayUserMessageToTopic(
               message_id:
                 message.message_id,
               disable_notification:
-                Boolean(
-                  freshUser.is_blocked ||
-                  freshUser.is_muted
-                )
+                Boolean(freshUser.is_blocked)
             },
             replyParameters
           );
@@ -4275,10 +4273,7 @@ async function relayUserMessageToTopic(
             message_id:
               message.message_id,
             disable_notification:
-              Boolean(
-                newestUser.is_blocked ||
-                newestUser.is_muted
-              )
+              Boolean(newestUser.is_blocked)
           },
           replyParameters
         );
@@ -10941,7 +10936,6 @@ async function handleUserCardCallback(
         reply_markup: getInfoCardButtons(
           targetUserId,
           user.is_blocked,
-          user.is_muted,
           usernameRaw2,
           user.is_trusted,
           user.relay_exempt
@@ -11049,7 +11043,6 @@ async function handleUserCardCallback(
           getInfoCardButtons(
             targetUserId,
             user.is_blocked,
-            user.is_muted,
             usernameRaw,
             user.is_trusted,
             user.relay_exempt
@@ -14169,7 +14162,7 @@ async function handleUserListApi(request, env) {
   // 多取一行判「还有下一页」，不靠总数推算。
   const result = await env.TG_BOT_DB.prepare(
     'SELECT user_id, user_state, is_blocked, ' +
-      'is_muted, is_trusted, relay_exempt, topic_id, ' +
+      'is_trusted, relay_exempt, topic_id, ' +
       'created_at, updated_at, ' +
       'user_info_json, admin_note FROM users ' +
       (where.length
@@ -14239,7 +14232,6 @@ async function handleUserListApi(request, env) {
       state: user.is_blocked
         ? 'blocked'
         : String(user.user_state || ''),
-      muted: Boolean(user.is_muted),
       topic: Boolean(user.topic_id),
       topic_id: user.topic_id
         ? String(user.topic_id)
@@ -14435,7 +14427,6 @@ async function handleStatsApi(request, env) {
     pending,
     fresh,
     blocked,
-    muted,
     botBlocked,
     new1,
     new7,
@@ -14467,7 +14458,6 @@ async function handleStatsApi(request, env) {
       [USER_STATE.NEW]
     ),
     countUsersWhere(env, 'is_blocked = 1', []),
-    countUsersWhere(env, 'is_muted = 1', []),
     countRows(
       env,
       'SELECT COUNT(*) AS n FROM config ' +
@@ -14532,7 +14522,6 @@ async function handleStatsApi(request, env) {
       pending,
       fresh,
       blocked,
-      muted,
       botBlocked
     },
     growth: { d1: new1, d7: new7, d30: new30 },
@@ -14724,7 +14713,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。这组按钮可以长按拖动摆放：按住任意一颗拖动、松手吸附到屏幕左侧或右侧，觉得挡住列表就把它挪开；展开搜索时它回到输入法上方（靠左时搜索框改为向右展开），收起回到放它的位置，拖回右下角原位会恢复自动避让分页条；关掉页面再打开则回到原位。页眉下方的「全部 / 已验证 / 待验证 / 已屏蔽 / 被屏蔽」是快速筛选（「被屏蔽」列的是拉黑了机器人的人）；筛选下方的一行按钮管排序——左半选按最后活跃还是首次来访（第一次与机器人互动的时间）排，右半选倒序还是正序。在列表上左右滑动，也能在五个筛选和「数据统计」之间切换。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
       <li><b class=\"k\">位置会记住：</b>每个筛选与搜索组合下翻到的页码和滚动位置都会被记住，切去别处再切回来，会自动回到离开时的位置（内容是重新拉取的新数据）；手动更换排序会清掉全部位置记忆，各视图都从第一页重新开始。</li>
       <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词封禁对他同样无效）和「🚫 屏蔽 / ✅ 解封」（与 /ban、/unban 同一套封禁：屏蔽后他再发来的新消息会被立即删掉；解封时他会收到一条解除通知）；设为信任的人行上会挂「🤝 已信任」徽标，屏蔽中的人挂「已屏蔽」徽标。</li>
-      <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证 / 未开始人数，已封禁、已静音和被屏蔽人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
+      <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证 / 未开始人数，已封禁和被屏蔽人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
     </ul>
   </section>
 
@@ -14950,7 +14939,7 @@ function buildPanelPage(pageCtx = {}) {
     <button class="save" data-k="verified_ttl_days" data-t="f_ttl">保存</button>
     <label>已验证改回待验证（天，0 = 关闭）</label>
     <input type="number" id="f_rvttl" min="0" max="3650" step="1">
-    <div class="hint">温和版：超过该天数无活跃的已验证访客只改回待验证，档案、备注与话题都保留，对方回来重新验证后还在原话题里聊。被封禁 / 静音 / 信任的访客不改。可与上面的删档清理同时开：一般把这个天数设得更小（先改回待验证）；删档天数从最后一次活动算起继续计时，满了照样删档。</div>
+    <div class="hint">温和版：超过该天数无活跃的已验证访客只改回待验证，档案、备注与话题都保留，对方回来重新验证后还在原话题里聊。被封禁 / 信任的访客不改。可与上面的删档清理同时开：一般把这个天数设得更小（先改回待验证）；删档天数从最后一次活动算起继续计时，满了照样删档。</div>
     <button class="save" data-k="reverify_ttl_days" data-t="f_rvttl">保存</button>
     <h2>⚙️ 参数与开关</h2>
     <div class="hint">说明：把问答「连错锁定次数」调小后，之前已答错多次的访客会按新次数提前锁定；已经在锁定期内的访客按落锁时的时长走完。验证链接与通行证的有效期调短，不影响已经发出去的（按发出时的时长到期）。</div>
@@ -19353,7 +19342,6 @@ fetch('/api/stats?' + qs.toString())
       stile(d.users.pending, '待验证'),
       stile(d.users.fresh, '未开始'),
       stile(d.users.blocked, '已封禁'),
-      stile(d.users.muted, '已静音'),
       stile(d.users.botBlocked, '被屏蔽')
     ]));
     box.appendChild(sgroup('新增访客', [
