@@ -12626,7 +12626,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.5.5';
+const BOT_VERSION = 'v1.6.0';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -14010,6 +14010,16 @@ async function handleUserListApi(request, env) {
     stateBinds.push(USER_STATE.PENDING);
   } else if (stateParam === 'blocked') {
     stateSql = 'is_blocked = 1';
+  } else if (stateParam === 'botblocked') {
+    // 被屏蔽（访客拉黑了机器人）：与前三档不同维——
+    // 它是横切标记，不落在 users 表列上，记账在
+    // config 的 botblocked:<id>（与数据统计的被屏蔽
+    // 总数同口径）。用 EXISTS 按键精确匹配，不用
+    // LIKE 前缀扫（会误配相邻 ID）；对方解除拉黑
+    // 时标记被清，人自动退出本筛选。谓词无绑定参
+    // 数，total / 页号 / 游标三处共用同一 filterSql
+    // 自动生效，搜索与排序照常叠加。
+    stateSql = "EXISTS (SELECT 1 FROM config WHERE key = 'botblocked:' || user_id AND value = '1')";
   }
 
   // 搜索：备注 / 姓名 / 用户名 / ID 子串匹配。姓名与用户
@@ -14648,7 +14658,7 @@ function buildGuidePage(pageCtx = {}) {
 <li><b class=\"k\">在哪里切换：</b>网页管理台 → 基础配置 → 验证方式。选了 Turnstile 后，问题和答案两项会自动隐藏；如果还没配好 Turnstile 密钥，验证不会自动降级成问答（默认答案公开可抄，降级等于没验证）：访客会看到「验证服务尚未配置完成」的提示，机器人也会私聊提醒你补齐密钥、或改选静态问答 / 顺序点击。</li>
       <li><b class=\"k\">让某人重新验证：</b>打开他的话题，发送 <code>/reverify</code>，他下一次发消息前要重新过一遍验证。</li>
       <li><b class=\"k\">自己先试一遍：</b>私聊发送 <code>/testverify</code> 会拿到一个测试验证链接，点开能看到访客眼中的验证页长什么样；测试模式只是看看样子，不会真的放行或记录任何人。</li>
-      <li><b class=\"k\">🎫 一次性通行证（救济通道）：</b>个别访客怎么也过不了验证（比如网络连不上验证服务）时，在访客列表里他那一行点「🎫 通行证」，机器人会私聊发给他一张通行证（默认 30 分钟内有效，有效期可在管理台「基础配置」里改），他点开确认即通过验证。通行证必须本人点开才有效，转发给别人没用，用过即作废；不依赖 Turnstile 配置，没配密钥也能发。</li>
+      <li><b class=\"k\">🎫 一次性通行证（救济通道）：</b>个别访客怎么也过不了验证（比如网络连不上验证服务）时，在访客列表里他那一行点「🎫 通行证」，机器人会私聊发给他一条带通行证链接的消息（默认 30 分钟内有效，有效期可在管理台「基础配置」里改），他点开链接、在确认页点一下即通过验证。通行证链接必须本人点开才有效，转发给别人没用，用过即作废；不依赖 Turnstile 配置，没配密钥也能发。</li>
       <li><b class=\"k\">🤝 信任：</b>熟人可以免掉验证：在访客列表他那一行点「🤝 信任」，或在他话题的资料卡上点「设为信任」，他立即通过验证（会收到验证成功提示）。信任只有一个开关，开启后一并免验证、免转发限流、免类型过滤、免超时清理（删档版与温和版都免）；屏蔽关键词与关键词自动封禁也一并豁免——他发的话、改的话带着关键词也照常送达、不计数。点「取消信任」收回。注意：对他「重置验证」或在话题里发 /reverify 会连信任一起撤销；被封禁的人要先解封才能设信任；资料卡上的信任按钮只有主管理员能操作。</li>
       <li><b class=\"k\">验证消息会自己清理：</b>验证提示、欢迎消息、通行证和「🎉 验证成功」这类流程消息，用完后会被机器人自动删掉，不在访客对话里堆积：反复索要验证只留最新一条提示，通过验证时提示、欢迎消息和访客自己发的那条 /start 会一并清掉，成功提示在他发出第一条消息、刚进入处理时就清掉（那条消息就算被关键词、类型过滤或限流拦下也照清）；过期没用的通行证会在他下次来发消息时清扫。</li>
     </ul>
@@ -14659,7 +14669,7 @@ function buildGuidePage(pageCtx = {}) {
     <ul>
       <li><b class=\"k\">资料卡：</b>每个话题顶部都钉着访客的资料卡（名字、ID、状态、你的备注）。卡片不见了就在话题里发 <code>/card</code> 重新生成；卡片上的按钮可以直接屏蔽 / 解除屏蔽、设为信任、刷新。</li>
       <li><b class=\"k\">引用回复会跟着走：</b>你在话题里引用某条消息再回复，访客那边看到的也是引用着他原话的回复；访客引用着回复你时同理，连他框选一小段文字的「部分引用」都会原样带过去。</li>
-      <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，被改好的那条消息下方会出现一颗「✍🏼已编辑」标记按钮（点它不会有任何反应，只是标记）。Telegram 不给机器人提供官方的「已编辑」标记，这颗按钮就是补这个用的；它和普通聊天里的编辑一样安静——不会有新消息、不会弹窗提醒，没留意的话可能根本发现不了对方改过。访客编辑他的消息时，你这边也一样。这是写死的固定行为：两个方向的编辑都会自动附上标记，管理台里没有它的开关。</li>
+      <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，被改好的那条消息下方会出现一颗「✍🏼已编辑」标记按钮（点它不会有任何反应，只是标记）。Telegram 不给机器人提供官方的「已编辑」标记，这颗按钮就是补这个用的；它和普通聊天里的编辑一样安静——不会有新消息、不会弹窗提醒，没留意的话可能根本发现不了对方改过。访客编辑他的消息时，你这边也一样。这是写死的固定行为：两个方向的编辑都会自动附上标记，管理台里没有它的开关。只有原地改不动的极少数情况例外（比如转发配对已过期被清理、原地修改被拒绝）：这时机器人会以「回复旧副本」的形式补发一条只含新内容的消息，下方照样附「✍🏼已编辑」标记，原来的副本保留不动——这种时候才会多出一条新消息，顺着回复关系就能对上是哪条被改了。</li>
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。注意：访客私聊那边的原消息只能删 48 小时以内的，超了删不掉时会在话题里留一行说明。</li>
       <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。这个操作只有主管理员能做，协管员发命令或点确认都会被拦下。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
@@ -14711,10 +14721,10 @@ function buildGuidePage(pageCtx = {}) {
     <h2>📋 访客列表与数据统计</h2>
     <ul>
       <li><b class=\"k\">两个标签页：</b>「访客列表」和「数据统计」，默认打开列表页，点顶部标签切换。</li>
-      <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。这组按钮可以长按拖动摆放：按住任意一颗拖动、松手吸附到屏幕左侧或右侧，觉得挡住列表就把它挪开；展开搜索时它回到输入法上方（靠左时搜索框改为向右展开），收起回到放它的位置，拖回右下角原位会恢复自动避让分页条；关掉页面再打开则回到原位。页眉下方的「全部 / 已验证 / 待验证 / 已屏蔽」是快速筛选；筛选下方的一行按钮管排序——左半选按最后活跃还是首次来访（第一次与机器人互动的时间）排，右半选倒序还是正序。在列表上左右滑动，也能在四个筛选和「数据统计」之间切换。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
+      <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。这组按钮可以长按拖动摆放：按住任意一颗拖动、松手吸附到屏幕左侧或右侧，觉得挡住列表就把它挪开；展开搜索时它回到输入法上方（靠左时搜索框改为向右展开），收起回到放它的位置，拖回右下角原位会恢复自动避让分页条；关掉页面再打开则回到原位。页眉下方的「全部 / 已验证 / 待验证 / 已屏蔽 / 被屏蔽」是快速筛选（「被屏蔽」列的是拉黑了机器人的人）；筛选下方的一行按钮管排序——左半选按最后活跃还是首次来访（第一次与机器人互动的时间）排，右半选倒序还是正序。在列表上左右滑动，也能在五个筛选和「数据统计」之间切换。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
       <li><b class=\"k\">位置会记住：</b>每个筛选与搜索组合下翻到的页码和滚动位置都会被记住，切去别处再切回来，会自动回到离开时的位置（内容是重新拉取的新数据）；手动更换排序会清掉全部位置记忆，各视图都从第一页重新开始。</li>
       <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词封禁对他同样无效）和「🚫 屏蔽 / ✅ 解封」（与 /ban、/unban 同一套封禁：屏蔽后他再发来的新消息会被立即删掉；解封时他会收到一条解除通知）；设为信任的人行上会挂「🤝 已信任」徽标，屏蔽中的人挂「已屏蔽」徽标。</li>
-      <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
+      <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证 / 未开始人数，已封禁、已静音和拉黑了机器人的人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
     </ul>
   </section>
 
@@ -17809,6 +17819,7 @@ function buildUserListPage(pageCtx = {}) {
   <button class="chip" data-f="verified">已验证</button>
   <button class="chip" data-f="pending">待验证</button>
   <button class="chip" data-f="blocked">已屏蔽</button>
+  <button class="chip" data-f="botblocked">被屏蔽</button>
 </div>
 <div id="uscroll">
 <main>
@@ -18987,9 +18998,10 @@ document.addEventListener('touchend', function (e) {
   var dx = t.clientX - kbTouchX, dy = t.clientY - kbTouchY;
   if (Math.sqrt(dx * dx + dy * dy) < 12) uCollapseSearch();
 }, { passive: true });
-// 左右横滑切换五视图（-v150b1 新增，此功能从未
-// 有过）：顺序 [全部, 已验证, 待验证, 已屏蔽,
-// 数据统计]，左滑下一格、右滑上一格，到头不循
+// 左右横滑切换六视图（-v150b1 新增，此功能从未
+// 有过；-v155b2 增「被屏蔽」一格）：顺序 [全部,
+// 已验证, 待验证, 已屏蔽, 被屏蔽, 数据统计]，
+// 左滑下一格、右滑上一格，到头不循
 // 环。识别放在 touchmove 阶段（|dx|≥56 且
 // |dx|≥1.6|dy|），赶在 touchend 的 click 之前
 // 就置好抑制戳 swipeAt；切换本体借道现行入口
@@ -19003,11 +19015,11 @@ document.addEventListener('touchend', function (e) {
 // <12px）天然正交；拖动监视只看纵向 scrollTop，
 // 横滑不改变它，互不干扰。当前视图判定：统计
 // 侧看 paneStats 的 display、列表侧看 filt。
-var swipeViews = ['all', 'verified', 'pending', 'blocked', 'stats'];
+var swipeViews = ['all', 'verified', 'pending', 'blocked', 'botblocked', 'stats'];
 var swipeAt = 0, swipeSelf = false;
 var swipeX0 = null, swipeY0 = null, swipeLock = false, swipeOff = true;
 function swipeCurIdx() {
-  if (document.getElementById('paneStats').style.display !== 'none') return 4;
+  if (document.getElementById('paneStats').style.display !== 'none') return swipeViews.length - 1;
   var i = swipeViews.indexOf(filt);
   return i >= 0 ? i : 0;
 }
@@ -19047,7 +19059,7 @@ document.addEventListener('touchmove', function (e) {
     var cur = swipeCurIdx();
     var nxt = cur + (dx < 0 ? 1 : -1);
     if (nxt < 0) nxt = 0;
-    if (nxt > 4) nxt = 4;
+    if (nxt > swipeViews.length - 1) nxt = swipeViews.length - 1;
     if (nxt !== cur) swipeGo(nxt);
   }
 }, { passive: true });
@@ -19064,7 +19076,7 @@ window.addEventListener('resize', function () {
   if (stW && (window.innerWidth || 0) !== stW) uCollapseSearch();
 });
 window.addEventListener('resize', function () { uFloatDodge(true); });
-// 五视图整页滑动（-v150b5）：旧切换读作硬切——
+// 六视图整页滑动（-v150b5）：旧切换读作硬切——
 // 旧列表先被清空（或闪一下转圈）、新列表才以
 // .in-r/.in-l 小滑入场，页签高亮瞬间变色。新法
 // 整页滑动：当前 pane 先朝切换方向退场
@@ -19176,7 +19188,7 @@ document.getElementById('chips').addEventListener('click', function (e) {
 });
 function chipSwitch(nf) {
   uCollapseSearch();
-  var order = ['all', 'verified', 'pending', 'blocked'];
+  var order = ['all', 'verified', 'pending', 'blocked', 'botblocked'];
   var ni = order.indexOf(nf);
   var dir = ni >= prevFiltIdx ? 1 : -1;
   prevFiltIdx = ni;
@@ -19266,7 +19278,7 @@ document.getElementById('pgsel').addEventListener('change', function () {
 
 function showTab(which) {
   if (!swipeSelf && Date.now() - swipeAt < 350) return;
-  var target = which === 'stats' ? 4 : swipeViews.indexOf(filt);
+  var target = which === 'stats' ? swipeViews.indexOf('stats') : swipeViews.indexOf(filt);
   var cur = swipeCurIdx();
   if (viewAnim) {
     if (swipeSelf && !viewBodyRan) viewChain(function () { showTabBody(which); });
