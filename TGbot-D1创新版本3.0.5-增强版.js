@@ -1143,13 +1143,35 @@ async function sweepRetiredMarkConfigKeys(env) {
 // 退役——统计、转发静默投递与超时清理豁免都不再读它，
 // 界面与接口也不再暴露；存量库里还挂着 1 的行随概率清
 // 扫一次清零，免得标记无声残留。清零幂等：清净后每轮
-// 清扫只是一次零命中更新，故可长期挂在清扫链上、不设
-// 完成标记（物理列保留不动，无害）。
+// 清扫只是一次零命中更新。第十轮审计起加完成标记
+// （见函数内说明），清净确认后不再每轮空转全表。
 async function sweepRetiredMutedFlags(env) {
-  await env.TG_BOT_DB.prepare(
+  // 完成标记（第十轮审计）：清零确认后落
+  // sys:muted-swept，后续清扫见标记直接跳过。标
+  // 记不怕被新数据「失效」的前提是 is_muted 再无
+  // 写 1 的路径——dbUserUpdate 的字段白名单已摘
+  // 除该列、建行 INSERT 不写该列（默认 0）、全仓
+  // 唯一的写点就是本函数的清零 UPDATE——标记落
+  // 下后不可能再有行变回 1。落标记的条件是本轮
+  // UPDATE 影响行数为 0（确已清净）：本轮清了若
+  // 干行则不落标记，下一轮确认 0 后再落，存量行
+  // 不会被标记挡在门外。
+  if (
+    (await dbConfigGet('sys:muted-swept', env)) === '1'
+  ) {
+    return;
+  }
+
+  const swept = await env.TG_BOT_DB.prepare(
     'UPDATE users SET is_muted = 0 ' +
     'WHERE is_muted != 0'
   ).run();
+
+  invalidateAllUserRows(env);
+
+  if (Number(swept?.meta?.changes || 0) === 0) {
+    await dbConfigPut('sys:muted-swept', '1', env);
+  }
 }
 
 // 卡死占位清扫：同步处理模型下，一条更新 10 分钟还没
@@ -1241,7 +1263,7 @@ async function cleanupReverifyExpiredUsers(env, now) {
 
   const result =
     await env.TG_BOT_DB.prepare(
-      'SELECT user_id, is_trusted FROM users ' +
+      'SELECT user_id, is_trusted, relay_exempt FROM users ' +
       'WHERE user_state IN (?, ?) ' +
       'AND is_blocked = 0 ' +
       'AND updated_at IS NOT NULL ' +
@@ -1270,9 +1292,10 @@ async function cleanupReverifyExpiredUsers(env, now) {
       continue;
     }
 
-    // 已设为信任（免验证）的访客不改，
+    // 已信任的访客不改（共享谓词 isTrustedRow：
+    // is_trusted 与 relay_exempt 任一为真），
     // 否则改回待验证与信任免验的口径互相打架。
-    if (Number(row.is_trusted || 0) === 1) {
+    if (isTrustedRow(row)) {
       continue;
     }
 
@@ -1291,8 +1314,21 @@ async function cleanupReverifyExpiredUsers(env, now) {
         userId
       )
       .run();
+
+    invalidateUserRow(env, userId);
   }
 }
+
+// 删档版 TTL 单轮删除预算（第十轮审计）：每删一人
+// 要连带约二十条 D1 操作（删行、清配对与提示行、
+// 作废通行证、删熔断卡、一串记账行），旧候选上限
+// 200 人一轮可达约 4400 条——TTL 开启后的清扫轮
+// 能把日写额度打穿一截。单轮最多实际删除这么多
+// 人，剩余留下轮（清扫随请求概率触发、轮次不断）；
+// 候选仍取 200，跳过行（管理员 / 已信任 / 复检未
+// 删）不占预算。默认关闭（verified_ttl_days=0）时
+// 本函数在读到配置后直接返回，行为不变。
+const TTL_SWEEP_DELETE_BUDGET = 25;
 
 async function cleanupExpiredUsers(env, now) {
   const ttlDays =
@@ -1313,9 +1349,11 @@ async function cleanupExpiredUsers(env, now) {
 
   const cutoff = now - ttlDays * 86400;
 
+  let deletedUsers = 0;
+
   const result =
     await env.TG_BOT_DB.prepare(
-      'SELECT user_id, is_trusted FROM users ' +
+      'SELECT user_id, is_trusted, relay_exempt FROM users ' +
       'WHERE user_state IN (?, ?) ' +
       'AND is_blocked = 0 ' +
       'AND updated_at IS NOT NULL ' +
@@ -1344,10 +1382,16 @@ async function cleanupExpiredUsers(env, now) {
       continue;
     }
 
-    // 已设为信任（免验证）的访客不清理，
+    // 已信任的访客不清理（共享谓词 isTrustedRow），
     // 否则信任标记随档案一起消失（已随 SELECT 带出，不再逐行点读）。
-    if (Number(row.is_trusted || 0) === 1) {
+    if (isTrustedRow(row)) {
       continue;
+    }
+
+    // 单轮删除预算：删满即停，剩余留下轮（跳过行
+    // 不占预算，见 TTL_SWEEP_DELETE_BUDGET 说明）。
+    if (deletedUsers >= TTL_SWEEP_DELETE_BUDGET) {
+      break;
     }
 
     // 删行前留好完整记录：拉黑提醒的 🚫 本体在话题里，
@@ -1377,6 +1421,10 @@ async function cleanupExpiredUsers(env, now) {
     ) {
       continue;
     }
+
+    deletedUsers += 1;
+
+    invalidateUserRow(env, userId);
 
     await env.TG_BOT_DB.prepare(
       'DELETE FROM messages WHERE user_id = ?'
@@ -1479,8 +1527,14 @@ async function touchUserActivity(user, env) {
   const now =
     Math.floor(Date.now() / 1000);
 
-  // 至多每天打卡一次，避免每条消息多一次写。
-  if (now - Number(user.updated_at || 0) < 86400) {
+  // 节流 23 小时（82800 秒），比活跃统计的最小窗口
+  // （24 小时）短 1 小时：节流与窗口等长时，窗口沿
+  // 附近的活跃会漏计——上次打卡在 24 小时多一点点
+  // 之前、本人一直在发消息，打卡却要等满 86400 秒
+  // 才刷新，统计在窗口沿把人漏掉（第十轮审计）。
+  // 短 1 小时保证任何时刻窗口内至少有一次打卡落
+  // 点，同时仍避免每条消息多一次写。
+  if (now - Number(user.updated_at || 0) < 82800) {
     return;
   }
 
@@ -1493,6 +1547,8 @@ async function touchUserActivity(user, env) {
     )
       .bind(now, user.user_id)
       .run();
+
+    invalidateUserRow(env, user.user_id);
   } catch (error) {
     console.error(
       '刷新访客活跃时间失败：',
@@ -1553,12 +1609,23 @@ async function claimUpdateStart(updateId, env) {
   }
 
   if (existing.status === 'failed') {
-    await env.TG_BOT_DB.prepare(
+    // 原子认领：带上读到的原状态与原时间戳作条件，
+    // 并发重推/双路处理只有一路能改成功
+    // （changes = 1），另一路按在途重复处理——与
+    // 插入路径 INSERT OR IGNORE 的认领口径一致。
+    // 旧写法先读后无条件写，两路会同时拿到 process
+    // 并发处理同一更新（第十轮审计）。
+    const claimed = await env.TG_BOT_DB.prepare(
       "UPDATE processed_updates SET status = 'pending', " +
-      'processed_at = ? WHERE update_id = ?'
-    ).bind(now, id).run();
+      'processed_at = ? WHERE update_id = ? ' +
+      "AND status = 'failed' AND processed_at = ?"
+    ).bind(now, id, Number(existing.processed_at || 0)).run();
 
-    return { mode: 'process', attempts };
+    if (Number(claimed?.meta?.changes || 0) > 0) {
+      return { mode: 'process', attempts };
+    }
+
+    return { mode: 'inflight', attempts };
   }
 
   if (
@@ -1568,13 +1635,21 @@ async function claimUpdateStart(updateId, env) {
     return { mode: 'inflight', attempts };
   }
 
-  // 接管：刷新占位时间，attempts 沿用。
-  await env.TG_BOT_DB.prepare(
+  // 接管：刷新占位时间，attempts 沿用。同样按读到的
+  // 原状态与原时间戳原子认领：被判陈旧的上一进程若
+  // 其实还活着（或另一路也在接管），只有一路改得动，
+  // 另一路按在途重复处理。
+  const claimed = await env.TG_BOT_DB.prepare(
     'UPDATE processed_updates SET processed_at = ? ' +
-    'WHERE update_id = ?'
-  ).bind(now, id).run();
+    'WHERE update_id = ? ' +
+    "AND status = 'pending' AND processed_at = ?"
+  ).bind(now, id, Number(existing.processed_at || 0)).run();
 
-  return { mode: 'process', attempts };
+  if (Number(claimed?.meta?.changes || 0) > 0) {
+    return { mode: 'process', attempts };
+  }
+
+  return { mode: 'inflight', attempts };
 }
 
 async function claimUpdateDone(updateId, env) {
@@ -1633,6 +1708,51 @@ async function claimUpdateRelease(updateId, env) {
     "UPDATE processed_updates SET status = 'failed' " +
     'WHERE update_id = ?'
   ).bind(String(updateId)).run();
+}
+
+// 更新处理记账（失败计数 / 限流释放）的落账兜底：同步
+// 先重试一次，仍失败则挂 waitUntil 后台补记。记账没
+// 落下时占位行还停在 claim 时的 pending，重推撞见会
+// 被当在途重复回 200 吞掉——更新既不重试也不进死
+// 信、静默丢失（第十轮审计）；补记赶在重推之前落账，
+// 行转 failed 即可被立即重办。返回值：记账函数的结
+// 果；同步两次都失败时返回 undefined（后台补记的结果
+// 调用方看不到，按未落账处理）。
+async function bookkeepingWithRetry(label, fn, ctx) {
+  try {
+    return await fn();
+  } catch (firstError) {
+    console.error(
+      `${label}失败，重试一次：`,
+      firstError?.message || firstError
+    );
+  }
+
+  try {
+    return await fn();
+  } catch (secondError) {
+    console.error(
+      `${label}重试仍失败，转后台补记：`,
+      secondError?.message || secondError
+    );
+  }
+
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(
+      (async () => {
+        try {
+          await fn();
+        } catch (bgError) {
+          console.error(
+            `${label}后台补记仍失败：`,
+            bgError?.message || bgError
+          );
+        }
+      })()
+    );
+  }
+
+  return undefined;
 }
 
 // 限流提示：每小时至多一条（config 时间戳节流），免得限流
@@ -1905,10 +2025,45 @@ function normalizeUser(user) {
   };
 }
 
+// 请求级访客行缓存（第十轮审计·性能）：稳态一条私聊
+// 消息原本要约 31 条 D1、同一访客行被重读约 6 次
+// （入口、闸门、等待话题、中继、回执各读一遍）。
+// fetch 入口给 env 浅拷贝挂一张 Map（见 fetch），
+// dbUserGet 命中直接用缓存行；一切 users 表写入点
+// 在写后调 invalidateUserRow / invalidateAllUserRows
+// 失效，缓存与库行不会脱节。只缓存查到的行：不存
+// 在的行不缓存，建行路径（dbUserGetOrCreate 插入后
+// 紧接着回读）必须读到新行。normalizeUser 每次现
+// 做、返回对象互不共享，调用方改返回值不污染缓存。
+function userRowCache(env) {
+  const cache = env?.__userRowCache;
+
+  return cache instanceof Map ? cache : null;
+}
+
+function invalidateUserRow(env, userId) {
+  userRowCache(env)?.delete(String(userId));
+}
+
+function invalidateAllUserRows(env) {
+  userRowCache(env)?.clear();
+}
+
 async function dbUserGet(userId, env) {
+  const id = String(userId);
+  const cache = userRowCache(env);
+
+  if (cache?.has(id)) {
+    return normalizeUser(cache.get(id));
+  }
+
   const row = await env.TG_BOT_DB.prepare(
     'SELECT * FROM users WHERE user_id = ?'
-  ).bind(String(userId)).first();
+  ).bind(id).first();
+
+  if (cache && row) {
+    cache.set(id, row);
+  }
 
   return normalizeUser(row);
 }
@@ -2042,7 +2197,12 @@ async function captureVisitorNameIfMissing(
   }
 }
 
-async function dbUserUpdate(userId, data, env) {
+async function dbUserUpdate(
+  userId,
+  data,
+  env,
+  options = {}
+) {
   if (
     !data ||
     Object.keys(data).length === 0
@@ -2050,10 +2210,19 @@ async function dbUserUpdate(userId, data, env) {
     return;
   }
 
-  const payload = {
-    ...data,
-    updated_at: Math.floor(Date.now() / 1000)
-  };
+  const payload = { ...data };
+
+  // 活跃戳（updated_at）只由访客本人活动路径盖：它同时
+  // 是活跃排序/统计与双 TTL 的不活跃时钟，管理操作
+  // （备注/信任/封禁/重置）、资料卡与话题绑定记账、
+  // 槽位记账这类与访客活跃无关的写入一律传
+  // { touchActivity: false }，不得把长期不活跃的访客
+  // 顶成「刚刚活跃」、更不得整体重置其 TTL 时钟——
+  // 与回填代码「不动 updated_at」的既有意图对齐
+  // （第十轮审计）。
+  if (options.touchActivity !== false) {
+    payload.updated_at = Math.floor(Date.now() / 1000);
+  }
 
   if (payload.user_info !== undefined) {
     payload.user_info_json =
@@ -2113,6 +2282,8 @@ async function dbUserUpdate(userId, data, env) {
     ...values,
     String(userId)
   ).run();
+
+  invalidateUserRow(env, userId);
 }
 
 async function dbTopicUserGet(topicId, env) {
@@ -2143,6 +2314,8 @@ async function incrementBlockCount(
     Math.floor(Date.now() / 1000),
     String(userId)
   ).run();
+
+  invalidateUserRow(env, userId);
 
   const user = await dbUserGetOrCreate(userId, env);
 
@@ -2419,6 +2592,60 @@ function validateRegexPattern(pattern) {
   buildRegexRule(pattern);
 }
 
+// 名单类配置（屏蔽关键词 / 自动回复）的严格解析
+// （第十轮审计）：safeJsonParse 把坏 JSON 静默吞成
+// 空名单——名单一旦写坏，关键词屏蔽与自动回复就
+// 无声全关、管理员毫无察觉。这里把「解析失败 /
+// 形状不是数组」与「本来就是空名单」区分开：坏值
+// 仍按空名单执行（编不出规则），但由读取口留痕
+// 并节流告警主管理员，不再无声失效。
+function parseJsonArrayOrNull(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function alertAdminsCorruptConfigList(
+  env,
+  key,
+  label
+) {
+  try {
+    const last = Number(
+      (await dbConfigGet(
+        `alertat:listcorrupt:${key}`,
+        env
+      )) || 0
+    );
+
+    if (Date.now() - last < 24 * 60 * 60 * 1000) {
+      return;
+    }
+
+    await dbConfigPut(
+      `alertat:listcorrupt:${key}`,
+      String(Date.now()),
+      env
+    );
+
+    await notifyPrimaryAdmins(
+      env,
+      `⚠️ 配置损坏：${label}（${key}）的内容无法` +
+      '解析，相关功能已暂时失效。请在网页管理台' +
+      '重新保存该名单以修复。'
+    );
+  } catch (error) {
+    console.error(
+      '发送名单损坏告警失败：',
+      error?.message || error
+    );
+  }
+}
+
 function parseAutoReplyRules(raw) {
   const rules = safeJsonParse(raw, []);
 
@@ -2433,9 +2660,27 @@ function parseAutoReplyRules(raw) {
 }
 
 async function getAutoReplyRules(env) {
-  return parseAutoReplyRules(
-    await getConfig('keyword_responses', env, '[]')
+  const raw = await getConfig(
+    'keyword_responses',
+    env,
+    '[]'
   );
+
+  if (parseJsonArrayOrNull(raw) === null) {
+    console.error(
+      '自动回复名单配置损坏，按空名单处理'
+    );
+
+    await alertAdminsCorruptConfigList(
+      env,
+      'keyword_responses',
+      '自动回复名单'
+    );
+
+    return [];
+  }
+
+  return parseAutoReplyRules(raw);
 }
 
 function parseBlockKeywords(raw) {
@@ -2447,9 +2692,27 @@ function parseBlockKeywords(raw) {
 }
 
 async function getBlockKeywords(env) {
-  return parseBlockKeywords(
-    await getConfig('block_keywords', env, '[]')
+  const raw = await getConfig(
+    'block_keywords',
+    env,
+    '[]'
   );
+
+  if (parseJsonArrayOrNull(raw) === null) {
+    console.error(
+      '屏蔽关键词名单配置损坏，按空名单处理'
+    );
+
+    await alertAdminsCorruptConfigList(
+      env,
+      'block_keywords',
+      '屏蔽关键词名单'
+    );
+
+    return [];
+  }
+
+  return parseBlockKeywords(raw);
 }
 
 function parseBlockThreshold(raw) {
@@ -3018,7 +3281,8 @@ async function refreshUserInfoCard(
         first_message_date: firstMessageDate
       }
     },
-    env
+    env,
+    { touchActivity: false }
   );
 
   return {
@@ -3139,7 +3403,8 @@ async function createInfoCard(
             first_message_date: message.date
           }
         },
-        env
+        env,
+        { touchActivity: false }
       );
 
       writeError = null;
@@ -3282,7 +3547,8 @@ async function recreateUserInfoCard(
       topic_creating: false,
       topic_lock_at: null
     },
-    env
+    env,
+    { touchActivity: false }
   );
 
   user = await dbUserGetOrCreate(
@@ -3316,7 +3582,8 @@ async function recreateUserInfoCard(
         info_card_message_id:
           oldCardMessageId || null
       },
-      env
+      env,
+      { touchActivity: false }
     );
 
     throw error;
@@ -3416,6 +3683,8 @@ if (user.topic_id) {
       userId,
       staleTime
     ).run();
+
+  invalidateUserRow(env, userId);
 
   const acquired =
     Number(lockResult?.meta?.changes || 0) > 0;
@@ -4930,6 +5199,22 @@ async function callEditWithMark(
   }
 }
 
+// 可同步编辑的内容形状：有文本、或有说明文字、或是可
+// 替换媒体（photo/video/animation/document/audio）——
+// 与 tryEditCounterpartMessage 能处理的三条路径同集。
+// 三者皆无的消息（如清单 checklist 的勾选编辑、无说
+// 明的付费媒体编辑）原地同步无从下手：这类编辑绝不
+// 许落方案 B 发占位回退（第十轮审计·中18），否则话
+// 题/私聊里会多出一条占位文案 +「✍🏼已编辑」的假提
+// 示、而对侧副本状态纹丝不动，双侧就此分叉。
+function hasSyncableEditedContent(source) {
+  return Boolean(
+    source.text ||
+    source.caption !== undefined ||
+    buildEditedMedia(source)
+  );
+}
+
 async function tryEditCounterpartMessage(
   env,
   targetChatId,
@@ -5390,11 +5675,13 @@ ${versionLine}${pauseLine}
     ]);
   }
 
-  // 五个按钮全部关掉时键盘为空：Telegram 会以
-  // reply markup 为空拒收整条菜单，此时只发正文不带键盘。
+  // 五个按钮全部关掉时键盘为空：整条菜单只剩正文，
+  // 成了一条无按钮的系统消息——按系统提示口径附标
+  // 签钮（第十轮审计·低：此前无钮也无牌）；有按钮
+  // 时菜单自带按钮、不附，与十类豁免同口径。
   const reply_markup = keyboard.length
     ? { inline_keyboard: keyboard }
-    : undefined;
+    : SYS_TAG_MARKUP;
 
   const menuMessageId = await renderMenu(env, {
     chatId,
@@ -5642,12 +5929,28 @@ async function recordQuizWrongAttempt(
     }
   }
 
-  // 多次冲突后兜底：以最新读到的计数无条件写入（尽力而为）。
+  // 多次冲突后兜底（fail-closed）：绝不无条件覆盖——
+  // 并发刚落下的锁定行形状是 {n:0, until:未来}，旧兜底
+  // 以它算出 attempts=1 并整行覆写，等于把防爆破锁
+  // 定亲手解开、计数清零（第十轮审计）。先按最后读
+  // 到的状态复查锁定：已锁定按锁定中处理（-1）；未
+  // 锁定也只许对读到的原值条件写，写不进（或原值已
+  // 消失）就放弃本次计数、按锁定中处理——宁可漏记
+  // 一次答错，也不解锁他人刚落下的锁定。
+  if (state && Number(state.until || 0) > Date.now()) {
+    return -1;
+  }
+
+  if (raw === null || raw === undefined) {
+    return -1;
+  }
+
   const attempts = Number(state?.n || 0) + 1;
   const locked = attempts >= maxAttempts;
 
-  await dbConfigPut(
+  const wrote = await dbConfigPutIfValue(
     lockKey,
+    raw,
     JSON.stringify(
       locked
         ? {
@@ -5659,7 +5962,7 @@ async function recordQuizWrongAttempt(
     env
   );
 
-  return attempts;
+  return wrote ? attempts : -1;
 }
 
 async function handleVerification(
@@ -6932,7 +7235,8 @@ async function trackSlotMessage(env, userId, column, messageId) {
     await dbUserUpdate(
       userId,
       { [column]: newId },
-      env
+      env,
+      { touchActivity: false }
     );
   }
 }
@@ -6949,7 +7253,8 @@ async function clearSlotMessage(env, userId, column) {
   await dbUserUpdate(
     userId,
     { [column]: null },
-    env
+    env,
+    { touchActivity: false }
   );
 
   await quietDeleteMessage(env, userId, oldId);
@@ -8158,7 +8463,8 @@ async function applyBlockState(userId, blocked, env) {
     await dbUserUpdate(
       uid,
       { is_blocked: true },
-      env
+      env,
+      { touchActivity: false }
     );
 
     const staleUnbanNotice =
@@ -8218,7 +8524,8 @@ async function applyBlockState(userId, blocked, env) {
       is_blocked: false,
       block_count: 0
     },
-    env
+    env,
+    { touchActivity: false }
   );
 
   const staleBanNotice =
@@ -9671,7 +9978,8 @@ async function handleAdminCommand(
         is_trusted: 0,
         relay_exempt: 0
       },
-      env
+      env,
+      { touchActivity: false }
     );
 
     await voidUserPass(env, userId);
@@ -9731,7 +10039,8 @@ async function handleAdminCommand(
       await dbUserUpdate(
         userId,
         { admin_note: '' },
-        env
+        env,
+        { touchActivity: false }
       );
 
       await refreshCardAfterNoteChange(
@@ -9778,7 +10087,8 @@ async function handleAdminCommand(
     await dbUserUpdate(
       userId,
       { admin_note: noteText },
-      env
+      env,
+      { touchActivity: false }
     );
 
     await refreshCardAfterNoteChange(
@@ -10040,21 +10350,27 @@ if (parsed.command === 'card') {
 
     // 指定访客 ID 时，将当前话题重新绑定给该访客。
     if (parsed.argument) {
+      // 解绑只清绑定：不盖活跃戳——被解绑的原访客并没
+      // 有活跃过，盖戳会把他顶成刚刚活跃、并整体重置
+      // 其双 TTL 时钟（第十轮审计，与 dbUserUpdate 的
+      // touchActivity 口径一致）。
       await env.TG_BOT_DB.prepare(`
         UPDATE users
         SET
           topic_id = NULL,
           info_card_message_id = NULL,
           topic_creating = 0,
-          topic_lock_at = NULL,
-          updated_at = ?
+          topic_lock_at = NULL
         WHERE topic_id = ?
           AND user_id <> ?
       `).bind(
-        Math.floor(Date.now() / 1000),
         topicId,
         String(userId)
       ).run();
+
+      // 被解绑的是「别人」的行，受影响集合不确定，
+      // 整表缓存一并失效（低频管理路径，代价可忽略）。
+      invalidateAllUserRows(env);
 
       await dbUserUpdate(
         userId,
@@ -10063,7 +10379,8 @@ if (parsed.command === 'card') {
           topic_creating: false,
           topic_lock_at: null
         },
-        env
+        env,
+        { touchActivity: false }
       );
     }
 
@@ -10135,7 +10452,8 @@ if (parsed.command === 'card') {
           topic_creating: false,
           topic_lock_at: null
         },
-        env
+        env,
+        { touchActivity: false }
       );
 
       await sendTopicNotice(
@@ -10166,7 +10484,8 @@ if (parsed.command === 'card') {
           topic_creating: false,
           topic_lock_at: null
         },
-        env
+        env,
+        { touchActivity: false }
       );
     } catch (error) {
       await sendTopicNotice(
@@ -10627,6 +10946,13 @@ async function handleRelayEditedMessage(
     return;
   }
 
+  // 类型门（第十轮审计·中18）：源消息无可同步内容
+  // （清单勾选、无说明的付费媒体等）时静默跳过，
+  // 不发占位回退假报「已编辑」。
+  if (!hasSyncableEditedContent(editedMessage)) {
+    return;
+  }
+
   try {
     await maybeAutoRefreshUserCard(
       editedMessage,
@@ -10775,6 +11101,12 @@ async function handleAdminEditedReply(
       hintKey
     });
 
+    return;
+  }
+
+  // 类型门（第十轮审计·中18）：与访客侧同口径——
+  // 源消息无可同步内容时静默跳过，不发占位回退。
+  if (!hasSyncableEditedContent(editedMessage)) {
     return;
   }
 
@@ -10938,7 +11270,8 @@ async function handleUserCardCallback(
       await dbUserUpdate(
         targetUserId,
         { is_trusted: 0, relay_exempt: 0 },
-        env
+        env,
+        { touchActivity: false }
       );
     } else {
       if (user.is_blocked) {
@@ -10958,7 +11291,8 @@ async function handleUserCardCallback(
         await dbUserUpdate(
           targetUserId,
           { is_trusted: 1, relay_exempt: 1 },
-          env
+          env,
+          { touchActivity: false }
         );
       } else {
         await dbUserUpdate(
@@ -10968,7 +11302,8 @@ async function handleUserCardCallback(
             relay_exempt: 1,
             user_state: USER_STATE.VERIFIED
           },
-          env
+          env,
+          { touchActivity: false }
         );
 
         await cleanupAfterVerified(env, targetUserId);
@@ -11623,6 +11958,36 @@ async function getMemberAllowIds(env) {
 // 基线 + 净变动」核对，补事件驱动看门狗的盲区（事件
 // 丢失、机器人掉线期间的进出）。基线接口失败时整体跳
 // 过，不阻断看门狗告警本身。
+async function alertAdminsMemberBaseCorrupt(env) {
+  try {
+    const last = Number(
+      (await dbConfigGet('alertat:memberbase', env)) || 0
+    );
+
+    if (Date.now() - last < 24 * 60 * 60 * 1000) {
+      return;
+    }
+
+    await dbConfigPut(
+      'alertat:memberbase',
+      String(Date.now()),
+      env
+    );
+
+    await notifyPrimaryAdmins(
+      env,
+      '⚠️ 成员看门狗的基线记录损坏，已按当前成员' +
+      '数重拍基线。此前的进出差异已无法对账，请' +
+      '人工核查一遍管理群成员名单。'
+    );
+  } catch (error) {
+    console.error(
+      '发送看门狗基线损坏告警失败：',
+      error?.message || error
+    );
+  }
+}
+
 async function loadMemberBase(env) {
   const base = safeJsonParse(
     await dbConfigGet('memberbase', env),
@@ -11691,6 +12056,23 @@ async function reconcileMemberBase(
     let justTaken = false;
 
     if (!base) {
+      // 区分「从未建过基线」与「基线值写坏」（第
+      // 十轮审计）：后者若静默重拍，新基线会把未
+      // 记录的进出直接吸进去、对账盲区无声扩大。
+      // 重拍前留痕并节流告警，提醒人工核查。
+      const rawBase = await dbConfigGet(
+        'memberbase',
+        env
+      );
+
+      if (rawBase) {
+        console.error(
+          '看门狗基线值损坏，重拍基线并告警'
+        );
+
+        await alertAdminsMemberBaseCorrupt(env);
+      }
+
       base = await snapshotMemberBase(env, groupId);
 
       if (!base) {
@@ -12149,6 +12531,12 @@ async function deleteMessagesCounted(
   let ok = 0;
   let failed = 0;
   let covered = 0;
+  // 逐条结果（第十轮审计）：'ok' 已删（「不存在」按
+  // 既有口径同样视为已删）/ 'stuck' 终局失败、确认
+  // 删不掉 / 'transient' 瞬时失败。清空按组结算靠
+  // 它区分「可落墓碑跳过」与「留待下轮重试」；未覆
+  // 盖（预算耗尽没轮到）的 id 不在表里。
+  const outcomes = new Map();
 
   const del = async (chunk) => {
     if (!chunk.length) {
@@ -12173,6 +12561,10 @@ async function deleteMessagesCounted(
 
       ok += chunk.length;
       covered += chunk.length;
+
+      for (const id of chunk) {
+        outcomes.set(id, 'ok');
+      }
     } catch (error) {
       if (chunk.length === 1) {
         covered += 1;
@@ -12183,8 +12575,15 @@ async function deleteMessagesCounted(
           )
         ) {
           ok += 1;
+          outcomes.set(chunk[0], 'ok');
         } else {
           failed += 1;
+          outcomes.set(
+            chunk[0],
+            isTransientTelegramError(error)
+              ? 'transient'
+              : 'stuck'
+          );
         }
 
         return;
@@ -12204,7 +12603,8 @@ async function deleteMessagesCounted(
   return {
     ok,
     failed,
-    complete: covered >= ids.length
+    complete: covered >= ids.length,
+    outcomes
   };
 }
 
@@ -12217,7 +12617,9 @@ async function deleteMessagesCounted(
 // 大体量会话一轮删不完时停在
 // 组边界，剩余组的记录原样保留，返回 partial/remaining，
 // 管理员再执行一次 /clear 就能接着删（确认占用按确认
-// 消息编号，新确认照常能占上，不会卡死）。
+// 消息编号，新确认照常能占上，不会卡死）。落账按组
+// 结算：已删净的组删键、留了删不掉副本的组落墓碑，
+// 不再整块同进退（见循环内说明，第十轮审计）。
 async function wipeConversationCopies(
   userId,
   env,
@@ -12239,7 +12641,7 @@ async function wipeConversationCopies(
     const group = units.slice(i, i + 50);
 
     if (budget.stats.n >= budget.limit) {
-      remaining = units.length - i;
+      remaining += units.length - i;
 
       break;
     }
@@ -12282,7 +12684,12 @@ async function wipeConversationCopies(
           topicIds,
           budget
         )
-      : { ok: 0, failed: 0, complete: true };
+      : {
+          ok: 0,
+          failed: 0,
+          complete: true,
+          outcomes: new Map()
+        };
 
     priv = {
       ok: priv.ok + privPart.ok,
@@ -12294,18 +12701,79 @@ async function wipeConversationCopies(
       failed: topic.failed + topicPart.failed
     };
 
-    if (!privPart.complete || !topicPart.complete) {
-      remaining = units.length - i;
+    // 按组结算（第十轮审计）：旧实现整块同进退——
+    // 块里一条确认删不掉的消息把二分预算烧穿时，
+    // 整块 50 组的键都不落账，下一轮又从同一块重
+    // 烧一遍、组数永远不降。现在逐组看逐条结果：
+    // 双边每条都有着落（删掉 / 不存在 / 确认删不
+    // 掉）的组当场落账——全删净的删键；留了删不
+    // 掉副本的组把配对键改写成墓碑（与 /delete 同
+    // 口径：之后对它的编辑 / 反应静默丢弃），提示
+    // 键照常删。没轮到（预算耗尽）或撞瞬时失败的
+    // 组整组保留、计入 remaining，下轮接着删。报
+    // 告口径不变：ok / failed 仍按本次实际删除结
+    // 果计，墓碑组里的删不掉条数照常计 failed。
+    // 墓碑只在连话题版（/clear：话题与档案保留、
+    // 残存副本的编辑需要墓碑拦截）才落：网页版随
+    // 后 purgeManagedUser 整行删档，配对行按旧口
+    // 径直接删键即可。
+    const settledDeleteKeys = [];
+    const settledTombstoneKeys = [];
 
-      break;
+    for (const unit of group) {
+      const unitPrivIds = [
+        unit.priv,
+        ...unit.privExtra
+      ].filter(Boolean);
+
+      const unitTopicIds = includeTopicContents
+        ? [unit.topic, ...unit.topicExtra].filter(Boolean)
+        : [];
+
+      const unitOutcomes = [
+        ...unitPrivIds.map(
+          (id) => privPart.outcomes.get(id)
+        ),
+        ...unitTopicIds.map(
+          (id) => topicPart.outcomes.get(id)
+        )
+      ];
+
+      const settled = unitOutcomes.every(
+        (outcome) =>
+          outcome === 'ok' || outcome === 'stuck'
+      );
+
+      if (!settled) {
+        remaining += 1;
+
+        continue;
+      }
+
+      if (
+        includeTopicContents &&
+        unitOutcomes.some(
+          (outcome) => outcome === 'stuck'
+        )
+      ) {
+        for (const key of unit.keys) {
+          if (key.startsWith('hint:')) {
+            settledDeleteKeys.push(key);
+          } else {
+            settledTombstoneKeys.push(key);
+          }
+        }
+      } else {
+        settledDeleteKeys.push(...unit.keys);
+      }
     }
 
-    const recordKeys = group.flatMap(
-      (unit) => unit.keys
-    );
-
-    for (let j = 0; j < recordKeys.length; j += 100) {
-      const chunk = recordKeys.slice(j, j + 100);
+    for (
+      let j = 0;
+      j < settledDeleteKeys.length;
+      j += 100
+    ) {
+      const chunk = settledDeleteKeys.slice(j, j + 100);
 
       await env.TG_BOT_DB.batch(
         chunk.map((key) =>
@@ -12316,6 +12784,32 @@ async function wipeConversationCopies(
           )
         )
       );
+    }
+
+    if (settledTombstoneKeys.length) {
+      const nowSec = Math.floor(Date.now() / 1000);
+
+      for (
+        let j = 0;
+        j < settledTombstoneKeys.length;
+        j += 100
+      ) {
+        const chunk = settledTombstoneKeys.slice(
+          j,
+          j + 100
+        );
+
+        await env.TG_BOT_DB.batch(
+          chunk.map((key) =>
+            messageDataPutStatement(
+              REACTION_MAP_USER,
+              key,
+              { text: 'gone', date: nowSec },
+              env
+            )
+          )
+        );
+      }
     }
   }
 
@@ -12371,6 +12865,12 @@ async function handleClearCallback(
   const chatId = msg.chat?.id;
   const threadId = msg.message_thread_id;
 
+  // 确认卡被改写后的每种形态（取消 / 正在清空 / 结
+  // 果报告 / 失败提示）都是无按钮的系统消息：原地编
+  // 辑按 -v160b7 口径捎带「系统提示」标签（第十轮审
+  // 计·低：此前 editConfirm 改写时漏带，报告落地后
+  // 无牌）。editMessageText 本就会摘掉原确认按钮，
+  // 标签钮正好接位。
   const editConfirm = async (text) => {
     try {
       await telegramApi(
@@ -12379,7 +12879,8 @@ async function handleClearCallback(
         {
           chat_id: chatId,
           message_id: msg.message_id,
-          text
+          text,
+          reply_markup: SYS_TAG_MARKUP
         }
       );
     } catch {
@@ -12623,6 +13124,8 @@ async function purgeManagedUser(
       `${userId}:%`
     )
   ]);
+
+  invalidateUserRow(env, userId);
 
   await dbConfigDelete(
     `botblocked:${userId}`,
@@ -13317,7 +13820,9 @@ const LIST_SENSITIVE_ACTIONS = new Set([
   'delete',
   'pass',
   'trust',
-  'block'
+  'block',
+  'reset',
+  'note'
 ]);
 
 // 动作语义参数的规范化：签发与消费两侧用同一份规则提取
@@ -13383,6 +13888,16 @@ function nonceSemanticParams(action, params) {
     }
 
     return semantic;
+  }
+
+  if (action === 'reset') {
+    return {};
+  }
+
+  if (action === 'note') {
+    // 备注绑提交内容本身（按落库口径 trim 后）：换一份
+    // 内容重放对不上。绑定只进参数哈希，审计不记正文。
+    return { note: String(p.note ?? '').trim() };
   }
 
   return {};
@@ -13837,6 +14352,8 @@ async function backfillUserSearchFields(env) {
             String(row.user_id)
           )
           .run();
+
+        invalidateUserRow(env, row.user_id);
       }
 
       if (rows.length < 50) {
@@ -13887,12 +14404,44 @@ function isTransientTelegramError(error) {
 // 为空」口径把真名补上。
 async function backfillMissingUserInfo(env) {
   try {
-    const result = await env.TG_BOT_DB.prepare(
-      'SELECT user_id FROM users ' +
-      'WHERE user_info_json IS NULL LIMIT 5'
-    ).all();
+    // 轮转推进（第十轮审计）：旧实现无 ORDER BY、
+    // 每请求固定取库中前 5 行——排前面的行若因瞬
+    // 时失败反复留空，后排永远轮不到（回填饿死）。
+    // 改按 user_id 数值序游标轮转：游标存 config
+    // （backfill_cursor），每轮从游标之后取 5 行；
+    // 取空说明已到尾，游标归零再取一轮；处理完把
+    // 游标推进到本轮最后一行。被瞬时失败跳过的行
+    // 在下一圈轮转时还会被访问，长期全覆盖。
+    let cursor = Number(
+      (await dbConfigGet('backfill_cursor', env)) || 0
+    );
 
-    const rows = result?.results || [];
+    if (!Number.isFinite(cursor) || cursor < 0) {
+      cursor = 0;
+    }
+
+    const backfillPage = (after) =>
+      env.TG_BOT_DB.prepare(
+        'SELECT user_id FROM users ' +
+        'WHERE user_info_json IS NULL ' +
+        'AND CAST(user_id AS INTEGER) > ? ' +
+        'ORDER BY CAST(user_id AS INTEGER) ASC ' +
+        'LIMIT 5'
+      )
+        .bind(after)
+        .all();
+
+    let result = await backfillPage(cursor);
+
+    let rows = result?.results || [];
+
+    if (!rows.length && cursor > 0) {
+      cursor = 0;
+
+      result = await backfillPage(0);
+
+      rows = result?.results || [];
+    }
 
     for (const row of rows) {
       try {
@@ -13960,10 +14509,26 @@ async function backfillMissingUserInfo(env) {
             userId
           )
           .run();
+
+        invalidateUserRow(env, userId);
       } catch (error) {
         console.error(
           '回填单行访客姓名失败：',
           error?.message || error
+        );
+      }
+    }
+
+    if (rows.length) {
+      const lastId = Number(
+        rows[rows.length - 1].user_id
+      );
+
+      if (Number.isFinite(lastId) && lastId > 0) {
+        await dbConfigPut(
+          'backfill_cursor',
+          String(lastId),
+          env
         );
       }
     }
@@ -14073,7 +14638,7 @@ async function handleUserListApi(request, env) {
     // 时标记被清，人自动退出本筛选。谓词无绑定参
     // 数，total / 页号 / 游标三处共用同一 filterSql
     // 自动生效，搜索与排序照常叠加。
-    stateSql = "EXISTS (SELECT 1 FROM config WHERE key = 'botblocked:' || user_id AND value = '1')";
+    stateSql = BOTBLOCKED_SQL;
   } else if (stateParam === 'fresh') {
     // 未开始（二级筛选）：与数据统计的未开始计数逐
     // 字同口径——user_state = NEW，不附加封禁条件；
@@ -14083,8 +14648,9 @@ async function handleUserListApi(request, env) {
     stateBinds.push(USER_STATE.NEW);
   } else if (stateParam === 'trusted') {
     // 已信任（二级筛选）：与统计的已信任计数同口
-    // 径（is_trusted = 1，排除集合统一处理）。
-    stateSql = 'is_trusted = 1';
+    // 径——共享谓词 TRUSTED_SQL（is_trusted 与
+    // relay_exempt 任一为真），排除集合统一处理。
+    stateSql = TRUSTED_SQL;
   } else if (stateParam === 'topic') {
     // 有话题（二级筛选）：与统计的同口径谓词逐字
     // 一致（topic_id 非 NULL 且非空串）。
@@ -14132,18 +14698,32 @@ async function handleUserListApi(request, env) {
         .replace(/_/g, '\\_') +
       '%';
 
-    searchSql =
-      "(admin_note LIKE ? ESCAPE '\\' OR " +
-      "search_name LIKE ? ESCAPE '\\' OR " +
-      "search_username LIKE ? ESCAPE '\\' OR " +
-      "user_id LIKE ? ESCAPE '\\')";
+    // 单字符非数字查询只查 ID 列（第十轮审计）：
+    // 四列前导通配 LIKE 每次搜索都是全表扫，逐字
+    // 输入的第一下单字符查询结果本就不可用（命中
+    // 大半个库的名字 / 备注），却照样付全额扫描。
+    // 这里只保留 user_id 子串匹配；数字 ID 搜索
+    // （含单个数字）在任何长度下口径不变、仍走四
+    // 列；两字符起恢复四列子串，搜得到的范围除
+    // 「单字符文本」外与旧口径一致。
+    if (q.length === 1 && !/^\d$/.test(q)) {
+      searchSql = "(user_id LIKE ? ESCAPE '\\')";
 
-    searchBinds.push(
-      pattern,
-      pattern,
-      pattern,
-      pattern
-    );
+      searchBinds.push(pattern);
+    } else {
+      searchSql =
+        "(admin_note LIKE ? ESCAPE '\\' OR " +
+        "search_name LIKE ? ESCAPE '\\' OR " +
+        "search_username LIKE ? ESCAPE '\\' OR " +
+        "user_id LIKE ? ESCAPE '\\')";
+
+      searchBinds.push(
+        pattern,
+        pattern,
+        pattern,
+        pattern
+      );
+    }
   }
 
   // 游标分页（keyset）：游标是不透明串，编码 {s 排序档,
@@ -14215,11 +14795,20 @@ async function handleUserListApi(request, env) {
 
   const filterBinds = [...stateBinds, ...searchBinds];
 
-  const total = await countUsersWhere(
-    env,
-    filterSql,
-    filterBinds
-  );
+  // 精确总数（第十轮审计）：页号模式要靠它钳页
+  // 号、必须算；游标模式只在第一页（无 cursor 参
+  // 数）算一次，供页眉计数与页码下拉，翻页时不
+  // 再每页付一次全表 COUNT——响应 total 回
+  // null，前端沿用上次的精确值（筛选 / 搜索 /
+  // 排序一变都会回到第一页重算，不会跨语境陈旧）。
+  const total =
+    pageMode || !cursorRaw
+      ? await countUsersWhere(
+          env,
+          filterSql,
+          filterBinds
+        )
+      : null;
 
   if (pageMode) {
     const totalPages =
@@ -14304,7 +14893,7 @@ async function handleUserListApi(request, env) {
       try {
         const rec = JSON.parse(row.value);
 
-        if (rec && Number(rec.e) > Date.now()) {
+        if (rec && rec.n && Number(rec.e) > Date.now()) {
           passExpById.set(
             String(row.key).slice('pass:'.length),
             Number(rec.e)
@@ -14369,7 +14958,8 @@ async function handleUserListApi(request, env) {
     ...(pageMode ? { page: pageNo } : {}),
     // 游标分页下没有「只看得到前 1000 人」的截断了：
     // 每一行都能翻页到达。字段保留兼容，恒 false；
-    // total 是当前筛选口径下的精确总数。
+    // total 是当前筛选口径下的精确总数（游标翻页
+    // 时为 null，前端沿用第一页的精确值）。
     truncated: false,
     nextCursor,
     uiDefaults: {
@@ -14457,10 +15047,35 @@ async function countRows(env, sql, binds) {
   return Number(row?.n || 0);
 }
 
-async function countUsersWhere(env, extraSql, binds) {
+// 「已信任」共享谓词（第十轮审计中 3 收口）：is_trusted
+// 与 relay_exempt 任一为真即已信任——合并前的存量
+// 「放行-only」行只置了 relay_exempt。数据统计、访客
+// 列表 trusted 筛选与双 TTL 豁免全走这一口径（呈现层
+// 资料卡 / 列表徽标本来就认两者）；信任写入仍同写两
+// 列不变。
+const TRUSTED_SQL = '(is_trusted = 1 OR relay_exempt = 1)';
+
+function isTrustedRow(row) {
+  return (
+    Number(row?.is_trusted || 0) === 1 ||
+    Number(row?.relay_exempt || 0) === 1
+  );
+}
+
+// 被屏蔽（访客拉黑机器人）谓词：config 的
+// botblocked:<id> 精确键 EXISTS（不用 LIKE 前缀扫）。
+// 访客列表 botblocked 筛选与数据统计被屏蔽计数共用
+// 同一串，两边数字恒等。
+const BOTBLOCKED_SQL =
+  "EXISTS (SELECT 1 FROM config WHERE key = 'botblocked:' || user_id AND value = '1')";
+
+async function countUsersWhere(env, extraSql, binds, knownAdminIds) {
   // 排除集合 = 主管理员 + 协管员：协管员不是访客，
   // 不进列表总数（total/truncated）与各项统计口径。
-  const adminIds = [
+  // knownAdminIds 由调用方整请求算一次后传入时直接
+  // 用，免得批量计数时每个计数各读一遍协管员配置
+  // （统计接口曾因此单请求重复读同一行 16 次）。
+  const adminIds = knownAdminIds || [
     ...new Set([
       ...getPrimaryAdminIds(env),
       ...(await getAuthorizedAdmins(env))
@@ -14541,135 +15156,146 @@ async function handleStatsApi(request, env) {
   const since7 = now - 7 * 86400;
   const since30 = now - 30 * 86400;
 
-  const inSql =
-    'SELECT COUNT(*) AS n FROM messages ' +
-    'WHERE user_id = ? AND message_id LIKE ? ' +
-    'AND date >= ?';
+  // 排除集合整请求只算一次：此前 16 个 users 计数各
+  // 自经 countUsersWhere 读一遍协管员配置，单请求光
+  // 同一行配置就重复读 16 次（第十轮审计中 14）。
+  const adminIds = [
+    ...new Set([
+      ...getPrimaryAdminIds(env),
+      ...(await getAuthorizedAdmins(env))
+    ])
+  ];
 
-  const outSql =
-    'SELECT COUNT(*) AS n FROM messages ' +
-    'WHERE message_id LIKE ? AND date >= ?';
+  const excludeSql = adminIds.length
+    ? ' WHERE user_id NOT IN (' +
+      adminIds.map(() => '?').join(',') +
+      ')'
+    : '';
 
-  const [
-    total,
-    verified,
-    pending,
-    fresh,
-    blocked,
-    botBlocked,
-    trusted,
-    withTopic,
-    passes,
-    new1,
-    new7,
-    new30,
-    act1,
-    act7,
-    act30,
-    actNew1,
-    actNew7,
-    actNew30,
-    in1,
-    in7,
-    in30,
-    out1,
-    out7,
-    out30
-  ] = await Promise.all([
-    countUsersWhere(env, '', []),
-    countUsersWhere(
-      env,
-      'user_state = ?',
-      [USER_STATE.VERIFIED]
-    ),
-    countUsersWhere(
-      env,
-      'user_state = ?',
-      [USER_STATE.PENDING]
-    ),
-    countUsersWhere(
-      env,
-      'user_state = ?',
-      [USER_STATE.NEW]
-    ),
-    countUsersWhere(env, 'is_blocked = 1', []),
-    countRows(
-      env,
-      'SELECT COUNT(*) AS n FROM config ' +
-      'WHERE key LIKE ? AND value = ?',
-      ['botblocked:%', '1']
-    ),
-    countUsersWhere(env, 'is_trusted = 1', []),
-    countUsersWhere(
-      env,
-      "topic_id IS NOT NULL AND topic_id != ''",
-      []
-    ),
-    countOutstandingPasses(env),
-    countUsersWhere(
-      env,
-      'created_at >= ?',
-      [since1]
-    ),
-    countUsersWhere(
-      env,
-      'created_at >= ?',
-      [since7]
-    ),
-    countUsersWhere(
-      env,
-      'created_at >= ?',
-      [since30]
-    ),
-    countUsersWhere(
-      env,
-      'updated_at >= ?',
-      [since1]
-    ),
-    countUsersWhere(
-      env,
-      'updated_at >= ?',
-      [since7]
-    ),
-    countUsersWhere(
-      env,
-      'updated_at >= ?',
-      [since30]
-    ),
-    countUsersWhere(
-      env,
-      'updated_at >= ? AND created_at >= ?',
-      [since1, since1]
-    ),
-    countUsersWhere(
-      env,
-      'updated_at >= ? AND created_at >= ?',
-      [since7, since7]
-    ),
-    countUsersWhere(
-      env,
-      'updated_at >= ? AND created_at >= ?',
-      [since30, since30]
-    ),
-    countRows(
-      env,
-      inSql,
-      [REACTION_MAP_USER, 't:%', since1]
-    ),
-    countRows(
-      env,
-      inSql,
-      [REACTION_MAP_USER, 't:%', since7]
-    ),
-    countRows(
-      env,
-      inSql,
-      [REACTION_MAP_USER, 't:%', since30]
-    ),
-    countRows(env, outSql, ['admin:%', since1]),
-    countRows(env, outSql, ['admin:%', since7]),
-    countRows(env, outSql, ['admin:%', since30])
-  ]);
+  // users 侧 16 项计数合并为一条条件聚合：SUM(CASE
+  // WHEN …) 逐项求和、同一排除集合一遍扫完（此前是
+  // 16 条 COUNT 各扫一遍）。各谓词与访客列表对应
+  // state 逐字同口径——verified / pending 带
+  // is_blocked = 0（被封禁者只进已屏蔽，此前统计漏
+  // 了这一条、数字恒大于名单）、fresh 不附加封禁条
+  // 件、trusted 走共享谓词 TRUSTED_SQL；口径变更必
+  // 须列表与统计两处同改。
+  const aggRow = await env.TG_BOT_DB.prepare(
+    'SELECT COUNT(*) AS total, ' +
+      'SUM(CASE WHEN user_state = ? AND is_blocked = 0 THEN 1 ELSE 0 END) AS verified, ' +
+      'SUM(CASE WHEN user_state = ? AND is_blocked = 0 THEN 1 ELSE 0 END) AS pending, ' +
+      'SUM(CASE WHEN user_state = ? THEN 1 ELSE 0 END) AS fresh, ' +
+      'SUM(CASE WHEN is_blocked = 1 THEN 1 ELSE 0 END) AS blocked, ' +
+      'SUM(CASE WHEN ' +
+      TRUSTED_SQL +
+      ' THEN 1 ELSE 0 END) AS trusted, ' +
+      "SUM(CASE WHEN topic_id IS NOT NULL AND topic_id != '' THEN 1 ELSE 0 END) AS withTopic, " +
+      'SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS new1, ' +
+      'SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS new7, ' +
+      'SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS new30, ' +
+      'SUM(CASE WHEN updated_at >= ? THEN 1 ELSE 0 END) AS act1, ' +
+      'SUM(CASE WHEN updated_at >= ? THEN 1 ELSE 0 END) AS act7, ' +
+      'SUM(CASE WHEN updated_at >= ? THEN 1 ELSE 0 END) AS act30, ' +
+      'SUM(CASE WHEN updated_at >= ? AND created_at >= ? THEN 1 ELSE 0 END) AS actNew1, ' +
+      'SUM(CASE WHEN updated_at >= ? AND created_at >= ? THEN 1 ELSE 0 END) AS actNew7, ' +
+      'SUM(CASE WHEN updated_at >= ? AND created_at >= ? THEN 1 ELSE 0 END) AS actNew30 ' +
+      'FROM users' +
+      excludeSql
+  )
+    .bind(
+      USER_STATE.VERIFIED,
+      USER_STATE.PENDING,
+      USER_STATE.NEW,
+      since1,
+      since7,
+      since30,
+      since1,
+      since7,
+      since30,
+      since1,
+      since1,
+      since7,
+      since7,
+      since30,
+      since30,
+      ...adminIds
+    )
+    .first();
+
+  const agg = aggRow || {};
+  const total = Number(agg.total || 0);
+  const verified = Number(agg.verified || 0);
+  const pending = Number(agg.pending || 0);
+  const fresh = Number(agg.fresh || 0);
+  const blocked = Number(agg.blocked || 0);
+  const trusted = Number(agg.trusted || 0);
+  const withTopic = Number(agg.withTopic || 0);
+  const new1 = Number(agg.new1 || 0);
+  const new7 = Number(agg.new7 || 0);
+  const new30 = Number(agg.new30 || 0);
+  const act1 = Number(agg.act1 || 0);
+  const act7 = Number(agg.act7 || 0);
+  const act30 = Number(agg.act30 || 0);
+  const actNew1 = Number(agg.actNew1 || 0);
+  const actNew7 = Number(agg.actNew7 || 0);
+  const actNew30 = Number(agg.actNew30 || 0);
+
+  // 被屏蔽与待用通行证都以 users 行为域计数：与访客
+  // 列表对应 state 的 total 共用 countUsersWhere 与
+  // 同一谓词、同一排除集合。此前被屏蔽数的是 config
+  // 原始行、通行证数的是收口函数的原始长度——标记
+  // 残留而 users 行已删、或持证 / 被拉黑者后来成为
+  // 管理员时，统计都会比名单多（第十轮审计中 2）。
+  const botBlocked = await countUsersWhere(
+    env,
+    BOTBLOCKED_SQL,
+    [],
+    adminIds
+  );
+
+  const passIds = await listOutstandingPassUserIds(env);
+  const passHolders = passIds.length
+    ? passIds
+    : ['__no_pass_holder__'];
+
+  const passes = await countUsersWhere(
+    env,
+    'user_id IN (' +
+      passHolders.map(() => '?').join(',') +
+      ')',
+    passHolders,
+    adminIds
+  );
+
+  // 消息量三窗合并为一条条件聚合（入 / 出各一），窗
+  // 口谓词与旧三条 COUNT 逐字一致。
+  const msgAgg = async (whereSql, whereBinds) =>
+    env.TG_BOT_DB.prepare(
+      'SELECT ' +
+        'SUM(CASE WHEN date >= ? THEN 1 ELSE 0 END) AS d1, ' +
+        'SUM(CASE WHEN date >= ? THEN 1 ELSE 0 END) AS d7, ' +
+        'SUM(CASE WHEN date >= ? THEN 1 ELSE 0 END) AS d30 ' +
+        'FROM messages WHERE ' +
+        whereSql
+    )
+      .bind(since1, since7, since30, ...whereBinds)
+      .first();
+
+  const inRow =
+    (await msgAgg('user_id = ? AND message_id LIKE ?', [
+      REACTION_MAP_USER,
+      't:%'
+    ])) || {};
+
+  const outRow =
+    (await msgAgg('message_id LIKE ?', ['admin:%'])) || {};
+
+  const in1 = Number(inRow.d1 || 0);
+  const in7 = Number(inRow.d7 || 0);
+  const in30 = Number(inRow.d30 || 0);
+  const out1 = Number(outRow.d1 || 0);
+  const out7 = Number(outRow.d7 || 0);
+  const out30 = Number(outRow.d30 || 0);
 
   return Response.json({
     ok: true,
@@ -14829,7 +15455,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">资料卡：</b>每个话题顶部都钉着访客的资料卡（名字、ID、状态、你的备注）。卡片不见了就在话题里发 <code>/card</code> 重新生成；卡片上的按钮可以直接屏蔽 / 解除屏蔽、设为信任、刷新。</li>
       <li><b class=\"k\">引用回复会跟着走：</b>你在话题里引用某条消息再回复，访客那边看到的也是引用着他原话的回复；访客引用着回复你时同理，连他框选一小段文字的「部分引用」都会原样带过去。</li>
       <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，被改好的那条消息下方会出现一颗「✍🏼已编辑」标记按钮（点它不会有任何反应，只是标记）。Telegram 不给机器人提供官方的「已编辑」标记，这颗按钮就是补这个用的；它和普通聊天里的编辑一样安静——不会有新消息、不会弹窗提醒，没留意的话可能根本发现不了对方改过。访客编辑他的消息时，你这边也一样。这是写死的固定行为：两个方向的编辑都会自动附上标记，管理台里没有它的开关。只有原地改不动的极少数情况例外（比如转发配对已过期被清理、原地修改被拒绝）：这时机器人会以「回复旧副本」的形式补发一条只含新内容的消息，下方照样附「✍🏼已编辑」标记，原来的副本保留不动——这种时候才会多出一条新消息，顺着回复关系就能对上是哪条被改了。</li>
-      <li><b class=\"k\">自动消息带「系统提示」牌：</b>机器人自动发出的提示消息（欢迎语、验证提示、自动回复、熔断期间的回复、拉黑 / 解封通知这类），只要本身没有功能按钮，下方都会带一颗「系统提示」按钮，用来和真人发送的消息区分，点它不会有任何动作；验证按钮、通行证、资料卡、菜单这些本来就带按钮的消息不再另加。消息被原地改写时牌子也在——比如熔断恢复后，「请稍后再试」会原地改成「✅ 服务已恢复」，下方的「系统提示」照样保留。</li>
+      <li><b class=\"k\">自动消息带「系统提示」牌：</b>机器人自动发出的提示消息（欢迎语、验证提示、自动回复、熔断期间的回复、拉黑 / 解封通知这类），只要本身没有功能按钮，下方都会带一颗「系统提示」按钮，用来和真人发送的消息区分，点它不会有任何动作；验证按钮、通行证、资料卡、主菜单这些本来就带按钮的消息不再另加；主菜单有个例外：按钮被全部关掉后，菜单没了按钮，就会带上这颗牌子。消息被原地改写时牌子也在，靠改写出现的报告也会补上——比如熔断恢复后，「请稍后再试」会原地改成「✅ 服务已恢复」，下方的「系统提示」照样保留；/clear 的确认卡点下后会原地改写成进度与结果报告，下方同样带这颗牌子。</li>
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。注意：访客私聊那边的原消息只能删 48 小时以内的，超了删不掉时会在话题里留一行说明。</li>
       <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。这个操作只有主管理员能做，协管员发命令或点确认都会被拦下。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
@@ -14884,7 +15510,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。这组按钮可以长按拖动摆放：按住任意一颗拖动、松手吸附到屏幕左侧或右侧，觉得挡住列表就把它挪开；展开搜索时它回到输入法上方（靠左时搜索框改为向右展开），收起回到放它的位置，拖回右下角原位会恢复自动避让分页条；关掉页面再打开则回到原位。页眉下方的「全部 / 已验证 / 待验证 / 已屏蔽 / 被屏蔽」是快速筛选（「被屏蔽」列的是拉黑了机器人的人）；筛选下方的一行按钮管排序——左半选按最后活跃还是首次来访（第一次与机器人互动的时间）排，右半选倒序还是正序。在列表上左右滑动，也能在五个筛选和「数据统计」之间切换。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
       <li><b class=\"k\">位置会记住：</b>每个筛选与搜索组合下翻到的页码和滚动位置都会被记住，切去别处再切回来，会自动回到离开时的位置（内容是重新拉取的新数据）；手动更换排序会清掉全部位置记忆，各视图都从第一页重新开始。</li>
       <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词封禁对他同样无效）和「🚫 屏蔽 / ✅ 解封」（与 /ban、/unban 同一套封禁：屏蔽后他再发来的新消息会被立即删掉；解封时他会收到一条解除通知）；设为信任的人行上会挂「🤝 已信任」徽标，屏蔽中的人挂「已屏蔽」徽标。</li>
-      <li><b class=\"k\">统计页：</b>总览一排九个数字，排在前面的是和列表筛选对应的五个：访客总数、已验证、待验证、已屏蔽、被屏蔽，后面是未开始、已信任、建有专属话题的人数和没用掉的通行证数；再往下是过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃（活跃还分新客和老客）、收发了多少条消息。这九个数字都能点：前五个点开会直接切到访客列表并选中对应筛选；后四个在列表里没有单独的筛选，点开会整页推入一个只属于这批人的名单页——顶部只剩一个返回箭头、人群名和紧跟在名字后面的人数，排序固定按最后活跃倒序，点返回箭头回到统计页。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
+      <li><b class=\"k\">统计页：</b>总览一排九个数字，排在前面的是和列表筛选对应的五个：访客总数、已验证、待验证、已屏蔽、被屏蔽，后面是未开始、已信任、建有专属话题的人数和没用掉的通行证数；再往下是过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃（活跃还分新客和老客）、收发了多少条消息。这九个数字都能点：前五个点开会直接切到访客列表并选中对应筛选；后四个在列表里没有单独的筛选，点开会整页推入一个只属于这批人的名单页——顶部是返回箭头、人群名和紧跟在名字后面的人数，名单上方有和访客列表同一条排序栏（按最后活跃或首次来访、正序或倒序），两边共用一份排序设置：在这边改了排序，回到访客列表也是这个顺序，反过来也一样；点返回箭头回到统计页。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
     </ul>
   </section>
 
@@ -16402,9 +17028,15 @@ async function handleConfigSet(request, env) {
     );
   }
 
-  // 改协管员名单是最敏感的配置：先落 intent 审计，
-  // 写不进去就拒绝执行。
-  if (key === 'authorized_admins') {
+  // 最敏感的配置：先落 intent 审计，写不进去就拒绝
+  // 执行。协管员名单决定谁能代管；看门狗豁免名单能让
+  // 名单内账号进群时不触发告警——两者都不能无痕变更
+  // （第十轮审计：豁免名单此前只走普通 fail-open 审
+  // 计，与协管员名单的审计强度倒挂）。
+  if (
+    key === 'authorized_admins' ||
+    key === 'member_allow_ids'
+  ) {
     try {
       await writeAdminAuditStrict(
         env,
@@ -16695,6 +17327,75 @@ async function handleConfigPause(request, env) {
   );
 }
 
+// 名单类配置（屏蔽关键词 / 自动回复规则）的 CAS 合并写
+// （第十轮审计 #13）：旧实现是读全表→改→整表无条件写，
+// 并发两路时后写者以旧快照覆盖先写者，一条屏蔽关键词
+// 或规则无声丢失、双方却都报成功。改走与问答计数同口
+// 径的 CAS 循环：基于读到的原始串条件写，冲突就重读、
+// 按条目身份在最新名单上重放本次增删（不覆盖对方的新
+// 增）；多次冲突耗尽返回 conflict，调用方明确报错，
+// 绝不静默成功。
+// mutate(list, retried) 三种返回：
+//   { list }             —— 要写入的新名单；
+//   { done: true, list } —— 目标状态已由并发操作（或本
+//                           方先前一次已落库的写）达成，
+//                           按成功收尾，list 为当前名单；
+//   { error }            —— 业务拒绝（重复 / 超限 / 条
+//                           目已不存在），原样回操作者。
+async function casListUpdate(key, parseFn, mutate, env) {
+  let attempted = false;
+
+  for (let casTry = 0; casTry < 5; casTry += 1) {
+    const raw = await dbConfigGet(key, env);
+    const list = parseFn(raw ?? '[]');
+    const outcome = mutate(list, attempted);
+
+    if (outcome.error) {
+      return { ok: false, error: outcome.error };
+    }
+
+    if (outcome.done) {
+      return { ok: true, list: outcome.list };
+    }
+
+    const newRaw = JSON.stringify(outcome.list);
+    let wrote = false;
+
+    if (raw === null) {
+      // 行还不存在：claim 占位写。claim 落下后仍可能被
+      // 另一路从空名单算出的 claim 覆盖，故回读核对——
+      // 值已不是本次写的就按冲突处理，带着最新名单重
+      // 试合并，不让先写的那条无声消失。
+      wrote = await dbConfigClaim(key, newRaw, env);
+
+      if (wrote) {
+        const verify = await dbConfigGet(key, env);
+
+        if (verify === newRaw) {
+          return { ok: true, list: outcome.list };
+        }
+
+        wrote = false;
+      }
+    } else {
+      wrote = await dbConfigPutIfValue(
+        key,
+        raw,
+        newRaw,
+        env
+      );
+    }
+
+    attempted = true;
+
+    if (wrote) {
+      return { ok: true, list: outcome.list };
+    }
+  }
+
+  return { ok: false, conflict: true };
+}
+
 async function handleConfigList(request, env) {
   const parsed = await readPanelPostBody(request, env, 'panel');
 
@@ -16741,20 +17442,48 @@ async function handleConfigList(request, env) {
       { status: 403 }
     );
 
+  // CAS 合并写的统一收尾：冲突留痕并明确报错（不许静
+  // 默成功）、业务拒绝原样回错、成功落一条 ok 审计。
+  const finishListCas = async (cas) => {
+    if (cas.conflict) {
+      await writeAdminAudit(
+        env,
+        adminId,
+        'config_list',
+        key,
+        'failed',
+        'cas_conflict', aOpts
+      );
+
+      return Response.json(
+        {
+          ok: false,
+          error: '名单刚被其他操作修改，请刷新后重试'
+        },
+        { status: 409 }
+      );
+    }
+
+    if (cas.error) {
+      return Response.json(
+        { ok: false, error: cas.error },
+        { status: 400 }
+      );
+    }
+
+    await writeAdminAudit(
+      env,
+      adminId,
+      'config_list',
+      key,
+      'ok', '', aOpts
+    );
+
+    return null;
+  };
+
   if (key === 'block_keywords') {
-    const keywords = await getBlockKeywords(env);
-
     if (op === 'add') {
-      if (keywords.length >= 200) {
-        return Response.json(
-          {
-            ok: false,
-            error: '屏蔽关键词已达数量上限（200 条）'
-          },
-          { status: 400 }
-        );
-      }
-
       const value = String(body?.value || '').trim();
 
       if (!value) {
@@ -16789,13 +17518,6 @@ async function handleConfigList(request, env) {
         );
       }
 
-      if (keywords.includes(value)) {
-        return Response.json(
-          { ok: false, error: '该关键词已经存在' },
-          { status: 400 }
-        );
-      }
-
       if (
         !(await consumeListNonce({
           op: 'add',
@@ -16805,26 +17527,40 @@ async function handleConfigList(request, env) {
         return listNonceInvalid();
       }
 
-      keywords.push(value);
-
-      await setConfig(
+      // 落库走 CAS 合并：上限与重复都在最新名单上判
+      // 定，并发新增不被本路覆盖（见 casListUpdate）。
+      const cas = await casListUpdate(
         'block_keywords',
-        JSON.stringify(keywords),
+        parseBlockKeywords,
+        (list, retried) => {
+          if (list.includes(value)) {
+            return retried
+              ? { done: true, list }
+              : { error: '该关键词已经存在' };
+          }
+
+          if (list.length >= 200) {
+            return {
+              error: '屏蔽关键词已达数量上限（200 条）'
+            };
+          }
+
+          return { list: [...list, value] };
+        },
         env
       );
 
-      await writeAdminAudit(
-        env,
-        adminId,
-        'config_list',
-        key,
-        'ok', '', aOpts
-      );
+      const casErr = await finishListCas(cas);
 
-      return Response.json({ ok: true, keywords });
+      if (casErr) {
+        return casErr;
+      }
+
+      return Response.json({ ok: true, keywords: cas.list });
     }
 
     if (op === 'delete') {
+      const keywords = await getBlockKeywords(env);
       const index = Number(body?.index);
 
       if (
@@ -16838,56 +17574,60 @@ async function handleConfigList(request, env) {
         );
       }
 
+      // nonce 绑被删条目本身；落库时按条目身份在最新
+      // 名单里定位删除——并发增删让序号漂移时，删的仍
+      // 然是管理员点的那一条，不误删别的条目。
+      const item = keywords[index];
+
       if (
         !(await consumeListNonce({
           op: 'delete',
-          item: keywords[index]
+          item
         }))
       ) {
         return listNonceInvalid();
       }
 
-      keywords.splice(index, 1);
-
-      await setConfig(
+      const cas = await casListUpdate(
         'block_keywords',
-        JSON.stringify(keywords),
+        parseBlockKeywords,
+        (list, retried) => {
+          const at = list.indexOf(item);
+
+          if (at < 0) {
+            return retried
+              ? { done: true, list }
+              : { error: '该条目已被其他操作删除' };
+          }
+
+          const next = list.slice();
+
+          next.splice(at, 1);
+
+          return { list: next };
+        },
         env
       );
 
-      await writeAdminAudit(
-        env,
-        adminId,
-        'config_list',
-        key,
-        'ok', '', aOpts
-      );
+      const casErr = await finishListCas(cas);
 
-      return Response.json({ ok: true, keywords });
+      if (casErr) {
+        return casErr;
+      }
+
+      return Response.json({ ok: true, keywords: cas.list });
     }
   }
 
   if (key === 'keyword_responses') {
-    const rules = await getAutoReplyRules(env);
-
-    const mapped = () =>
-      rules.map((rule) => ({
+    const mapRules = (list) =>
+      list.map((rule) => ({
         id: String(rule.id || ''),
         keywords: String(rule.keywords || ''),
         response: String(rule.response || '')
       }));
 
     if (op === 'add') {
-      if (rules.length >= 200) {
-        return Response.json(
-          {
-            ok: false,
-            error: '自动回复规则已达数量上限（200 条）'
-          },
-          { status: 400 }
-        );
-      }
-
       const pattern =
         String(body?.pattern || '').trim();
 
@@ -16952,33 +17692,51 @@ async function handleConfigList(request, env) {
         return listNonceInvalid();
       }
 
-      rules.push({
+      // 新规则的 id 先定死：CAS 重试时靠它认出「本方
+      // 先前一次已落库的写」，不重复追加第二条。
+      const newRule = {
         id: randomId(),
         keywords: pattern,
         response
-      });
+      };
 
-      await setConfig(
+      const cas = await casListUpdate(
         'keyword_responses',
-        JSON.stringify(rules),
+        parseAutoReplyRules,
+        (list) => {
+          if (
+            list.some(
+              (rule) => String(rule.id || '') === newRule.id
+            )
+          ) {
+            return { done: true, list };
+          }
+
+          if (list.length >= 200) {
+            return {
+              error: '自动回复规则已达数量上限（200 条）'
+            };
+          }
+
+          return { list: [...list, newRule] };
+        },
         env
       );
 
-      await writeAdminAudit(
-        env,
-        adminId,
-        'config_list',
-        key,
-        'ok', '', aOpts
-      );
+      const casErr = await finishListCas(cas);
+
+      if (casErr) {
+        return casErr;
+      }
 
       return Response.json({
         ok: true,
-        autoReplies: mapped()
+        autoReplies: mapRules(cas.list)
       });
     }
 
     if (op === 'delete') {
+      const rules = await getAutoReplyRules(env);
       const index = Number(body?.index);
 
       if (
@@ -16992,34 +17750,51 @@ async function handleConfigList(request, env) {
         );
       }
 
+      // 删除按规则 id 定位（与 nonce 绑定口径一致）：
+      // 并发增删后序号漂移，删的仍是点的那一条。
+      const item = String(rules[index].id || '');
+
       if (
         !(await consumeListNonce({
           op: 'delete',
-          item: String(rules[index].id || '')
+          item
         }))
       ) {
         return listNonceInvalid();
       }
 
-      rules.splice(index, 1);
-
-      await setConfig(
+      const cas = await casListUpdate(
         'keyword_responses',
-        JSON.stringify(rules),
+        parseAutoReplyRules,
+        (list, retried) => {
+          const at = list.findIndex(
+            (rule) => String(rule.id || '') === item
+          );
+
+          if (at < 0) {
+            return retried
+              ? { done: true, list }
+              : { error: '该条目已被其他操作删除' };
+          }
+
+          const next = list.slice();
+
+          next.splice(at, 1);
+
+          return { list: next };
+        },
         env
       );
 
-      await writeAdminAudit(
-        env,
-        adminId,
-        'config_list',
-        key,
-        'ok', '', aOpts
-      );
+      const casErr = await finishListCas(cas);
+
+      if (casErr) {
+        return casErr;
+      }
 
       return Response.json({
         ok: true,
-        autoReplies: mapped()
+        autoReplies: mapRules(cas.list)
       });
     }
   }
@@ -17193,9 +17968,23 @@ async function handleAuditApi(request, env) {
   // config 时间戳节流到每小时至多一次，避免每次拉列表
   // 都发一发 DELETE 写库。
   try {
-    const lastSweep = Number(
+    let lastSweep = Number(
       (await dbConfigGet('audit_sweep_at', env)) || 0
     );
+
+    // 坏值自愈（第十轮审计）：存量值若是非数字
+    // （NaN）或未来时间，旧口径下
+    // Date.now() - lastSweep 恒不达标、清扫永久停
+    // 摆且值永不被改写。这里把不可信的值按从未清
+    // 扫处理：本轮即清扫并改写为当前时间，之后恢
+    // 复每小时节流。
+    if (
+      !Number.isFinite(lastSweep) ||
+      lastSweep < 0 ||
+      lastSweep > Date.now()
+    ) {
+      lastSweep = 0;
+    }
 
     if (Date.now() - lastSweep >= 60 * 60 * 1000) {
       await dbConfigPut(
@@ -17386,6 +18175,15 @@ async function handleUserListAction(request, env) {
   };
 
   if (action === 'reset') {
+    // 重置是把已验证 / 已信任访客降级并作废其通行证，
+    // 属安全状态变更：与 delete / pass / trust / block
+    // 同规矩，先过一次性 nonce 再执行（第十轮审计）。
+    const ng = await guardNonce('reset', {});
+
+    if (ng) {
+      return ng;
+    }
+
     // 合并口径：重置连带清放行，与清信任一起回到未信任
     // 状态，避免留下「显示已信任但实际未信任」的残标。
     await dbUserUpdate(
@@ -17395,7 +18193,8 @@ async function handleUserListAction(request, env) {
         is_trusted: 0,
         relay_exempt: 0
       },
-      env
+      env,
+      { touchActivity: false }
     );
 
     await voidUserPass(env, targetId);
@@ -17403,6 +18202,15 @@ async function handleUserListAction(request, env) {
     // 在途顺序点击题目一并作废（与作废通行证同口径）：
     // 重置后旧题点完不能再算数。
     await dbConfigDelete(`seq:${targetId}`, env);
+
+    await writeAdminAudit(
+      env,
+      adminId,
+      'reset',
+      targetId,
+      'ok',
+      '', aOpts
+    );
 
     return Response.json({ ok: true });
   }
@@ -17436,7 +18244,8 @@ async function handleUserListAction(request, env) {
       await dbUserUpdate(
         targetId,
         { is_trusted: 0, relay_exempt: 0 },
-        env
+        env,
+        { touchActivity: false }
       );
 
       await writeAdminAudit(
@@ -17500,7 +18309,8 @@ async function handleUserListAction(request, env) {
       await dbUserUpdate(
         targetId,
         { is_trusted: 1, relay_exempt: 1 },
-        env
+        env,
+        { touchActivity: false }
       );
 
       await writeAdminAudit(
@@ -17530,7 +18340,8 @@ async function handleUserListAction(request, env) {
         relay_exempt: 1,
         user_state: USER_STATE.VERIFIED
       },
-      env
+      env,
+      { touchActivity: false }
     );
 
     await cleanupAfterVerified(env, targetId);
@@ -17619,6 +18430,15 @@ async function handleUserListAction(request, env) {
     ).trim();
 
     if (noteText.length > 500) {
+      await writeAdminAudit(
+        env,
+        adminId,
+        'note',
+        targetId,
+        'failed',
+        'too_long', aOpts
+      );
+
       return Response.json(
         {
           ok: false,
@@ -17628,15 +18448,35 @@ async function handleUserListAction(request, env) {
       );
     }
 
+    // 改备注会连带改话题名与资料卡，且旧请求重放能覆盖
+    // 刚改好的新备注：与其它敏感动作同规矩绑 nonce，
+    // nonce 绑提交内容本身（见 nonceSemanticParams）。
+    const ng = await guardNonce('note', { note: noteText });
+
+    if (ng) {
+      return ng;
+    }
+
     await dbUserUpdate(
       targetId,
       { admin_note: noteText },
-      env
+      env,
+      { touchActivity: false }
     );
 
     await refreshCardAfterNoteChange(
       targetId,
       env
+    );
+
+    // 审计只记「谁对谁改过备注」，不记备注正文。
+    await writeAdminAudit(
+      env,
+      adminId,
+      'note',
+      targetId,
+      'ok',
+      '', aOpts
     );
 
     return Response.json({ ok: true });
@@ -18014,7 +18854,7 @@ function buildUserListPage(pageCtx = {}) {
   </section>
   <section id="paneStats" style="display:none">
     <div class="stitle">📊 数据统计</div>
-    <div id="sgrid"><div class="sloading">统计加载中…</div></div>
+    <div id="sgrid"><div class="loadingbox"><div class="spinner"></div><div class="loadingtxt">加载中…</div></div></div>
     <div class="snote">消息量按同步映射记录统计（仅保留最近 90 天）；新增与活跃为滚动窗口（过去 24 小时 / 7 天 / 30 天）。</div>
   </section>
 </main>
@@ -18037,6 +18877,11 @@ var listTotal = 0;
 var GROUP_C = '';
 var PAGE = 15;
 var booted = false;
+// sortTouched：用户在本页亲手点过排序（boot 领养
+// uiDefaults 之前点过也算）。领养只在未点过时回
+// 填服务端默认；点过的选择是排序的唯一事实源，
+// 不许被领养无声覆写（第十轮审计·低3）。
+var sortTouched = false;
 var curCursor = '', cursorStack = [], nextCursor = null;
 var LABEL = { verified: '已验证', pending_verification: '待验证', blocked: '已屏蔽' };
 var CLS = { verified: 'b-ok', pending_verification: 'b-pend', blocked: 'b-ban' };
@@ -18203,13 +19048,19 @@ function loadUsers() {
   params.set('state', filt);
   if (query) params.set('q', query);
   if (booted) {
-    // 二级模式排序固定最后活跃·倒序：只改本次取数
-    // 的 sort 参数，不动一级的 sortMode 选择状态。
-    params.set('sort', l2Mode ? 'act_desc' : sortMode);
+    // 排序全站共用一个 sortMode 状态（-v161b1 方
+    // 案一）：二级与一级同栏同选择，取数一律带当
+    // 前值，不再为二级写死最后活跃·倒序。
+    params.set('sort', sortMode);
     params.set('limit', PAGE);
-  } else if (l2Mode) {
-    params.set('sort', 'act_desc');
   }
+  // 未 boot 时一律不带 sort（第十轮审计·低3）：服
+  // 务端按其配置默认序应答——正是 boot 时
+  // uiDefaults 要回填的同一个值。此前二级兜底分
+  // 支抢先写死 act_desc，与一级不带参的口径分裂，
+  // 且领养时还会把配置默认顶掉、锁死整个会话。
+  // boot 前点过的排序记在 sortTouched 里，领养以
+  // 它为准（见下方响应处理）。
   if (curCursor) params.set('cursor', curCursor);
   if (pageAnchor > 0) params.set('page', pageAnchor);
   fetch('/api/users?' + params.toString())
@@ -18222,7 +19073,12 @@ function loadUsers() {
         return;
       }
       rows = d.users;
-      listTotal = d.total || 0;
+      // 游标翻页时服务端不再重算精确总数（回
+      // null，第十轮审计）：沿用上次的精确值；
+      // 第一页与页号模式恒带数字，照常刷新。
+      if (typeof d.total === 'number') {
+        listTotal = d.total;
+      }
       nextCursor = d.nextCursor || null;
       if (pageAnchor > 0) {
         // 页号模式：以服务端回显的实际页号为准（超界钳到
@@ -18234,12 +19090,23 @@ function loadUsers() {
       GROUP_C = d.group || '';
       if (!booted) {
         booted = true;
+        var bootSort = '';
         if (d.uiDefaults) {
           if (d.uiDefaults.pageSize) PAGE = d.uiDefaults.pageSize;
-          if (d.uiDefaults.sort) {
-            sortMode = sortNorm(d.uiDefaults.sort);
-            sortChrome();
-          }
+          if (d.uiDefaults.sort) bootSort = sortNorm(d.uiDefaults.sort);
+        }
+        if (!sortTouched && bootSort) {
+          sortMode = bootSort;
+          sortChrome();
+        }
+        if (sortTouched && bootSort && bootSort !== sortMode) {
+          // boot 前点过的排序与服务端默认序不同：本
+          // 响应是按默认序取的数、与用户意图不符，
+          // 不渲染，带当下 sortMode 立即重取一次
+          // （审计·低3：此前点击会被领养无声覆写、
+          // 等于没点）。
+          loadUsers();
+          return;
         }
       }
       if (!rows.length && (cursorStack.length || pageAnchor > 1)) {
@@ -18288,7 +19155,7 @@ function translateError(d) {
   if (d && d.error && ERROR_TEXT[d.error]) d.error = ERROR_TEXT[d.error];
   return d;
 }
-var SENSITIVE_ACT = { delete: 1, pass: 1, trust: 1, block: 1 };
+var SENSITIVE_ACT = { delete: 1, pass: 1, trust: 1, block: 1, reset: 1, note: 1 };
 function act(id, action, delTopic, note, extra) {
   var body = { u: AUTH.u, e: AUTH.e, s: AUTH.s, action: action, userId: id, deleteTopic: !!delTopic, note: note };
   if (extra) { for (var ek in extra) body[ek] = extra[ek]; }
@@ -18306,6 +19173,7 @@ function act(id, action, delTopic, note, extra) {
   if (action === 'delete') params = { deleteTopic: !!delTopic };
   if (action === 'trust') params = { trust: !!(extra && extra.trust) };
   if (action === 'block') params = { block: !!(extra && extra.block) };
+  if (action === 'note') params = { note: note == null ? '' : String(note) };
   return fetch('/api/nonce', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -18615,7 +19483,12 @@ function uCollapseSearch() {
 var stVVH = 0;
 try { stVVH = parseInt(localStorage.getItem('usvvh') || '0', 10) || 0; } catch (e) {}
 function stLearn(v) {
-  if (!(v > 0)) return;
+  // 下限与全站其他学习入口对齐（stFreshLand /
+  // stPairSettle 均为 v > 40）：(0,40] 的瞬时值
+  // （含 1px 挤压态的塌缩读数）不得写进 usvvh，
+  // 免得学坏的高度让下次展开的预定位失效（第十
+  // 轮审计·低7）。
+  if (!(v > 40)) return;
   stVVH = v;
   try { localStorage.setItem('usvvh', String(v)); } catch (e) {}
 }
@@ -18788,7 +19661,14 @@ function stPairSettle() {
   if (good) {
     if (stPendingBad !== v) stPendingBad = 0;
     var lift = v - good;
-    var np = lift > 2 ? lift : 0;
+    // 顶起量上限 160（第十轮审计·低7）：lift 的本
+    // 义是坏高度多出的那截工具栏，实测配对差额
+    // 42（417→375）；good 若被异常落地污染得过
+    // 小，无上限的 lift 会把浮动组整体顶出屏外。
+    // 160 约为实测差额的 4 倍——任何现实工具栏 /
+    // 候选栏叠加都够不到，异常时顶到此为止、胶囊
+    // 仍留在屏内。
+    var np = lift > 2 ? Math.min(lift, 160) : 0;
     if (np !== stPair) { stPair = np; uFloatTransform(); }
     return;
   }
@@ -19395,6 +20275,11 @@ function chipSwitch(nf) {
 }
 document.getElementById('sortrow').addEventListener('click', function (e) {
   if (!swipeSelf && Date.now() - swipeAt < 350) return;
+  // 转场中与 chips 同口径直接忽略（第十轮审计·低
+  // 6）：动画期改 sortMode / 清 posMem，会被待执行
+  // 本体按旧快照覆盖、还白打一次请求；转场最长
+  // 280ms，落定后重点即可。
+  if (viewAnim) return;
   var b = e.target;
   if (!b || !b.dataset || (!b.dataset.sf && !b.dataset.sd)) return;
   var nm = b.dataset.sf
@@ -19402,6 +20287,7 @@ document.getElementById('sortrow').addEventListener('click', function (e) {
     : sortField() + '_' + b.dataset.sd;
   if (nm === sortMode) return;
   sortMode = nm;
+  sortTouched = true;
   sortChrome();
   // 排序变了，各视图记住的旧位置全部作废。boot 时 uiDefaults
   // 回填组合是程序赋值、不经点击路径，不会误清。
@@ -19411,6 +20297,7 @@ document.getElementById('sortrow').addEventListener('click', function (e) {
   uScrollTop();
 });
 document.getElementById('prev').onclick = function () {
+  if (viewAnim) return;
   uCollapseSearch();
   if (pageAnchor > 0) {
     if (pageAnchor > 1) { pageAnchor--; loadUsers(); uScrollTop(); }
@@ -19433,6 +20320,7 @@ document.getElementById('prev').onclick = function () {
   uScrollTop();
 };
 document.getElementById('next').onclick = function () {
+  if (viewAnim) return;
   uCollapseSearch();
   if (pageAnchor > 0) {
     if (pageJumpNext) {
@@ -19450,7 +20338,12 @@ document.getElementById('next').onclick = function () {
   if (nextCursor) { cursorStack.push(curCursor); curCursor = nextCursor; loadUsers(); uScrollTop(); }
 };
 document.getElementById('pgsel').addEventListener('change', function () {
-  var n = Number(document.getElementById('pgsel').value) || 1;
+  var sel = document.getElementById('pgsel');
+  // 转场中忽略（审计·低6，与 chips 同口径），并把
+  // 下拉显示拨回当前页：不拨回的话它会停在没生效
+  // 的页号上误导。
+  if (viewAnim) { sel.value = String(curPageNo()); return; }
+  var n = Number(sel.value) || 1;
   uCollapseSearch();
   if (n === curPageNo()) return;
   if (n === 1) { resetAndLoad(); uScrollTop(); return; }
@@ -19477,6 +20370,7 @@ function showTab(which) {
 function showTabBody(which) {
   var isStats = which === 'stats';
   if (isStats) uCollapseSearch();
+  if (isStats) loadStats();
   document.getElementById('usearch').style.display = isStats ? 'none' : '';
   document.getElementById('paneList').style.display = isStats ? 'none' : '';
   document.getElementById('chips').style.display = isStats ? 'none' : '';
@@ -19502,15 +20396,22 @@ document.getElementById('toTop').onclick = function () { uScrollTop(); };
 // 一级里没有的（未开始 / 已信任 / 有话题 / 待用通
 // 行证）进二级模式：filt 换成二级 state（posMem
 // 按 filt 键天然隔离），顶栏换成 #l2head（‹ 返回
-// + 人群名 + 共 N 人），页眉 / 筛选行 / 排序行隐
-// 藏；排序固定最后活跃·倒序（loadUsers 只改取数
-// 参数、不动 sortMode）；横滑在二级下禁用。点 ‹
+// + 人群名 + 共 N 人），页眉 / 筛选行隐藏，排序
+// 行保留在位；排序与一级共用 sortMode（-v161b1
+// 方案一：进出二级不改选择，二级内改了一级跟
+// 随）；横滑在二级下禁用。点 ‹
 // 回数据统计页签，并把 filt 还原为进入前的一级筛
 // 选重取，二级状态不残留。
 var L2_NAMES = { fresh: '未开始', trusted: '🤝 已信任', topic: '有话题', passes: '🎫 待用通行证' };
 var l2Mode = null, l2PrevFilt = 'all';
 function statsGo(act) {
   if (act === 'fresh' || act === 'trusted' || act === 'topic' || act === 'passes') { enterL2(act); return; }
+  // 一级入口在转场期先结算（第十轮审计·低5）：整
+  // 页滑入统计的入场期点一级人群块时，showTab 与
+  // chip.click 都会在 viewAnim 下 early-return、点
+  // 击无声丢失；与 enterL2 / exitL2 的打断口径一
+  // 致，先 viewSlideFinish 就地落定再借道。
+  if (viewAnim) viewSlideFinish();
   swipeSelf = true;
   if (document.getElementById('paneStats').style.display !== 'none') showTab('list');
   var cs = document.querySelectorAll('.chip');
@@ -19656,7 +20557,6 @@ function enterL2(nf) {
   var wasL2 = !!l2Mode;
   l2Mode = nf;
   filt = nf;
-  document.getElementById('sortrow').style.display = 'none';
   if (wasL2) {
     // 已在二级里换人群（界面上无此入口，程序兜
     // 底）：不走转场，原地换名单。
@@ -19728,6 +20628,8 @@ function sgroup(title, tiles) {
 }
 
 function statsFail() {
+  // 加载失败不算已取：下次切到统计页签时重试。
+  statsRequested = false;
   var box = document.getElementById('sgrid');
   box.textContent = '';
   var e = document.createElement('div');
@@ -19736,40 +20638,57 @@ function statsFail() {
   box.appendChild(e);
 }
 
-fetch('/api/stats?' + qs.toString())
-  .then(function (r) { return r.json(); })
-  .then(function (d) {
-    if (!d.ok) { statsFail(); return; }
-    var box = document.getElementById('sgrid');
-    box.textContent = '';
-    box.appendChild(sgroup('访客总览', [
-      stile(d.users.total, '访客总数', null, 'all'),
-      stile(d.users.verified, '已验证', null, 'verified'),
-      stile(d.users.pending, '待验证', null, 'pending'),
-      stile(d.users.blocked, '已屏蔽', null, 'blocked'),
-      stile(d.users.botBlocked, '被屏蔽', null, 'botblocked'),
-      stile(d.users.fresh, '未开始', null, 'fresh'),
-      stile(d.users.trusted, '已信任', null, 'trusted'),
-      stile(d.users.withTopic, '有话题', null, 'topic'),
-      stile(d.users.passes, '待用通行证', null, 'passes')
-    ]));
-    box.appendChild(sgroup('新增访客', [
-      stile(d.growth.d1, '过去 24 小时'),
-      stile(d.growth.d7, '过去 7 天'),
-      stile(d.growth.d30, '过去 30 天')
-    ]));
-    box.appendChild(sgroup('活跃访客', [
-      stile(d.active.d1, '过去 24 小时', '新 ' + d.activeNew.d1 + ' · 老 ' + d.activeOld.d1),
-      stile(d.active.d7, '过去 7 天', '新 ' + d.activeNew.d7 + ' · 老 ' + d.activeOld.d7),
-      stile(d.active.d30, '过去 30 天', '新 ' + d.activeNew.d30 + ' · 老 ' + d.activeOld.d30)
-    ]));
-    box.appendChild(sgroup('消息量（访客 / 管理员回复）', [
-      stile(d.messages.in.d1 + ' / ' + d.messages.out.d1, '过去 24 小时'),
-      stile(d.messages.in.d7 + ' / ' + d.messages.out.d7, '过去 7 天'),
-      stile(d.messages.in.d30 + ' / ' + d.messages.out.d30, '过去 30 天')
-    ]));
-  })
-  .catch(statsFail);
+// 统计懒加载（第十轮审计中 14）：此前页面一打开就
+// 无条件预取整份统计，只看列表也全价付。改为首次
+// 切到数据统计页签时才由 showTabBody 调 loadStats
+// 取数，取到后缓存复用、后续切入不重取；失败不算
+// 已取（statsFail 里复位标记），下次切入重试。
+var statsRequested = false;
+function loadStats() {
+  if (statsRequested) return;
+  statsRequested = true;
+  // 取数期间在统计区显示与名单加载同一个转圈（共
+  // 享 .loadingbox/.spinner/.loadingtxt，不另造一
+  // 套）：成功渲染与 statsFail 都先清空 #sgrid，
+  // 转圈随之消失、不会卡住；已取过再切入在上方
+  // 已 return，内容不动、不闪转圈。
+  var sbox = document.getElementById('sgrid');
+  sbox.innerHTML = '<div class="loadingbox"><div class="spinner"></div><div class="loadingtxt">加载中…</div></div>';
+  fetch('/api/stats?' + qs.toString())
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d.ok) { statsFail(); return; }
+      var box = document.getElementById('sgrid');
+      box.textContent = '';
+      box.appendChild(sgroup('访客总览', [
+        stile(d.users.total, '访客总数', null, 'all'),
+        stile(d.users.verified, '已验证', null, 'verified'),
+        stile(d.users.pending, '待验证', null, 'pending'),
+        stile(d.users.blocked, '已屏蔽', null, 'blocked'),
+        stile(d.users.botBlocked, '被屏蔽', null, 'botblocked'),
+        stile(d.users.fresh, '未开始', null, 'fresh'),
+        stile(d.users.trusted, '已信任', null, 'trusted'),
+        stile(d.users.withTopic, '有话题', null, 'topic'),
+        stile(d.users.passes, '待用通行证', null, 'passes')
+      ]));
+      box.appendChild(sgroup('新增访客', [
+        stile(d.growth.d1, '过去 24 小时'),
+        stile(d.growth.d7, '过去 7 天'),
+        stile(d.growth.d30, '过去 30 天')
+      ]));
+      box.appendChild(sgroup('活跃访客', [
+        stile(d.active.d1, '过去 24 小时', '新 ' + d.activeNew.d1 + ' · 老 ' + d.activeOld.d1),
+        stile(d.active.d7, '过去 7 天', '新 ' + d.activeNew.d7 + ' · 老 ' + d.activeOld.d7),
+        stile(d.active.d30, '过去 30 天', '新 ' + d.activeNew.d30 + ' · 老 ' + d.activeOld.d30)
+      ]));
+      box.appendChild(sgroup('消息量（访客 / 管理员回复）', [
+        stile(d.messages.in.d1 + ' / ' + d.messages.out.d1, '过去 24 小时'),
+        stile(d.messages.in.d7 + ' / ' + d.messages.out.d7, '过去 7 天'),
+        stile(d.messages.in.d30 + ' / ' + d.messages.out.d30, '过去 30 天')
+      ]));
+    })
+    .catch(statsFail);
+}
 
 loadUsers();
 // 页眉补偿退役（-v146b14）：列表页改内层容器滚动
@@ -20034,6 +20953,23 @@ function ufPosInit() {
       if (o && (o.s === 'left' || o.s === 'right') && isFinite(Number(o.b))) {
         ufSide = o.s;
         ufBottom = Number(o.b);
+        // 值域钳制（第十轮审计·低7）：形状合法不等
+        // 于值域合法——过大的 b 经 ufClosedY 换算
+        // 会把浮动组钉出屏外、且本会话内再也点不
+        // 回来。落点在拖动期恒满足 b ≤ 视口高 −
+        // 组高 − 6（ufOnMove 的钳制），恢复时视口
+        // 可能已变（旋转 / 折叠屏），按当前视口同
+        // 界夹回；组高读不到时退到保证最底一只
+        // 48px 钮完整在屏内的界（视口高 − 48）。
+        // 负值归未定位哨兵 -1（与旧行为同义：
+        // ufClosedY / ufIsHome 本就把负数按原位解）。
+        if (ufBottom < 0) ufBottom = -1;
+        var ihN = window.innerHeight || 0;
+        if (ufBottom >= 0 && ihN > 0) {
+          var ghN = (r && r.height) || 0;
+          var maxBN = ihN - (ghN > 0 ? ghN + 6 : 48);
+          if (ufBottom > maxBN) ufBottom = Math.max(0, maxBN);
+        }
       }
     } catch (e) {}
   }
@@ -20114,6 +21050,36 @@ async function notifyPrimaryAdmins(
   }
 }
 
+async function alertAdminsPauseStateCorrupt(env) {
+  try {
+    const last = Number(
+      (await dbConfigGet('alertat:pausestate', env)) || 0
+    );
+
+    if (Date.now() - last < 24 * 60 * 60 * 1000) {
+      return;
+    }
+
+    await dbConfigPut(
+      'alertat:pausestate',
+      String(Date.now()),
+      env
+    );
+
+    await notifyPrimaryAdmins(
+      env,
+      '⚠️ 熔断状态记录损坏：机器人按「熔断中」从严' +
+      '处理（访客消息暂被拦下）。执行 /resume 可清' +
+      '除坏值恢复服务，或重新 /pause 覆盖写入。'
+    );
+  } catch (error) {
+    console.error(
+      '发送熔断状态损坏告警失败：',
+      error?.message || error
+    );
+  }
+}
+
 async function getPauseState(env) {
   const raw = await dbConfigGet(
     PAUSE_STATE_KEY,
@@ -20131,7 +21097,18 @@ async function getPauseState(env) {
     typeof state !== 'object' ||
     !state.episode
   ) {
-    return null;
+    // 坏值 fail-closed（第十轮审计）：sys:pause 写
+    // 坏（非 JSON、缺 episode）时旧口径按未熔断放
+    // 行——熔断是安全闸门，状态不明就该关着。返
+    // 回一轮无到期时间的合成熔断（文案显示「手动
+    // 恢复前一直暂停」），并节流告警主管理员；管
+    // 理员执行 /resume（stopPause 无条件删键）或
+    // 重新 /pause（覆盖写）即可清除坏值。正常值
+    // 路径不受影响；读状态本身抛错的放行口径在闸
+    // 门调用方保持不变。
+    await alertAdminsPauseStateCorrupt(env);
+
+    return { episode: 'corrupt', until: 0, by: '' };
   }
 
   const until = Number(state.until || 0);
@@ -20156,7 +21133,14 @@ async function getPauseState(env) {
       const flip = await flipPauseCards(env);
 
       if (flip.remaining <= 0) {
-        await dbConfigDelete(PAUSE_STATE_KEY, env);
+        // 按进入时读到的原值 CAS 删除：翻牌期间管理员
+        // 新开一轮熔断会覆盖状态行，值已变就放弃清行，
+        // 绝不误删新熔断（第十轮审计）。
+        await dbConfigDeleteIfValue(
+          PAUSE_STATE_KEY,
+          raw,
+          env
+        );
       }
     } catch (error) {
       console.error(
@@ -20198,8 +21182,35 @@ async function startPause(env, minutes, byAdminId) {
   return state;
 }
 
-async function stopPause(env) {
-  await dbConfigDelete(PAUSE_STATE_KEY, env);
+async function stopPause(env, episode = '') {
+  if (!episode) {
+    await dbConfigDelete(PAUSE_STATE_KEY, env);
+
+    return;
+  }
+
+  // 带 episode 的清行（恢复流程专用）：状态行若已被
+  // 新一轮熔断覆盖（episode 不同）就不删——旧恢复
+  // 流程无条件清行会把管理员刚开的新熔断静默取消
+  // （第十轮审计）。读到后再按原值 CAS 一道：读与
+  // 删之间又被改写同样放弃。
+  const raw = await dbConfigGet(PAUSE_STATE_KEY, env);
+
+  if (!raw) {
+    return;
+  }
+
+  const state = safeJsonParse(raw, null);
+
+  if (
+    !state ||
+    typeof state !== 'object' ||
+    String(state.episode || '') !== String(episode)
+  ) {
+    return;
+  }
+
+  await dbConfigDeleteIfValue(PAUSE_STATE_KEY, raw, env);
 }
 
 // 恢复服务时收尾熔断期间留下的两类访客侧消息：
@@ -20295,9 +21306,14 @@ async function flipPauseCards(env, limit = 10) {
       : Number(row.value);
 
     if (!userId || !messageId) {
-      await dbConfigDelete(key, env);
-
-      settled += 1;
+      // 无卡可翻的残行：按读到的原值条件删——期间该行
+      // 被新一轮熔断改写（新卡编号）时不误删，留给新
+      // 一轮自己的恢复流程处理（第十轮审计）。
+      if (
+        await dbConfigDeleteIfValue(key, row.value, env)
+      ) {
+        settled += 1;
+      }
 
       continue;
     }
@@ -20334,11 +21350,14 @@ async function flipPauseCards(env, limit = 10) {
     // 记录在处理尝试之后才删：进程中途被打断时，没轮到的
     // 记录还在，下一次恢复会续跑（已翻的编辑同文案无副作用，
     // 已删的警告再删只会得到终局错误、同列处理）。
-    // 且只有处理成功、或失败是带 errorCode 的终局错误（消息
-    // 已删、被拉黑、已是恢复文案等）才删；无 errorCode 的
-    // 瞬时失败（网络抖动、子请求超限）保留记录下一次再处理，
-    // 否则访客端会永远留着「请稍后再试」或警告。
-    if (!opError || opError.errorCode) {
+    // 且只有处理成功、或失败是终局错误（消息已删、被
+    // 拉黑、已是恢复文案等）才删；瞬时失败（429、5xx、
+    // 网络抖动、子请求超限）保留记录下一次再处理，
+    // 否则访客端会永远留着「请稍后再试」或警告。终局/
+    // 瞬时的判据与全站统一走 isTransientTelegramError
+    // ——旧口径只看 errorCode 是否存在，带码的 429/5xx
+    // 会被误判终局删记录，卡永久搁浅（第十轮审计）。
+    if (!opError || !isTransientTelegramError(opError)) {
       if (!row.warn && !opError) {
         // 翻牌成功：这张卡现在显示「✅ 服务已恢复」，
         // 编号转记到 pauserestored:<uid>，等访客下一次
@@ -20359,9 +21378,14 @@ async function flipPauseCards(env, limit = 10) {
         }
       }
 
-      await dbConfigDelete(key, env);
-
-      settled += 1;
+      // 同无卡分支：按读到的原值条件删，行已被新一
+      // 轮改写时保留、不计本轮 settled（剩余数里留
+      // 着它，本轮也不会因此误清状态行）。
+      if (
+        await dbConfigDeleteIfValue(key, row.value, env)
+      ) {
+        settled += 1;
+      }
     }
   }
 
@@ -20416,6 +21440,33 @@ async function performResume(
   byAdminId,
   ctx = null
 ) {
+  // 记住本次恢复对应哪一轮熔断：翻牌期间管理员可能
+  // 又新开一轮（状态行被覆盖写），本轮的清行与待续
+  // 翻改写都只能作用于自己这一轮（按 episode 守卫，
+  // 见 stopPause 与下方收尾改写）。
+  let resumeEpisode = '';
+
+  try {
+    const rawAtStart = await dbConfigGet(
+      PAUSE_STATE_KEY,
+      env
+    );
+    const stateAtStart = safeJsonParse(rawAtStart, null);
+
+    if (
+      stateAtStart &&
+      typeof stateAtStart === 'object' &&
+      stateAtStart.episode
+    ) {
+      resumeEpisode = String(stateAtStart.episode);
+    }
+  } catch (error) {
+    console.error(
+      '读取待恢复的熔断轮次失败：',
+      error?.message || error
+    );
+  }
+
   // 先翻牌、翻完才清状态：分批翻（单批上限见
   // flipPauseCards），直到剩余为 0 才走 stopPause 清行。
   // 没翻完不清行：某批一张都没翻动（多半是持续性
@@ -20452,7 +21503,7 @@ async function performResume(
           }
 
           if (rest.remaining <= 0) {
-            await stopPause(env);
+            await stopPause(env, resumeEpisode);
           }
         } catch (error) {
           console.error(
@@ -20477,7 +21528,7 @@ async function performResume(
   }
 
   if (flip.remaining <= 0) {
-    await stopPause(env);
+    await stopPause(env, resumeEpisode);
 
     await notifyPrimaryAdmins(
       env,
@@ -20495,7 +21546,9 @@ async function performResume(
     if (
       state &&
       typeof state === 'object' &&
-      state.episode
+      state.episode &&
+      (!resumeEpisode ||
+        String(state.episode) === resumeEpisode)
     ) {
       // 先占掉到期通知名额：后续读路径续翻时不会再
       // 补发一条「已自动恢复」的重复通知。
@@ -20507,8 +21560,13 @@ async function performResume(
 
       state.until = Date.now() - 1;
 
-      await setConfig(
+      // 按读到的原值 CAS 写回：期间状态行被新一轮
+      // 熔断覆盖（episode 已变，守卫先拦）或被其他
+      // 路径改写时放弃本次改写，绝不把新熔断改回
+      // 本轮的过期形状（第十轮审计）。
+      await dbConfigPutIfValue(
         PAUSE_STATE_KEY,
+        raw,
         JSON.stringify(state),
         env
       );
@@ -20988,21 +22046,24 @@ async function processWebhookUpdate(
       return 500;
     }
 
-    // 限流延迟不算处理失败：释放占位（attempts 不累计）、
+    // 限流不算处理失败：释放占位（attempts 不累计）、
     // 回 500 等 Telegram 在限流窗口后重推，并给主管理员
     // 一条节流提示。再久的限流也不会把消息误判成死信。
-    if (error?.name === 'RateLimitDeferred') {
-      try {
-        await claimUpdateRelease(
-          update.update_id,
-          env
-        );
-      } catch (bookkeepingError) {
-        console.error(
-          '释放限流占位失败：',
-          bookkeepingError?.message || bookkeepingError
-        );
-      }
+    // 分流口径与全站瞬时判据对齐：不只认抛成
+    // RateLimitDeferred 的（retry_after > 15），请求内
+    // 重试耗尽的普通 429（小 retry_after）与不带
+    // retry_after 的 429 同属限流，一律释放不计次——
+    // 旧口径下它们会累计死信计数，限流过后本可成功
+    // 的消息被误判死信（第十轮审计）。
+    if (
+      error?.name === 'RateLimitDeferred' ||
+      Number(error?.errorCode || 0) === 429
+    ) {
+      await bookkeepingWithRetry(
+        '释放限流占位',
+        () => claimUpdateRelease(update.update_id, env),
+        ctx
+      );
 
       await alertAdminsRateLimited(env);
 
@@ -21011,18 +22072,18 @@ async function processWebhookUpdate(
 
     let dead = false;
 
-    try {
-      dead = await claimUpdateFailed(
-        update.update_id,
-        env,
-        claim.attempts
-      );
-    } catch (bookkeepingError) {
-      console.error(
-        '记录 Update 失败次数失败：',
-        bookkeepingError?.message || bookkeepingError
-      );
-    }
+    const deadResult = await bookkeepingWithRetry(
+      '记录 Update 失败次数',
+      () =>
+        claimUpdateFailed(
+          update.update_id,
+          env,
+          claim.attempts
+        ),
+      ctx
+    );
+
+    dead = deadResult === true;
 
     if (dead) {
       const brief =
@@ -21162,6 +22223,26 @@ async function handleUpdate(
 /*                         Cloudflare Worker 入口                               */
 /* -------------------------------------------------------------------------- */
 
+// 数据接口统一禁缓存（第十轮审计）：四个 GET 数
+// 据接口（访客列表 / 数据统计 / 管理台配置 / 审计
+// 日志）此前用裸 Response.json 应答、不带
+// Cache-Control，与三页的 no-store 口径不一致——
+// 带签名链接的敏感数据不该被浏览器或中间层缓存。
+// 在路由层统一给响应补头，覆盖各 handler 的全部
+// 返回路径（含错误应答）。
+async function withNoStore(responsePromise) {
+  const response = await responsePromise;
+  const headers = new Headers(response.headers);
+
+  headers.set('cache-control', 'no-store');
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -21188,6 +22269,11 @@ export default {
         }
       );
     }
+
+    // 请求级访客行缓存（见 dbUserGet）：浅拷贝一份
+    // env 并挂空 Map，本请求的全部处理（含 waitUntil
+    // 续跑）共用这份 env，缓存随请求结束自然释放。
+    env = { ...env, __userRowCache: new Map() };
 
     const requestUrl = new URL(request.url);
 
@@ -21246,20 +22332,14 @@ export default {
       request.method === 'GET' &&
       requestUrl.pathname === '/api/users'
     ) {
-      return handleUserListApi(
-        request,
-        env
-      );
+      return withNoStore(handleUserListApi(request, env));
     }
 
     if (
       request.method === 'GET' &&
       requestUrl.pathname === '/api/stats'
     ) {
-      return handleStatsApi(
-        request,
-        env
-      );
+      return withNoStore(handleStatsApi(request, env));
     }
 
     if (
@@ -21286,10 +22366,7 @@ export default {
       request.method === 'GET' &&
       requestUrl.pathname === '/api/config'
     ) {
-      return handleConfigApi(
-        request,
-        env
-      );
+      return withNoStore(handleConfigApi(request, env));
     }
 
     if (
@@ -21366,10 +22443,7 @@ export default {
       request.method === 'GET' &&
       requestUrl.pathname === '/api/audit'
     ) {
-      return handleAuditApi(
-        request,
-        env
-      );
+      return withNoStore(handleAuditApi(request, env));
     }
 
     if (request.method === 'GET') {
