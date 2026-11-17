@@ -14396,6 +14396,34 @@ async function countUsersWhere(env, extraSql, binds) {
   return countRows(env, sql, allBinds);
 }
 
+// 待用通行证数：pass:<uid> 记录还在即未消费（消费 /
+// 作废都会删键）；记录值 {n, e}，e 为毫秒到期时刻，
+// 未过期才算。过期记录要等访客下次互动才清扫，统计
+// 这里按 e 现场过滤，口径与列表页的证状态徽标一致。
+async function countOutstandingPasses(env) {
+  const result = await env.TG_BOT_DB.prepare(
+    'SELECT key, value FROM config WHERE key LIKE ?'
+  )
+    .bind('pass:%')
+    .all();
+
+  let n = 0;
+
+  for (const row of result?.results || []) {
+    try {
+      const rec = JSON.parse(row.value);
+
+      if (rec && rec.n && Number(rec.e) > Date.now()) {
+        n += 1;
+      }
+    } catch {
+      /* 坏记录按无证处理 */
+    }
+  }
+
+  return n;
+}
+
 async function handleStatsApi(request, env) {
   const adminId =
     await panelQueryAdminId(request, env);
@@ -14428,12 +14456,18 @@ async function handleStatsApi(request, env) {
     fresh,
     blocked,
     botBlocked,
+    trusted,
+    withTopic,
+    passes,
     new1,
     new7,
     new30,
     act1,
     act7,
     act30,
+    actNew1,
+    actNew7,
+    actNew30,
     in1,
     in7,
     in30,
@@ -14464,6 +14498,13 @@ async function handleStatsApi(request, env) {
       'WHERE key LIKE ? AND value = ?',
       ['botblocked:%', '1']
     ),
+    countUsersWhere(env, 'is_trusted = 1', []),
+    countUsersWhere(
+      env,
+      "topic_id IS NOT NULL AND topic_id != ''",
+      []
+    ),
+    countOutstandingPasses(env),
     countUsersWhere(
       env,
       'created_at >= ?',
@@ -14493,6 +14534,21 @@ async function handleStatsApi(request, env) {
       env,
       'updated_at >= ?',
       [since30]
+    ),
+    countUsersWhere(
+      env,
+      'updated_at >= ? AND created_at >= ?',
+      [since1, since1]
+    ),
+    countUsersWhere(
+      env,
+      'updated_at >= ? AND created_at >= ?',
+      [since7, since7]
+    ),
+    countUsersWhere(
+      env,
+      'updated_at >= ? AND created_at >= ?',
+      [since30, since30]
     ),
     countRows(
       env,
@@ -14522,10 +14578,23 @@ async function handleStatsApi(request, env) {
       pending,
       fresh,
       blocked,
-      botBlocked
+      botBlocked,
+      trusted,
+      withTopic,
+      passes
     },
     growth: { d1: new1, d7: new7, d30: new30 },
     active: { d1: act1, d7: act7, d30: act30 },
+    activeNew: {
+      d1: actNew1,
+      d7: actNew7,
+      d30: actNew30
+    },
+    activeOld: {
+      d1: act1 - actNew1,
+      d7: act7 - actNew7,
+      d30: act30 - actNew30
+    },
     messages: {
       in: { d1: in1, d7: in7, d30: in30 },
       out: { d1: out1, d7: out7, d30: out30 }
@@ -14713,7 +14782,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。这组按钮可以长按拖动摆放：按住任意一颗拖动、松手吸附到屏幕左侧或右侧，觉得挡住列表就把它挪开；展开搜索时它回到输入法上方（靠左时搜索框改为向右展开），收起回到放它的位置，拖回右下角原位会恢复自动避让分页条；关掉页面再打开则回到原位。页眉下方的「全部 / 已验证 / 待验证 / 已屏蔽 / 被屏蔽」是快速筛选（「被屏蔽」列的是拉黑了机器人的人）；筛选下方的一行按钮管排序——左半选按最后活跃还是首次来访（第一次与机器人互动的时间）排，右半选倒序还是正序。在列表上左右滑动，也能在五个筛选和「数据统计」之间切换。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
       <li><b class=\"k\">位置会记住：</b>每个筛选与搜索组合下翻到的页码和滚动位置都会被记住，切去别处再切回来，会自动回到离开时的位置（内容是重新拉取的新数据）；手动更换排序会清掉全部位置记忆，各视图都从第一页重新开始。</li>
       <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词封禁对他同样无效）和「🚫 屏蔽 / ✅ 解封」（与 /ban、/unban 同一套封禁：屏蔽后他再发来的新消息会被立即删掉；解封时他会收到一条解除通知）；设为信任的人行上会挂「🤝 已信任」徽标，屏蔽中的人挂「已屏蔽」徽标。</li>
-      <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证 / 未开始人数，已封禁和被屏蔽人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
+      <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证 / 未开始人数，已信任、建有专属话题、已封禁和被屏蔽人数，还有没用掉的通行证数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃（活跃还分新客和老客）、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
     </ul>
   </section>
 
@@ -17780,6 +17849,7 @@ function buildUserListPage(pageCtx = {}) {
   .sgroup { color: #9db2c5; font-size: 12px; margin: 10px 0 6px; }
   .srow { display: grid; grid-template-columns: repeat(auto-fit, minmax(94px, 1fr)); gap: 8px; }
   .stile { background: #17212b; border-radius: 10px; padding: 8px 10px; }
+  .ss { color: #5f7488; font-size: 11px; margin-top: 2px; }
   .sv { font-size: 19px; font-weight: 700; }
   .sl { color: #9db2c5; font-size: 11.5px; margin-top: 1px; }
   .snote { color: #5f7488; font-size: 11.5px; margin-top: 9px; line-height: 1.5; }
@@ -19294,7 +19364,7 @@ document.getElementById('tabList').onclick = function () { showTab('list'); };
 document.getElementById('tabStats').onclick = function () { showTab('stats'); };
 document.getElementById('toTop').onclick = function () { uScrollTop(); };
 
-function stile(v, l) {
+function stile(v, l, sub) {
   var d = document.createElement('div');
   d.className = 'stile';
   var a = document.createElement('div');
@@ -19305,6 +19375,12 @@ function stile(v, l) {
   b.textContent = l;
   d.appendChild(a);
   d.appendChild(b);
+  if (sub != null) {
+    var c = document.createElement('div');
+    c.className = 'ss';
+    c.textContent = sub;
+    d.appendChild(c);
+  }
   return d;
 }
 
@@ -19341,8 +19417,11 @@ fetch('/api/stats?' + qs.toString())
       stile(d.users.verified, '已验证'),
       stile(d.users.pending, '待验证'),
       stile(d.users.fresh, '未开始'),
+      stile(d.users.trusted, '已信任'),
+      stile(d.users.withTopic, '有话题'),
       stile(d.users.blocked, '已封禁'),
-      stile(d.users.botBlocked, '被屏蔽')
+      stile(d.users.botBlocked, '被屏蔽'),
+      stile(d.users.passes, '待用通行证')
     ]));
     box.appendChild(sgroup('新增访客', [
       stile(d.growth.d1, '过去 24 小时'),
@@ -19350,9 +19429,9 @@ fetch('/api/stats?' + qs.toString())
       stile(d.growth.d30, '过去 30 天')
     ]));
     box.appendChild(sgroup('活跃访客', [
-      stile(d.active.d1, '过去 24 小时'),
-      stile(d.active.d7, '过去 7 天'),
-      stile(d.active.d30, '过去 30 天')
+      stile(d.active.d1, '过去 24 小时', '新 ' + d.activeNew.d1 + ' · 老 ' + d.activeOld.d1),
+      stile(d.active.d7, '过去 7 天', '新 ' + d.activeNew.d7 + ' · 老 ' + d.activeOld.d7),
+      stile(d.active.d30, '过去 30 天', '新 ' + d.activeNew.d30 + ' · 老 ' + d.activeOld.d30)
     ]));
     box.appendChild(sgroup('消息量（访客 / 管理员回复）', [
       stile(d.messages.in.d1 + ' / ' + d.messages.out.d1, '过去 24 小时'),
