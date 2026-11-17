@@ -108,7 +108,7 @@ const DEFAULTS = {
   menu_btn_guide: 'true',
   menu_btn_updchk: 'true',
   menu_btn_pause: 'true',
-  userlist_sort: 'active',
+  userlist_sort: 'act_desc',
   userlist_page_size: '20',
   display_tz: 'Asia/Singapore',
 
@@ -12626,7 +12626,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.5.4';
+const BOT_VERSION = 'v1.5.5';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -13921,6 +13921,27 @@ async function backfillMissingUserInfo(env) {
   }
 }
 
+// 访客列表排序组合（两段式：字段 × 方向）的唯一口径：
+// 新枚举 act_desc / act_asc / fst_desc / fst_asc；旧三档
+// active / new / old 只在读时映射（请求参数、存量配置、
+// 管理台回显三处共用本函数），写侧只存新枚举。无法识
+// 别的值返回 null，调用方各自落默认。
+function normalizeUserlistSort(v) {
+  const s = String(v || '');
+
+  if (
+    ['act_desc', 'act_asc', 'fst_desc', 'fst_asc'].includes(s)
+  ) {
+    return s;
+  }
+
+  return (
+    { active: 'act_desc', new: 'fst_desc', old: 'fst_asc' }[
+      s
+    ] || null
+  );
+}
+
 async function handleUserListApi(request, env) {
   const adminId =
     await panelQueryAdminId(request, env);
@@ -13938,23 +13959,20 @@ async function handleUserListApi(request, env) {
 
   const url = new URL(request.url);
 
-  // 排序三档与旧前端同口径：active 最近活跃 / new 最新
-  // 注册 / old 最早注册；请求未指定时用服务端存的默认档。
-  const sortConfig = await getConfig(
-    'userlist_sort',
-    env,
-    'active'
-  );
+  // 排序两段式四组合（字段 × 方向）：act 最后活跃 /
+  // fst 首次来访（首次建档时间，旧称「注册」），desc
+  // 倒序 / asc 正序。旧三档值在请求参数与存量配置两处
+  // 读时映射（见 normalizeUserlistSort），老链接与老设
+  // 置不失效；请求未指定时用服务端存的默认组合。
+  const sortConfig =
+    normalizeUserlistSort(
+      await getConfig('userlist_sort', env, 'act_desc')
+    ) || 'act_desc';
 
-  const sortParam = String(
-    url.searchParams.get('sort') || ''
-  );
-
-  const sort = ['active', 'new', 'old'].includes(sortParam)
-    ? sortParam
-    : ['active', 'new', 'old'].includes(sortConfig)
-      ? sortConfig
-      : 'active';
+  const sort =
+    normalizeUserlistSort(
+      String(url.searchParams.get('sort') || '')
+    ) || sortConfig;
 
   const pageSizeDefault = await clampedIntConfig(
     'userlist_page_size',
@@ -14037,9 +14055,9 @@ async function handleUserListApi(request, env) {
   // 行被跳过或重复（OFFSET 分页的老毛病）。排序档对不上
   // 或游标损坏时按第一页处理。
   const sortCol =
-    sort === 'active' ? 'updated_at' : 'created_at';
-  const sortDir = sort === 'old' ? 'ASC' : 'DESC';
-  const cmp = sort === 'old' ? '>' : '<';
+    sort.indexOf('fst') === 0 ? 'created_at' : 'updated_at';
+  const sortDir = sort.slice(-3) === 'asc' ? 'ASC' : 'DESC';
+  const cmp = sort.slice(-3) === 'asc' ? '>' : '<';
 
   let cursorSql = '';
   const cursorBinds = [];
@@ -14259,7 +14277,7 @@ async function handleUserListApi(request, env) {
     truncated: false,
     nextCursor,
     uiDefaults: {
-      sort: sortConfig,
+      sort: sort,
       pageSize: pageSizeDefault
     }
   });
@@ -14693,7 +14711,7 @@ function buildGuidePage(pageCtx = {}) {
     <h2>📋 访客列表与数据统计</h2>
     <ul>
       <li><b class=\"k\">两个标签页：</b>「访客列表」和「数据统计」，默认打开列表页，点顶部标签切换。</li>
-      <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。这组按钮可以长按拖动摆放：按住任意一颗拖动、松手吸附到屏幕左侧或右侧，觉得挡住列表就把它挪开；展开搜索时它回到输入法上方（靠左时搜索框改为向右展开），收起回到放它的位置，拖回右下角原位会恢复自动避让分页条；关掉页面再打开则回到原位。页眉下方的「全部 / 已验证 / 待验证 / 已屏蔽」是快速筛选；还能换排序顺序。在列表上左右滑动，也能在四个筛选和「数据统计」之间切换。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
+      <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。这组按钮可以长按拖动摆放：按住任意一颗拖动、松手吸附到屏幕左侧或右侧，觉得挡住列表就把它挪开；展开搜索时它回到输入法上方（靠左时搜索框改为向右展开），收起回到放它的位置，拖回右下角原位会恢复自动避让分页条；关掉页面再打开则回到原位。页眉下方的「全部 / 已验证 / 待验证 / 已屏蔽」是快速筛选；筛选下方的一行按钮管排序——左半选按最后活跃还是首次来访（第一次与机器人互动的时间）排，右半选倒序还是正序。在列表上左右滑动，也能在四个筛选和「数据统计」之间切换。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
       <li><b class=\"k\">位置会记住：</b>每个筛选与搜索组合下翻到的页码和滚动位置都会被记住，切去别处再切回来，会自动回到离开时的位置（内容是重新拉取的新数据）；手动更换排序会清掉全部位置记忆，各视图都从第一页重新开始。</li>
       <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词封禁对他同样无效）和「🚫 屏蔽 / ✅ 解封」（与 /ban、/unban 同一套封禁：屏蔽后他再发来的新消息会被立即删掉；解封时他会收到一条解除通知）；设为信任的人行上会挂「🤝 已信任」徽标，屏蔽中的人挂「已屏蔽」徽标。</li>
       <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
@@ -15068,9 +15086,10 @@ function buildPanelPage(pageCtx = {}) {
     <div class="hint">其余按钮关掉只是不再显示，对应功能仍可通过命令等方式使用（管理台按钮例外，见上方警示）。</div>
     <label>访客列表默认排序</label>
     <select id="s_sort">
-      <option value="active">按最近活跃</option>
-      <option value="new">按最新注册</option>
-      <option value="old">按最早注册</option>
+      <option value="act_desc">最后活跃 · 倒序</option>
+      <option value="act_asc">最后活跃 · 正序</option>
+      <option value="fst_desc">首次来访 · 倒序</option>
+      <option value="fst_asc">首次来访 · 正序</option>
     </select>
     <button class="save" data-k="userlist_sort" data-t="s_sort">保存</button>
     <label>访客列表每页条数（5～100）</label>
@@ -15424,7 +15443,7 @@ fetch('/api/config?' + qs.toString())
     setVal('m_guide', d.menu_buttons && d.menu_buttons.guide ? 'true' : 'false');
     setVal('m_updchk', d.menu_buttons && d.menu_buttons.updchk ? 'true' : 'false');
     setVal('m_pause', d.menu_buttons && d.menu_buttons.pause ? 'true' : 'false');
-    setVal('s_sort', d.userlist_sort || 'active');
+    setVal('s_sort', d.userlist_sort || 'act_desc');
     setVal('s_pagesize', d.userlist_page_size);
     setVal('s_tz', d.display_tz || 'Asia/Singapore');
     KW = d.keywords || [];
@@ -15796,7 +15815,9 @@ function validateScalarConfig(key, rawValue) {
 
   if (key === 'userlist_sort') {
     if (
-      !['active', 'new', 'old'].includes(raw)
+      !['act_desc', 'act_asc', 'fst_desc', 'fst_asc'].includes(
+        raw
+      )
     ) {
       return { error: '列表排序方式无效' };
     }
@@ -16140,7 +16161,9 @@ async function handleConfigApi(request, env) {
         (cfg('menu_btn_pause', 'true')) === 'true'
     },
     userlist_sort:
-      cfg('userlist_sort', 'active'),
+      normalizeUserlistSort(
+        cfg('userlist_sort', 'act_desc')
+      ) || 'act_desc',
     userlist_page_size:
       clampShow('userlist_page_size', 20, 5, 100),
     display_tz:
@@ -17677,6 +17700,10 @@ function buildUserListPage(pageCtx = {}) {
   .chips { display: flex; gap: 8px; flex-wrap: nowrap; background: #0f141a; padding: 10px 12px 8px; flex: none; }
   .chip { flex: 1; padding: 8px 0; border-radius: 9px; border: 1px solid #2b3a47; background: transparent; color: #9db2c5; font-size: 14px; cursor: pointer; text-align: center; transition: background-color .2s ease, color .2s ease, border-color .2s ease; }
   .chip.on { background: #2b5278; color: #fff; border-color: #2b5278; }
+  .sortrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 14px 0 22px; }
+  .sortgrp { display: flex; gap: 8px; }
+  .sbtn { padding: 8px 14px; border-radius: 9px; border: 1px solid #2b3a47; background: transparent; color: #9db2c5; font-size: 14px; cursor: pointer; text-align: center; transition: background-color .2s ease, color .2s ease, border-color .2s ease; }
+  .sbtn.on { background: #2b5278; color: #fff; border-color: #2b5278; }
   .tabs { display: flex; gap: 8px; margin-top: 10px; }
   .tab { flex: 1; padding: 8px 0; border-radius: 9px; border: 1px solid #2b3a47; background: transparent; color: #9db2c5; font-size: 14px; cursor: pointer; transition: background-color .2s ease, color .2s ease, border-color .2s ease; }
   .tab.on { background: #2b5278; color: #fff; border-color: #2b5278; }
@@ -17786,11 +17813,16 @@ function buildUserListPage(pageCtx = {}) {
 <div id="uscroll">
 <main>
   <section id="paneList">
-  <select id="sort">
-    <option value="active">按最近活跃</option>
-    <option value="new">按最新注册</option>
-    <option value="old">按最早注册</option>
-  </select>
+  <div class="sortrow" id="sortrow">
+    <div class="sortgrp">
+      <button class="sbtn on" data-sf="act">最后活跃</button>
+      <button class="sbtn" data-sf="fst">首次来访</button>
+    </div>
+    <div class="sortgrp">
+      <button class="sbtn on" data-sd="desc">倒序</button>
+      <button class="sbtn" data-sd="asc">正序</button>
+    </div>
+  </div>
   <div class="listclip"><div id="list"><div class="loadingbox"><div class="spinner"></div><div class="loadingtxt">加载中…</div></div></div></div>
   <div class="pager">
     <button id="prev">← 上一页</button>
@@ -17847,7 +17879,7 @@ function fmt(ts) {
 // 连点筛选/搜索时旧响应若后到，序号对不上直接丢弃（不渲染、
 // 不动加载块），最新请求负责收尾。删空整页自动退页的递归取
 // 数保持加载块，最终渲染后才收尾。
-// 位置回拉：posMem 以「筛选|搜索词」为键记每个视图的游标栈、
+// 位置回拉：posMem 以「筛选|搜索词|排序组合」为键记游标栈、
 // 当前游标与滚动位，只存页面内存；render 后 memSave 刷新当
 // 前键的游标位置，滚动监听与切换键前的 memLeave 维护滚动位。
 // 切回有记忆的视图时 enterKey 按记忆游标重新取新数据，渲染
@@ -17871,7 +17903,27 @@ var progScrollUntil = 0;
 // 本页一切滚动读/写（posMem、回顶判定、拖动监
 // 视、平滑回顶、位置回拉）自此只认 uScr.scrollTop。
 var uScr = document.getElementById('uscroll');
-function posKey() { return filt + '|' + query; }
+// 排序两段式（字段 × 方向）：sortMode 恒为四组合之一
+// （act_desc / act_asc / fst_desc / fst_asc）。服务端回的
+// uiDefaults 已是新枚举，sortNorm 再兼容旧三档值；按钮
+// 选中态由 sortChrome 按当前组合重绘，翻页/切视图不重设。
+var SORT_MODES = ['act_desc', 'act_asc', 'fst_desc', 'fst_asc'];
+function sortNorm(v) {
+  if (SORT_MODES.indexOf(v) >= 0) return v;
+  return { active: 'act_desc', new: 'fst_desc', old: 'fst_asc' }[v] || 'act_desc';
+}
+function sortField() { return sortMode.indexOf('fst') === 0 ? 'fst' : 'act'; }
+function sortDirn() { return sortMode.slice(-3) === 'asc' ? 'asc' : 'desc'; }
+function sortChrome() {
+  var bs = document.querySelectorAll('#sortrow .sbtn');
+  for (var i = 0; i < bs.length; i++) {
+    var b = bs[i], on = false;
+    if (b.dataset.sf) on = b.dataset.sf === sortField();
+    if (b.dataset.sd) on = b.dataset.sd === sortDirn();
+    b.className = 'sbtn' + (on ? ' on' : '');
+  }
+}
+function posKey() { return filt + '|' + query + '|' + sortMode; }
 function memSave() {
   var m = posMem[posKey()] || (posMem[posKey()] = { stack: [], cursor: '', scrollY: 0 });
   m.stack = cursorStack.slice();
@@ -17999,8 +18051,8 @@ function loadUsers() {
         if (d.uiDefaults) {
           if (d.uiDefaults.pageSize) PAGE = d.uiDefaults.pageSize;
           if (d.uiDefaults.sort) {
-            sortMode = d.uiDefaults.sort;
-            document.getElementById('sort').value = sortMode;
+            sortMode = sortNorm(d.uiDefaults.sort);
+            sortChrome();
           }
         }
       }
@@ -19142,10 +19194,18 @@ function chipSwitch(nf) {
   slideIn(document.getElementById('list'), dir);
   if (!had) uScrollTop();
 }
-document.getElementById('sort').addEventListener('change', function () {
-  sortMode = document.getElementById('sort').value;
+document.getElementById('sortrow').addEventListener('click', function (e) {
+  if (!swipeSelf && Date.now() - swipeAt < 350) return;
+  var b = e.target;
+  if (!b || !b.dataset || (!b.dataset.sf && !b.dataset.sd)) return;
+  var nm = b.dataset.sf
+    ? b.dataset.sf + '_' + sortDirn()
+    : sortField() + '_' + b.dataset.sd;
+  if (nm === sortMode) return;
+  sortMode = nm;
+  sortChrome();
   // 排序变了，各视图记住的旧位置全部作废。boot 时 uiDefaults
-  // 回填 select 的值是程序赋值、不触发 change，不会误清。
+  // 回填组合是程序赋值、不经点击路径，不会误清。
   posMem = {};
   pendingScrollY = null;
   resetAndLoad();
