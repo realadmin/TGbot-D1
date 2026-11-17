@@ -17694,13 +17694,13 @@ function buildUserListPage(pageCtx = {}) {
 <style>
   body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 0; background: #0f141a; color: #e8edf2; height: 100%; overflow: hidden; display: flex; flex-direction: column; }
   html { height: 100%; overflow-x: hidden; overflow-x: clip; }
-  header { background: #17212b; padding: 12px 14px; flex: none; }
+  header { background: #17212b; padding: 12px 14px 4px; flex: none; }
   h1 { font-size: 17px; margin: 0 0 10px; }
   #pgsel { -webkit-appearance: none; appearance: none; margin-top: 0; padding: 7px 30px 7px 14px; border-radius: 8px; border: 1px solid #2b3a47; background-color: #17212b; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%239db2c5' stroke-width='1.8' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; color: #e8edf2; font-size: 13px; cursor: pointer; }
-  .chips { display: flex; gap: 8px; flex-wrap: nowrap; background: #0f141a; padding: 10px 12px 8px; flex: none; }
+  .chips { display: flex; gap: 8px; flex-wrap: nowrap; background: #17212b; padding: 4px 12px 8px; flex: none; }
   .chip { flex: 1; padding: 8px 0; border-radius: 9px; border: 1px solid #2b3a47; background: transparent; color: #9db2c5; font-size: 14px; cursor: pointer; text-align: center; transition: background-color .2s ease, color .2s ease, border-color .2s ease; }
   .chip.on { background: #2b5278; color: #fff; border-color: #2b5278; }
-  .sortrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 14px 0 22px; }
+  .sortrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 8px 0 8px; }
   .sortgrp { display: flex; gap: 8px; }
   .sbtn { padding: 8px 14px; border-radius: 9px; border: 1px solid #2b3a47; background: transparent; color: #9db2c5; font-size: 14px; cursor: pointer; text-align: center; transition: background-color .2s ease, color .2s ease, border-color .2s ease; }
   .sbtn.on { background: #2b5278; color: #fff; border-color: #2b5278; }
