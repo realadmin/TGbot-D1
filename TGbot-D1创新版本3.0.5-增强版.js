@@ -189,17 +189,13 @@ async function ensureBotCommands(env) {
   }
 
   // 命令菜单按身份分范围：访客在任何聊天里只看得到
-  // start/help；管理员命令只注册到主管理员本人的私聊；
+  // start；管理员命令只注册到主管理员本人的私聊；
   // 话题命令只注册到接待群。四份注册各自覆盖同范围的
   // 旧值，旧版混在一起的菜单不会残留。
   const publicCommands = [
     {
       command: 'start',
       description: '开始使用'
-    },
-    {
-      command: 'help',
-      description: '获取帮助'
     }
   ];
 
@@ -5796,7 +5792,7 @@ ${versionLine}${pauseLine}
   });
 
   // 主菜单只保留最新一对：删除推迟一轮——新发菜单送达后，
-  // 删掉的是上一条主菜单与触发它的那条 /start（或 /help）命令消息，
+  // 删掉的是上一条主菜单与触发它的那条 /start 命令消息，
   // 最新的一条命令消息始终留在聊天里，点一下就能重发刷新菜单
   // （网页链接 10 分钟过期，靠它快速拿新链接）；原地编辑形态只更新追踪。
   try {
@@ -9041,10 +9037,7 @@ async function handlePrivateMessage(
     }
   }
 
-  if (
-    commandText === '/start' ||
-    commandText === '/help'
-  ) {
+  if (commandText === '/start') {
     if (isPrimary) {
       await showMainMenu(chatId, env, 0, message.message_id || 0, origin);
       return;
@@ -9055,8 +9048,9 @@ async function handlePrivateMessage(
     // 时成为删不掉的尾巴。删除走 quiet 口径，失败不拦
     // 回复——失败时下方 startmsg 记账仍是兜底（验证成
     // 功/首条真实消息的清理点会再删一次）。管理员与协
-    // 管员不删（其 /start 是主菜单入口）；/help 不在此
-    // 列，与既有记账口径一致。被封禁访客在函数入口的
+    // 管员不删（其 /start 是主菜单入口）。/help 命令已
+    // 删除（-v162b8），不再是 /start 的别名：手打 /help
+    // 按普通消息路径处理，不进本分支。被封禁访客在函数入口的
     // 早检处已连消息一并删除、到不了这里。
     if (!isAdmin && commandText === '/start') {
       await quietDeleteMessage(
@@ -9156,8 +9150,8 @@ async function handlePrivateMessage(
       );
 
       await sendVerifySuccessReceipt(env, chatId);
-      // 与未验证分支同口径记下这条 /start（只记最新一条，
-      // /help 不记）：入口处已先删，这本账只作即时删除
+      // 与未验证分支同口径记下这条 /start（只记最新一条）：
+      // 入口处已先删，这本账只作即时删除
       // 失败时的兜底——已验证访客不会再有「验证成功收
       // 尾」来撤它，改由首条真实消息的回执清理点连带
       // 再删（见 clearTrackedStartMessage）。
@@ -9173,7 +9167,7 @@ async function handlePrivateMessage(
       // 记下这条 /start 的编号（只记最新一条）：入口处已
       // 先删，这本账只作即时删除失败时的兜底——验证成
       // 功时由 cleanupAfterVerified 再删一次。
-      // /help 同样会走 handleStart，但清理对象是 /start 本身，不记。
+      // /help 命令已删除（-v162b8），没有别名入口需要记账。
       if (commandText === '/start' && message.message_id) {
         await dbConfigPut(
           `startmsg:${userId}`,
@@ -15693,7 +15687,7 @@ function buildGuidePage(pageCtx = {}) {
 
   <section id=\"g-cmd\">
     <h2>⌨️ 命令速查</h2>
-    <p>命令菜单按身份显示：访客在私聊里点开菜单，只看得到 /start 与 /help；管理员命令只出现在主管理员自己的私聊菜单里，话题命令只出现在接待群里，访客看不到。</p>
+    <p>命令菜单按身份显示：访客在私聊里点开菜单，只看得到 /start；管理员命令只出现在主管理员自己的私聊菜单里，话题命令只出现在接待群里，访客看不到。</p>
     <p>下面这些命令都在<b class=\"k\">访客的话题里</b>发送（在私聊里发没用）：</p>
     <div class=\"cmd\"><code>/ban</code><div>封禁这位访客：他再发来的消息会被当场删掉、不再转进来，他会收到一条「⚠️ 您已被管理员封禁，无法继续发送消息。」的通知。</div></div>
     <div class=\"cmd\"><code>/unban</code><div>解除封禁：他会收到一条「✅ 管理员已解除对您的封禁，现在可以继续发送消息。」，之后恢复正常转发。</div></div>
@@ -15705,7 +15699,6 @@ function buildGuidePage(pageCtx = {}) {
     <div class=\"cmd\"><code>/note 内容</code><div>给这位访客存一条只有管理员看得到的备注（如「老客户，注意时效」）；只发 /note 是查看，/notedelete 是删除。备注除了显示在资料卡上，还会同步到话题名最前面（格式「备注｜名字 (ID)」），在群的话题列表里一眼就能看到。</div></div>
     <p style=\"margin-top:10px\">在<b class=\"k\">私聊</b>里用的命令：</p>
     <div class=\"cmd\"><code>/start</code><div>打开主菜单。</div></div>
-    <div class=\"cmd\"><code>/help</code><div>和 /start 一样，打开主菜单。</div></div>
     <div class=\"cmd\"><code>/testverify</code><div>拿一条验证页的测试链接，自己先体验一遍。</div></div>
     <div class=\"cmd\"><code>/version</code><div>查看当前版本，以及有没有新版本。</div></div>
     <div class=\"cmd\"><code>/panel</code><div>直接打开网页管理台（只有主管理员可用）。主菜单里关掉了管理台按钮时，也可以用这个命令临时打开。</div></div>
