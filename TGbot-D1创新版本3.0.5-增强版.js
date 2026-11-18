@@ -188,57 +188,98 @@ async function ensureBotCommands(env) {
     return botCommandsPromise;
   }
 
-  botCommandsPromise = Promise.all([
+  // 命令菜单按身份分范围：访客在任何聊天里只看得到
+  // start/help；管理员命令只注册到主管理员本人的私聊；
+  // 话题命令只注册到接待群。四份注册各自覆盖同范围的
+  // 旧值，旧版混在一起的菜单不会残留。
+  const publicCommands = [
+    {
+      command: 'start',
+      description: '开始使用'
+    },
+    {
+      command: 'help',
+      description: '获取帮助'
+    }
+  ];
+
+  const adminPrivateCommands = [
+    ...publicCommands,
+    {
+      command: 'testverify',
+      description: '打开 Turnstile 验证测试页'
+    },
+    {
+      command: 'version',
+      description: '查看版本与检查更新'
+    },
+    {
+      command: 'panel',
+      description: '打开网页管理台'
+    },
+    {
+      command: 'pause',
+      description: '服务熔断（可带分钟数）'
+    },
+    {
+      command: 'resume',
+      description: '恢复机器人服务'
+    }
+  ];
+
+  const topicCommands = [
+    {
+      command: 'ban',
+      description: '封禁当前话题访客'
+    },
+    {
+      command: 'unban',
+      description: '解除当前话题访客封禁'
+    },
+    {
+      command: 'delete',
+      description: '删除被回复的消息'
+    },
+    {
+      command: 'clear',
+      description: '清空与当前话题访客的全部聊天记录'
+    },
+    {
+      command: 'terminate',
+      description: '删除当前访客话题'
+    },
+    {
+      command: 'card',
+      description: '重新创建当前访客资料卡'
+    },
+    {
+      command: 'reverify',
+      description: '让当前话题访客重新验证'
+    },
+    {
+      command: 'note',
+      description: '给当前话题访客打备注（/note 内容）'
+    },
+    {
+      command: 'notedelete',
+      description: '删除当前话题访客的备注'
+    },
+    {
+      command: 'pause',
+      description: '服务熔断（/pause 分钟）'
+    },
+    {
+      command: 'resume',
+      description: '恢复机器人服务'
+    }
+  ];
+
+  const registrations = [
     telegramApi(
       env.BOT_TOKEN,
       'setMyCommands',
       {
-        commands: [
-          {
-            command: 'ban',
-            description: '封禁当前话题访客'
-          },
-          {
-            command: 'unban',
-            description: '解除当前话题访客封禁'
-          },
-          {
-            command: 'delete',
-            description: '删除被回复的消息'
-          },
-          {
-            command: 'clear',
-            description: '清空与当前话题访客的全部聊天记录'
-          },
-          {
-            command: 'terminate',
-            description: '删除当前访客话题'
-          },
-          {
-            command: 'card',
-            description: '重新创建当前访客资料卡'
-          },
-          {
-            command: 'reverify',
-            description: '让当前话题访客重新验证'
-          },
-          {
-            command: 'note',
-            description: '给当前话题访客打备注（/note 内容）'
-          },
-          {
-            command: 'notedelete',
-            description: '删除当前话题访客的备注'
-          },
-          {
-            command: 'pause',
-            description: '服务熔断（/pause 分钟）'
-          },
-          {
-            command: 'resume',
-            description: '恢复机器人服务'
-          }
-        ]
+        commands: publicCommands
       }
     ),
 
@@ -247,39 +288,48 @@ async function ensureBotCommands(env) {
       'setMyCommands',
       {
         scope: { type: 'all_private_chats' },
-        commands: [
-          {
-            command: 'start',
-            description: '开始使用'
-          },
-          {
-            command: 'help',
-            description: '获取帮助'
-          },
-          {
-            command: 'testverify',
-            description: '打开 Turnstile 验证测试页'
-          },
-          {
-            command: 'version',
-            description: '查看版本与检查更新'
-          },
-          {
-            command: 'panel',
-            description: '打开网页管理台'
-          },
-          {
-            command: 'pause',
-            description: '服务熔断（可带分钟数）'
-          },
-          {
-            command: 'resume',
-            description: '恢复机器人服务'
-          }
-        ]
+        commands: publicCommands
       }
     )
-  ]).catch((error) => {
+  ];
+
+  for (const adminId of getPrimaryAdminIds(env)) {
+    registrations.push(
+      telegramApi(
+        env.BOT_TOKEN,
+        'setMyCommands',
+        {
+          scope: {
+            type: 'chat',
+            chat_id: adminId
+          },
+          commands: adminPrivateCommands
+        }
+      )
+    );
+  }
+
+  // 接待群 id 缺失或不可解析时只跳过话题命令这一份，
+  // 不影响其余范围的注册。
+  const groupId = String(env.ADMIN_GROUP_ID || '').trim();
+
+  if (groupId && Number.isFinite(Number(groupId))) {
+    registrations.push(
+      telegramApi(
+        env.BOT_TOKEN,
+        'setMyCommands',
+        {
+          scope: {
+            type: 'chat',
+            chat_id: groupId
+          },
+          commands: topicCommands
+        }
+      )
+    );
+  }
+
+  botCommandsPromise = Promise.all(registrations).catch((error) => {
     botCommandsPromise = null;
 
     console.error(
@@ -15643,6 +15693,7 @@ function buildGuidePage(pageCtx = {}) {
 
   <section id=\"g-cmd\">
     <h2>⌨️ 命令速查</h2>
+    <p>命令菜单按身份显示：访客在私聊里点开菜单，只看得到 /start 与 /help；管理员命令只出现在主管理员自己的私聊菜单里，话题命令只出现在接待群里，访客看不到。</p>
     <p>下面这些命令都在<b class=\"k\">访客的话题里</b>发送（在私聊里发没用）：</p>
     <div class=\"cmd\"><code>/ban</code><div>封禁这位访客：他再发来的消息会被当场删掉、不再转进来，他会收到一条「⚠️ 您已被管理员封禁，无法继续发送消息。」的通知。</div></div>
     <div class=\"cmd\"><code>/unban</code><div>解除封禁：他会收到一条「✅ 管理员已解除对您的封禁，现在可以继续发送消息。」，之后恢复正常转发。</div></div>
@@ -15841,7 +15892,7 @@ function buildPanelPage(pageCtx = {}) {
   h2 { font-size: 15px; margin: 0 0 10px; }
   label { display: block; color: #9db2c5; font-size: 12.5px; margin: 12px 0 5px; }
   label:first-of-type { margin-top: 2px; }
-  textarea, input[type=text], input[type=number], select { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px; border: 1px solid #2b3a47; background: #0f141a; color: #e8edf2; font-size: 15px; }
+  textarea, input[type=text], input[type=number], select { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px; border: 1px solid #2b3a47; background: #0f141a; color: #e8edf2; font-size: 16px; }
   textarea { resize: vertical; line-height: 1.5; }
   .hint { color: #5f7488; font-size: 12px; margin-top: 5px; line-height: 1.5; }
   .save { margin-top: 8px; padding: 7px 18px; border-radius: 8px; border: 0; background: #2b5278; color: #fff; font-size: 14px; cursor: pointer; }
@@ -18964,7 +19015,7 @@ function buildUserListPage(pageCtx = {}) {
   html { height: 100%; overflow-x: hidden; overflow-x: clip; }
   header { background: #17212b; padding: 12px 14px 4px; flex: none; }
   h1 { font-size: 17px; margin: 0 0 10px; }
-  #pgsel { -webkit-appearance: none; appearance: none; margin-top: 0; padding: 7px 30px 7px 14px; border-radius: 8px; border: 1px solid #2b3a47; background-color: #17212b; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%239db2c5' stroke-width='1.8' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; color: #e8edf2; font-size: 13px; cursor: pointer; }
+  #pgsel { -webkit-appearance: none; appearance: none; margin-top: 0; padding: 7px 30px 7px 14px; border-radius: 8px; border: 1px solid #2b3a47; background-color: #17212b; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%239db2c5' stroke-width='1.8' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; color: #e8edf2; font-size: 16px; cursor: pointer; }
   .chips { display: flex; gap: 8px; flex-wrap: nowrap; background: #17212b; padding: 4px 12px 8px; flex: none; }
   .chip { flex: 1; padding: 8px 0; border-radius: 9px; border: 1px solid #2b3a47; background: transparent; color: #9db2c5; font-size: 14px; cursor: pointer; text-align: center; transition: background-color .2s ease, color .2s ease, border-color .2s ease; }
   .chip.on { background: #2b5278; color: #fff; border-color: #2b5278; }
@@ -19005,7 +19056,7 @@ function buildUserListPage(pageCtx = {}) {
   .ntb { background: #2b3a47; color: #e8edf2; }
   .ne { margin-top: 9px; display: none; }
   .ne.open { display: block; }
-  .ne textarea { width: 100%; box-sizing: border-box; min-height: 62px; padding: 8px 10px; border-radius: 8px; border: 1px solid #2b3a47; background: #0f141a; color: #e8edf2; font-size: 14px; }
+  .ne textarea { width: 100%; box-sizing: border-box; min-height: 62px; padding: 8px 10px; border-radius: 8px; border: 1px solid #2b3a47; background: #0f141a; color: #e8edf2; font-size: 16px; }
   .ne .row { display: flex; gap: 8px; margin-top: 7px; }
   .ne button { padding: 6px 13px; border-radius: 8px; border: 0; font-size: 13.5px; cursor: pointer; }
   .ne .c { background: #2b3a47; color: #e8edf2; }
