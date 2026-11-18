@@ -19036,6 +19036,7 @@ function buildUserListPage(pageCtx = {}) {
   .ops button, .cf button { height: 42px; padding: 6px 13px; border-radius: 8px; border: 0; font-size: 13.5px; white-space: nowrap; cursor: pointer; }
   .cf button { flex: 0 0 auto; }
   .ops button { flex: 1 1 30%; display: flex; align-items: center; justify-content: center; gap: 5px; padding: 6px 4px; }
+  @media (min-width: 640px) { .ops button { flex: 0 0 auto; padding: 6px 16px; } }
   .rst { background: #2b5278; color: #fff; }
   .ric { font-size: 17px; line-height: 1.1; }
   .del { background: #5c2222; color: #ffb4b4; }
