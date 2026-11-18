@@ -12435,6 +12435,17 @@ async function handleCallbackQuery(
     return;
   }
 
+  if (data.startsWith('selfupd:')) {
+    await handleSelfUpdateCallback(
+      callbackQuery,
+      env,
+      origin,
+      ctx
+    );
+
+    return;
+  }
+
   if (data.startsWith('updchk:')) {
     await handleUpdateCheckCallback(
       callbackQuery,
@@ -14117,6 +14128,7 @@ const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
 const UPDATE_FRESH_MS = 6 * 60 * 60 * 1000;
 const UPDATE_NEGATIVE_MS = 30 * 60 * 1000;
 const UPDATE_MANUAL_FLOOR_MS = 5 * 60 * 1000;
+const UPDATE_ASSET_NAME = 'TGbot-D1-3.0.5-enhanced.js';
 
 function compareVersions(a, b) {
   const parse = (value) =>
@@ -14155,6 +14167,134 @@ async function readUpdateCache(env) {
   }
 }
 
+// 自更新下载目标：发行版资产里的独立 .js 文件（部署包
+// zip 不处理）；候选优先含 enhanced 的，其次任意 .js。
+// 没有可用资产时返回 null（自更新按钮不出现）。
+function pickReleaseAsset(assets) {
+  if (!Array.isArray(assets)) {
+    return null;
+  }
+
+  const jsAssets = assets.filter(
+    (a) =>
+      a &&
+      String(a.name || '')
+        .toLowerCase()
+        .endsWith('.js') &&
+      a.url
+  );
+
+  if (!jsAssets.length) {
+    return null;
+  }
+
+  const chosen =
+    jsAssets.find((a) =>
+      String(a.name)
+        .toLowerCase()
+        .includes('enhanced')
+    ) || jsAssets[0];
+
+  return {
+    name: String(chosen.name),
+    url: String(chosen.url),
+    size: Number(chosen.size) || 0
+  };
+}
+
+// 版本发现第一顺位：网页跳转。未鉴权 GitHub API 按出口
+// IP 限流，Workers 共享出口常年被拒（2026-11-16 起检查
+// 连续失败、卡上一直是旧缓存）；github.com 的
+// /releases/latest 会 302 到最新版的 tag 页，不受该限
+// 流影响。发行名跳转里没有，用 tag 顶替；资产指向该
+// tag 的直链下载地址。
+async function fetchLatestReleaseViaWeb() {
+  const response = await fetch(
+    `https://github.com/${UPDATE_REPO}/releases/latest`,
+    {
+      redirect: 'manual',
+      headers: {
+        'User-Agent': 'tgbotd1-update-check'
+      },
+      signal: AbortSignal.timeout(8000)
+    }
+  );
+
+  const location =
+    response.headers?.get?.('location') || '';
+
+  const match = location.match(
+    /\/releases\/tag\/([^/?#]+)/
+  );
+
+  if (!match) {
+    throw new Error(
+      `GitHub 网页跳转异常（HTTP ${response.status}）`
+    );
+  }
+
+  let tag = match[1];
+
+  try {
+    tag = decodeURIComponent(tag);
+  } catch (_) {
+    // 解码失败就用原样
+  }
+
+  return {
+    tag,
+    url:
+      `https://github.com/${UPDATE_REPO}` +
+      `/releases/tag/${tag}`,
+    name: tag,
+    asset: {
+      name: UPDATE_ASSET_NAME,
+      url:
+        `https://github.com/${UPDATE_REPO}` +
+        `/releases/download/${tag}/${UPDATE_ASSET_NAME}`,
+      size: 0
+    }
+  };
+}
+
+// 两路发现：先网页跳转，失败回退 GitHub API；两路都
+// 失败时抛出 API 一路的错误（原因通常更具体）。
+async function fetchLatestReleaseAny() {
+  try {
+    return await fetchLatestReleaseViaWeb();
+  } catch (webError) {
+    return fetchLatestRelease();
+  }
+}
+
+// 检查失败原因的短句（写进缓存并上卡）：只留类别，
+// 不把整段错误信息塞进卡片。
+function updateErrorShort(error) {
+  const message = String(
+    error?.message || error || ''
+  );
+
+  const status = message.match(/GitHub API (\d{3})/);
+
+  if (status) {
+    return `GitHub 返回 ${status[1]}`;
+  }
+
+  if (
+    error?.name === 'TimeoutError' ||
+    error?.name === 'AbortError' ||
+    /timeout|timed out/i.test(message)
+  ) {
+    return '请求超时';
+  }
+
+  if (message.includes('GitHub 网页跳转异常')) {
+    return 'GitHub 网页异常';
+  }
+
+  return '网络错误';
+}
+
 async function fetchLatestRelease() {
   const response = await fetch(
     `https://api.github.com/repos/${UPDATE_REPO}/releases/latest`,
@@ -14186,7 +14326,8 @@ async function fetchLatestRelease() {
     url: rawUrl.startsWith('https://github.com/')
       ? rawUrl
       : `https://github.com/${UPDATE_REPO}/releases`,
-    name: String(data.name || data.tag_name)
+    name: String(data.name || data.tag_name),
+    asset: pickReleaseAsset(data.assets)
   };
 }
 
@@ -14209,12 +14350,13 @@ async function checkForUpdates(env, force = false) {
   let next;
 
   try {
-    const release = await fetchLatestRelease();
+    const release = await fetchLatestReleaseAny();
 
     next = {
       tag: release.tag,
       url: release.url,
       name: release.name,
+      asset: release.asset,
       checkedAt: now,
       lastAttempt: now,
       lastOk: true
@@ -14239,9 +14381,11 @@ async function checkForUpdates(env, force = false) {
       tag: cache?.tag || null,
       url: cache?.url || null,
       name: cache?.name || null,
+      asset: cache?.asset || null,
       checkedAt: cache?.checkedAt || 0,
       lastAttempt: now,
-      lastOk: false
+      lastOk: false,
+      lastError: updateErrorShort(error)
     };
   }
 
@@ -14343,10 +14487,14 @@ function describeUpdateState(cache, displayTz) {
   }
 
   if (!cache.lastOk) {
+    const reason = cache.lastError
+      ? `（${cache.lastError}）`
+      : '';
+
     return {
       status: 'stale',
       line:
-        `最新版本：${cache.tag}（已是最新，上次成功检查：${timeText}；最近一次检查失败，显示上次结果）`
+        `最新版本：${cache.tag}（已是最新，上次成功检查：${timeText}；最近一次检查失败${reason}，显示上次结果）`
     };
   }
 
@@ -14522,6 +14670,8 @@ async function handleUpdateCheckCallback(
   const messageId =
     callbackQuery.message.message_id;
 
+  await maybeFinalizeSelfUpdate(env);
+
   const before = await readUpdateCache(env);
 
   const state = await checkForUpdates(
@@ -14557,6 +14707,12 @@ async function handleUpdateCheckCallback(
       '手动检查最短间隔 5 分钟。）';
   }
 
+  const suState = await selfUpdateCardState(env, state);
+
+  if (suState.line) {
+    text += `\n${suState.line}`;
+  }
+
   const keyboard = [];
 
   if (
@@ -14567,6 +14723,24 @@ async function handleUpdateCheckCallback(
       {
         text: '⬇️ 打开 Release 页',
         url: state.url
+      }
+    ]);
+  }
+
+  if (suState.canUpdate) {
+    keyboard.push([
+      {
+        text: `🆙 一键更新到 ${state.tag}`,
+        callback_data: 'selfupd:ask'
+      }
+    ]);
+  }
+
+  if (suState.canRollback) {
+    keyboard.push([
+      {
+        text: '↩️ 回滚到上一版',
+        callback_data: 'selfupd:rbask'
       }
     ]);
   }
@@ -14593,6 +14767,1009 @@ async function handleUpdateCheckCallback(
       inline_keyboard: keyboard
     }
   });
+}
+
+/* -------------------------------------------------------------------------- */
+/*                         一键自更新（试用 -v170b1）                            */
+/* -------------------------------------------------------------------------- */
+
+// 机器人用自己的 Cloudflare 令牌把自己部署到 GitHub 最新
+// 发行版：检查更新卡上的按钮触发，部署语义与已验证的外
+// 部部署流程一致（新族 versions 接口建版本、secret 用
+// inherit 钉已部署版本、deployments 切 100%、回读核对
+// 后才算成功）。需要三个绑定：CF_ACCOUNT_ID 与
+// CF_WORKER_ID（plain）、CF_API_TOKEN（secret）；缺任
+// 一即视为未配置，按钮不出现、点到也只回未配置。
+const SELFUPDATE_PREV_KEY = 'selfupdate:prev';
+const SELFUPDATE_PENDING_KEY = 'selfupdate:pending';
+const SELFUPDATE_RUN_KEY = 'selfupdate:run';
+const SELFUPDATE_ASK_KEY = 'selfupdate:ask';
+const SELFUPDATE_SCRIPT_KEY = 'selfupdate:script';
+const SELFUPDATE_ASK_TTL_MS = 5 * 60 * 1000;
+const SELFUPDATE_PENDING_TTL_MS = 10 * 60 * 1000;
+const SELFUPDATE_MAX_CODE_BYTES = 2 * 1024 * 1024;
+const CF_API_BASE = 'https://api.cloudflare.com/client/v4';
+
+function selfUpdateConfigured(env) {
+  return Boolean(
+    String(env.CF_ACCOUNT_ID || '').trim() &&
+    String(env.CF_WORKER_ID || '').trim() &&
+    String(env.CF_API_TOKEN || '').trim()
+  );
+}
+
+async function cfApi(env, method, path, body) {
+  const response = await fetch(CF_API_BASE + path, {
+    method,
+    headers: {
+      Authorization: `Bearer ${env.CF_API_TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    body:
+      body === undefined
+        ? undefined
+        : JSON.stringify(body),
+    signal: AbortSignal.timeout(20000)
+  });
+
+  let data = null;
+
+  try {
+    data = await response.json();
+  } catch (_) {
+    data = null;
+  }
+
+  if (!response.ok || !data?.success) {
+    const detail =
+      Array.isArray(data?.errors) && data.errors.length
+        ? String(
+            data.errors[0].message ||
+              data.errors[0].code ||
+              ''
+          )
+        : '';
+
+    throw new Error(
+      `Cloudflare API ${response.status}` +
+        (detail ? `：${detail}` : '')
+    );
+  }
+
+  return data.result;
+}
+
+// 脚本名（deployments 与版本详情接口按名寻址）由
+// worker_id 单查得到，查到后按 worker_id 记账缓存；
+// worker_id 变了自动重查。
+async function selfUpdateScriptName(env) {
+  const wid = String(env.CF_WORKER_ID).trim();
+  const cached = await dbConfigGet(
+    SELFUPDATE_SCRIPT_KEY,
+    env
+  );
+
+  if (cached) {
+    try {
+      const parsed = JSON.parse(cached);
+
+      if (parsed?.wid === wid && parsed?.name) {
+        return String(parsed.name);
+      }
+    } catch (_) {
+      // 坏缓存按未缓存处理，下面重查覆盖。
+    }
+  }
+
+  const worker = await cfApi(
+    env,
+    'GET',
+    `/accounts/${env.CF_ACCOUNT_ID}/workers/workers/${wid}`
+  );
+
+  const name = String(worker?.name || '');
+
+  if (!name) {
+    throw new Error('无法从 Cloudflare 读到本 Worker 的脚本名');
+  }
+
+  await dbConfigPut(
+    SELFUPDATE_SCRIPT_KEY,
+    JSON.stringify({ wid, name }),
+    env
+  );
+
+  return name;
+}
+
+async function selfUpdateActiveVersion(env, scriptName) {
+  const result = await cfApi(
+    env,
+    'GET',
+    `/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${scriptName}/deployments`
+  );
+
+  const versions = result?.deployments?.[0]?.versions || [];
+
+  if (
+    versions.length !== 1 ||
+    Number(versions[0].percentage) !== 100
+  ) {
+    throw new Error('当前部署形态不是单一版本 100%，自更新中止');
+  }
+
+  return String(versions[0].version_id);
+}
+
+async function selfUpdateHealth(env) {
+  const name = await selfUpdateScriptName(env);
+  const activeId = await selfUpdateActiveVersion(env, name);
+
+  return { name, activeId };
+}
+
+async function selfUpdateVersionDetail(env, scriptName, versionId) {
+  const result = await cfApi(
+    env,
+    'GET',
+    `/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${scriptName}/versions/${versionId}`
+  );
+
+  const bindings = result?.resources?.bindings;
+  const compat =
+    result?.resources?.script_runtime?.compatibility_date;
+
+  if (!Array.isArray(bindings) || !compat) {
+    throw new Error('读不到已部署版本的绑定清单');
+  }
+
+  return { bindings, compat: String(compat) };
+}
+
+// 绑定照抄：明文与 D1 原样带过，每个 secret 一条
+// inherit 钉已部署版本（与外部部署流程同一语义）；
+// 出现没见过的绑定类型宁可中止，不猜。
+function selfUpdateBuildBindings(deployedBindings, deployedId) {
+  const out = [];
+
+  for (const b of deployedBindings) {
+    if (b.type === 'plain_text') {
+      out.push({
+        name: b.name,
+        type: 'plain_text',
+        text: String(b.text ?? '')
+      });
+    } else if (b.type === 'd1') {
+      out.push({
+        name: b.name,
+        type: 'd1',
+        database_id: String(b.database_id)
+      });
+    } else if (b.type === 'secret_text') {
+      out.push({
+        name: b.name,
+        type: 'inherit',
+        version_id: deployedId
+      });
+    } else {
+      throw new Error(
+        `部署版本含未知绑定类型 ${b.type}（${b.name}），自更新中止`
+      );
+    }
+  }
+
+  return out;
+}
+
+function base64EncodeUtf8(text) {
+  const bytes = new TextEncoder().encode(text);
+  let binary = '';
+  const CHUNK = 0x8000;
+
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(
+      null,
+      bytes.subarray(i, i + CHUNK)
+    );
+  }
+
+  return btoa(binary);
+}
+
+async function selfUpdateDownloadCode(asset) {
+  const response = await fetch(asset.url, {
+    headers: {
+      Accept: 'application/octet-stream',
+      'User-Agent': 'tgbotd1-self-update'
+    },
+    signal: AbortSignal.timeout(30000)
+  });
+
+  if (!response.ok) {
+    throw new Error(`下载发行版代码失败（HTTP ${response.status}）`);
+  }
+
+  const code = await response.text();
+  const bytes = new TextEncoder().encode(code).length;
+
+  if (bytes < 100 * 1024 || bytes > SELFUPDATE_MAX_CODE_BYTES) {
+    throw new Error(`发行版代码体积异常（${bytes} 字节），已中止`);
+  }
+
+  return code;
+}
+
+// 自更新下载：第一顺位走发行版直链（不经 GitHub
+// API，不受未鉴权 API 的 IP 限流影响）；直链失败才
+// 回退检查更新时经 API 发现的资产地址；缓存资产就
+// 是直链本身（版本经网页跳转发现）时，再现查一次
+// API 资产列表兜底。
+async function selfUpdateDownloadTargetCode(
+  cache,
+  targetTag
+) {
+  const directUrl =
+    `https://github.com/${UPDATE_REPO}` +
+    `/releases/download/${targetTag}/${UPDATE_ASSET_NAME}`;
+
+  let directError = null;
+
+  try {
+    return await selfUpdateDownloadCode({
+      name: UPDATE_ASSET_NAME,
+      url: directUrl
+    });
+  } catch (error) {
+    directError = error;
+  }
+
+  if (
+    cache?.asset?.url &&
+    cache.asset.url !== directUrl
+  ) {
+    return selfUpdateDownloadCode(cache.asset);
+  }
+
+  let release = null;
+
+  try {
+    release = await fetchLatestRelease();
+  } catch (_) {
+    release = null;
+  }
+
+  if (
+    !release ||
+    release.tag !== targetTag ||
+    !release.asset?.url
+  ) {
+    throw directError;
+  }
+
+  return selfUpdateDownloadCode(release.asset);
+}
+
+function selfUpdateCodeVersion(code) {
+  const m = String(code).match(
+    /const BOT_VERSION = '([^']+)'/
+  );
+
+  return m ? m[1] : null;
+}
+
+async function readSelfUpdatePending(env) {
+  const raw = await dbConfigGet(SELFUPDATE_PENDING_KEY, env);
+
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function clearSelfUpdateRun(env) {
+  await dbConfigDelete(SELFUPDATE_PENDING_KEY, env);
+  await dbConfigDelete(SELFUPDATE_RUN_KEY, env);
+  await dbConfigDelete(SELFUPDATE_ASK_KEY, env);
+}
+
+// 检查更新卡上的自更新行与按钮可用性：未配置只给一行
+// 说明；已配置做一次令牌只读自检（读本 Worker 的部署
+// 状态），成功才算就绪并按状态给更新/回滚按钮。
+async function selfUpdateCardState(env, cache) {
+  const out = { line: '', canUpdate: false, canRollback: false };
+
+  if (!selfUpdateConfigured(env)) {
+    out.line = '自更新：未配置';
+
+    return out;
+  }
+
+  let health = null;
+
+  try {
+    health = await selfUpdateHealth(env);
+  } catch (_) {
+    health = null;
+  }
+
+  if (!health) {
+    out.line = '自更新：令牌不可用';
+
+    return out;
+  }
+
+  out.line = '自更新：就绪';
+
+  if (
+    cache?.tag &&
+    cache.asset?.url &&
+    compareVersions(cache.tag, BOT_VERSION) > 0
+  ) {
+    out.canUpdate = true;
+  }
+
+  const prev = await dbConfigGet(SELFUPDATE_PREV_KEY, env);
+
+  if (prev && prev !== health.activeId) {
+    out.canRollback = true;
+  }
+
+  return out;
+}
+
+async function selfUpdateVerify(env, origin, scriptName, newVersionId, targetTag) {
+  const delays = [0, 800, 1500, 2500, 4000];
+  let versionOk = false;
+
+  for (const delay of delays) {
+    if (delay) {
+      await sleep(delay);
+    }
+
+    let activeOk = false;
+
+    try {
+      activeOk =
+        (await selfUpdateActiveVersion(env, scriptName)) ===
+        newVersionId;
+    } catch (_) {
+      // 回读失败不中断轮询，靠版本端点兜底判定。
+    }
+
+    try {
+      const res = await fetch(`${origin}/api/version`, {
+        signal: AbortSignal.timeout(8000)
+      });
+
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+
+        versionOk = data?.version === targetTag;
+      }
+    } catch (_) {
+      // 自访失败不中断轮询。
+    }
+
+    if (versionOk && activeOk) {
+      return true;
+    }
+  }
+
+  // 流量实际已由新版代码服务时以 /api/version 为准：
+  // deployments 回读在平台侧有已知延迟（外部部署多次
+  // 遇到误报），不能因回读滞后把健康的新版回滚掉。
+  return versionOk;
+}
+
+async function selfUpdateDeployTo(env, scriptName, versionId, message) {
+  await cfApi(
+    env,
+    'POST',
+    `/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${scriptName}/deployments`,
+    {
+      strategy: 'percentage',
+      versions: [{ version_id: versionId, percentage: 100 }],
+      annotations: { 'workers/message': message }
+    }
+  );
+}
+
+async function runSelfUpdate(env, origin, pending) {
+  const chatId = pending.chatId;
+  let messageId = pending.messageId;
+
+  const say = async (text, replyMarkup) => {
+    const id = await renderMenu(env, {
+      chatId,
+      messageId,
+      text,
+      reply_markup: replyMarkup
+    });
+
+    if (id) {
+      messageId = id;
+    }
+  };
+
+  const backKeyboard = {
+    inline_keyboard: [
+      [
+        {
+          text: '⬅️ 返回主菜单',
+          callback_data: 'menu:main'
+        }
+      ]
+    ]
+  };
+
+  let switched = false;
+
+  try {
+    await say('⏳ 正在下载并校验新版代码…');
+
+    const cache = await readUpdateCache(env);
+
+    if (!cache?.asset?.url || cache.tag !== pending.target) {
+      throw new Error('发行版信息已变化，请重新检查更新后再试');
+    }
+
+    const code = await selfUpdateDownloadTargetCode(
+      cache,
+      pending.target
+    );
+    const codeVersion = selfUpdateCodeVersion(code);
+
+    if (codeVersion !== pending.target) {
+      throw new Error(
+        `下载到的代码版本是 ${codeVersion || '未知'}，与目标 ${pending.target} 不一致，已中止`
+      );
+    }
+
+    const name = await selfUpdateScriptName(env);
+    const deployedId = await selfUpdateActiveVersion(env, name);
+    const detail = await selfUpdateVersionDetail(env, name, deployedId);
+    const bindings = selfUpdateBuildBindings(detail.bindings, deployedId);
+
+    await say('⏳ 正在部署新版本…');
+
+    // 先落 prev 与 pending 再切流量：进程中途被回收也
+    // 有据可查、可回滚（收尾兜底据此补结）。
+    await dbConfigPut(SELFUPDATE_PREV_KEY, deployedId, env);
+
+    pending.prevVersionId = deployedId;
+    pending.stage = 'deploying';
+
+    await dbConfigPut(
+      SELFUPDATE_PENDING_KEY,
+      JSON.stringify(pending),
+      env
+    );
+
+    const created = await cfApi(
+      env,
+      'POST',
+      `/accounts/${env.CF_ACCOUNT_ID}/workers/workers/${env.CF_WORKER_ID}/versions`,
+      {
+        main_module: 'worker.js',
+        modules: [
+          {
+            name: 'worker.js',
+            content_type: 'application/javascript+module',
+            content_base64: base64EncodeUtf8(code)
+          }
+        ],
+        bindings,
+        compatibility_date: detail.compat,
+        annotations: {
+          'workers/message': `self-update to ${pending.target}`
+        }
+      }
+    );
+
+    const newVersionId = String(created?.id || '');
+
+    if (!newVersionId) {
+      throw new Error('Cloudflare 未返回新版本编号');
+    }
+
+    const createdDetail = await selfUpdateVersionDetail(
+      env,
+      name,
+      newVersionId
+    );
+
+    const expect = {};
+    const got = {};
+
+    for (const b of detail.bindings) {
+      expect[b.name] = b.type;
+    }
+
+    for (const b of createdDetail.bindings) {
+      got[b.name] = b.type;
+    }
+
+    if (
+      JSON.stringify(Object.keys(expect).sort()) !==
+        JSON.stringify(Object.keys(got).sort()) ||
+      Object.keys(expect).some((k) => expect[k] !== got[k])
+    ) {
+      throw new Error('新版本绑定与当前部署不一致，已中止（未切换流量）');
+    }
+
+    pending.newVersionId = newVersionId;
+    pending.stage = 'verifying';
+
+    await dbConfigPut(
+      SELFUPDATE_PENDING_KEY,
+      JSON.stringify(pending),
+      env
+    );
+
+    await selfUpdateDeployTo(
+      env,
+      name,
+      newVersionId,
+      `self-update to ${pending.target}`
+    );
+
+    switched = true;
+
+    await say('⏳ 正在验证新版本…');
+
+    const verified = await selfUpdateVerify(
+      env,
+      origin,
+      name,
+      newVersionId,
+      pending.target
+    );
+
+    if (!verified) {
+      throw new Error('新版本验证未通过');
+    }
+
+    await clearSelfUpdateRun(env);
+
+    await writeAdminAudit(
+      env,
+      pending.adminId,
+      'self_update',
+      pending.target,
+      'ok',
+      `from ${BOT_VERSION}`
+    );
+
+    await say(`更新完成，当前版本：${pending.target}。`, backKeyboard);
+  } catch (error) {
+    console.error('自更新失败：', error?.message || error);
+
+    let text = `更新失败：${String(error?.message || error)}`;
+    let result = 'fail';
+
+    if (switched && pending.prevVersionId) {
+      let rolled = false;
+
+      try {
+        const name = await selfUpdateScriptName(env);
+
+        await selfUpdateDeployTo(
+          env,
+          name,
+          pending.prevVersionId,
+          'self-update auto rollback'
+        );
+
+        rolled =
+          (await selfUpdateActiveVersion(env, name).catch(
+            () => ''
+          )) === pending.prevVersionId;
+      } catch (_) {
+        rolled = false;
+      }
+
+      if (rolled) {
+        text += '\n已自动回滚到上一版。';
+        result = 'rolled_back';
+      } else {
+        text += '\n自动回滚也失败，请尽快手动处理。';
+        result = 'rollback_failed';
+      }
+    } else {
+      text += '\n当前版本未改变。';
+    }
+
+    await clearSelfUpdateRun(env).catch(() => {});
+
+    await writeAdminAudit(
+      env,
+      pending.adminId,
+      'self_update',
+      pending.target,
+      result,
+      String(error?.message || '').slice(0, 40)
+    );
+
+    await say(text, backKeyboard).catch(() => {});
+  }
+}
+
+async function runSelfRollback(env, pending) {
+  const chatId = pending.chatId;
+  let messageId = pending.messageId;
+
+  const say = async (text, replyMarkup) => {
+    const id = await renderMenu(env, {
+      chatId,
+      messageId,
+      text,
+      reply_markup: replyMarkup
+    });
+
+    if (id) {
+      messageId = id;
+    }
+  };
+
+  const backKeyboard = {
+    inline_keyboard: [
+      [
+        {
+          text: '⬅️ 返回主菜单',
+          callback_data: 'menu:main'
+        }
+      ]
+    ]
+  };
+
+  try {
+    await say('⏳ 正在回滚到上一版…');
+
+    const name = await selfUpdateScriptName(env);
+    const activeBefore = await selfUpdateActiveVersion(env, name);
+    const targetId = pending.prevVersionId;
+
+    if (!targetId || targetId === activeBefore) {
+      throw new Error('没有可回滚的上一版');
+    }
+
+    await selfUpdateDeployTo(
+      env,
+      name,
+      targetId,
+      'self-update rollback (manual)'
+    );
+
+    const activeAfter = await selfUpdateActiveVersion(
+      env,
+      name
+    ).catch(() => '');
+
+    if (activeAfter !== targetId) {
+      throw new Error('回滚后部署回读未确认');
+    }
+
+    // 把刚换下的版本存为新的 prev，卡片上的回滚钮
+    // 可以再切回去（往返）。
+    await dbConfigPut(SELFUPDATE_PREV_KEY, activeBefore, env);
+
+    await clearSelfUpdateRun(env);
+
+    await writeAdminAudit(
+      env,
+      pending.adminId,
+      'self_rollback',
+      targetId.slice(0, 8),
+      'ok',
+      `from ${activeBefore.slice(0, 8)}`
+    );
+
+    await say('回滚完成，已切回上一版。', backKeyboard);
+  } catch (error) {
+    console.error('自回滚失败：', error?.message || error);
+
+    await clearSelfUpdateRun(env).catch(() => {});
+
+    await writeAdminAudit(
+      env,
+      pending.adminId,
+      'self_rollback',
+      String(pending.prevVersionId || '').slice(0, 8),
+      'fail',
+      String(error?.message || '').slice(0, 40)
+    );
+
+    await say(
+      `回滚失败：${String(error?.message || error)}`,
+      backKeyboard
+    ).catch(() => {});
+  }
+}
+
+// 收尾兜底：pending 超期未结（执行进程中途被回收）时，
+// 在后续请求里按当时实际部署版本补结——只补记与通
+// 知，不再自动做任何切换。
+async function maybeFinalizeSelfUpdate(env) {
+  try {
+    const pending = await readSelfUpdatePending(env);
+
+    if (!pending || Number(pending.exp) > Date.now()) {
+      return;
+    }
+
+    let conclusion = '结果未确认';
+
+    try {
+      const name = await selfUpdateScriptName(env);
+      const active = await selfUpdateActiveVersion(env, name);
+
+      if (pending.newVersionId && active === pending.newVersionId) {
+        conclusion = '更新其实已经完成';
+      } else if (
+        pending.prevVersionId &&
+        active === pending.prevVersionId
+      ) {
+        conclusion = '未完成，当前仍在上一版';
+      }
+    } catch (_) {
+      // 读不到部署状态时按未确认补结。
+    }
+
+    await clearSelfUpdateRun(env);
+
+    await writeAdminAudit(
+      env,
+      pending.adminId || '',
+      pending.kind === 'rollback' ? 'self_rollback' : 'self_update',
+      pending.target ||
+        String(pending.prevVersionId || '').slice(0, 8),
+      'finalized',
+      conclusion
+    );
+
+    if (pending.chatId) {
+      await telegramApi(env.BOT_TOKEN, 'sendMessage', {
+        chat_id: pending.chatId,
+        text:
+          pending.kind === 'rollback'
+            ? `回滚状态补结：${conclusion}。`
+            : `更新状态补结：目标 ${pending.target || ''}，${conclusion}。`,
+        reply_markup: SYS_TAG_MARKUP
+      }).catch(() => {});
+    }
+  } catch (error) {
+    console.error(
+      '自更新收尾补结异常：',
+      error?.message || error
+    );
+  }
+}
+
+async function handleSelfUpdateCallback(callbackQuery, env, origin = '', ctx = null) {
+  const senderId = String(callbackQuery.from.id);
+  const callbackId = callbackQuery.id;
+  const chatId = String(
+    callbackQuery.message?.chat?.id || senderId
+  );
+  const messageId = callbackQuery.message?.message_id || 0;
+  const data = String(callbackQuery.data || '');
+
+  if (!isPrimaryAdmin(senderId, env)) {
+    await answerCallback(
+      callbackId,
+      env,
+      '⚠️ 仅主管理员可执行此操作。',
+      true
+    );
+
+    return;
+  }
+
+  if (!selfUpdateConfigured(env)) {
+    await answerCallback(
+      callbackId,
+      env,
+      '⚠️ 自更新未配置。',
+      true
+    );
+
+    return;
+  }
+
+  if (data === 'selfupd:cancel') {
+    await answerCallback(callbackId, env);
+    await dbConfigDelete(SELFUPDATE_ASK_KEY, env);
+    await handleUpdateCheckCallback(callbackQuery, env);
+
+    return;
+  }
+
+  if (data === 'selfupd:ask' || data === 'selfupd:rbask') {
+    const isRollback = data === 'selfupd:rbask';
+    let target = '';
+    let releaseName = '';
+    let prevId = '';
+
+    if (isRollback) {
+      prevId =
+        (await dbConfigGet(SELFUPDATE_PREV_KEY, env)) || '';
+
+      const health = await selfUpdateHealth(env).catch(
+        () => null
+      );
+
+      if (!prevId || !health || prevId === health.activeId) {
+        await answerCallback(
+          callbackId,
+          env,
+          '⚠️ 当前没有可回滚的上一版。',
+          true
+        );
+
+        return;
+      }
+    } else {
+      const cache = await readUpdateCache(env);
+
+      if (
+        !cache?.tag ||
+        compareVersions(cache.tag, BOT_VERSION) <= 0 ||
+        !cache.asset?.url
+      ) {
+        await answerCallback(
+          callbackId,
+          env,
+          '⚠️ 当前没有可更新的新版本。',
+          true
+        );
+
+        return;
+      }
+
+      target = cache.tag;
+      releaseName = cache.name || cache.tag;
+    }
+
+    const nonce =
+      Date.now().toString(36) +
+      Math.floor(Math.random() * 1e6).toString(36);
+
+    await dbConfigPut(
+      SELFUPDATE_ASK_KEY,
+      JSON.stringify({
+        nonce,
+        kind: isRollback ? 'rollback' : 'update',
+        target,
+        name: releaseName,
+        prevVersionId: prevId,
+        exp: Date.now() + SELFUPDATE_ASK_TTL_MS
+      }),
+      env
+    );
+
+    await answerCallback(callbackId, env);
+
+    await renderMenu(env, {
+      chatId,
+      messageId,
+      text: isRollback
+        ? '确认回滚到上一版？\n回滚后当前版本会被换下，之后仍可再切回。'
+        : `确认更新？\n当前版本：${BOT_VERSION}\n目标版本：${target}（${escapeHtml(releaseName)}）\n更新过程会自动校验与验证，失败会自动回滚。`,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: isRollback ? '↩️ 确认回滚' : '🆙 确认更新',
+              callback_data: `${isRollback ? 'selfupd:rbgo' : 'selfupd:go'}:${nonce}`
+            },
+            {
+              text: '取消',
+              callback_data: 'selfupd:cancel'
+            }
+          ]
+        ]
+      }
+    });
+
+    return;
+  }
+
+  if (
+    data.startsWith('selfupd:go:') ||
+    data.startsWith('selfupd:rbgo:')
+  ) {
+    const isRollback = data.startsWith('selfupd:rbgo:');
+    const nonce = data.split(':')[2] || '';
+    const askRaw = await dbConfigGet(SELFUPDATE_ASK_KEY, env);
+    let ask = null;
+
+    try {
+      ask = askRaw ? JSON.parse(askRaw) : null;
+    } catch (_) {
+      ask = null;
+    }
+
+    if (
+      !ask ||
+      ask.nonce !== nonce ||
+      Number(ask.exp) <= Date.now() ||
+      ask.kind !== (isRollback ? 'rollback' : 'update')
+    ) {
+      await answerCallback(
+        callbackId,
+        env,
+        '⚠️ 这条确认已失效，请重新打开检查更新。',
+        true
+      );
+
+      return;
+    }
+
+    // 并发防双跑：确认的 nonce 做原子占用——同一条确
+    // 认被双击或并发投递时只有第一个占得上（与 /clear
+    // 的 clearrun 同法）；运行结束（或超期补结）时释放。
+    const claimed = await dbConfigClaim(
+      SELFUPDATE_RUN_KEY,
+      ask.nonce,
+      env
+    );
+
+    if (!claimed) {
+      await answerCallback(
+        callbackId,
+        env,
+        '⚠️ 已在执行中，请勿重复点击。',
+        true
+      );
+
+      return;
+    }
+
+    const pending = {
+      nonce: ask.nonce,
+      kind: ask.kind,
+      target: ask.target || '',
+      name: ask.name || '',
+      prevVersionId: ask.prevVersionId || '',
+      newVersionId: '',
+      adminId: senderId,
+      chatId,
+      messageId,
+      stage: 'starting',
+      exp: Date.now() + SELFUPDATE_PENDING_TTL_MS
+    };
+
+    await dbConfigPut(
+      SELFUPDATE_PENDING_KEY,
+      JSON.stringify(pending),
+      env
+    );
+
+    await answerCallback(
+      callbackId,
+      env,
+      isRollback ? '正在回滚…' : '正在更新…'
+    );
+
+    const run = isRollback
+      ? runSelfRollback(env, pending)
+      : runSelfUpdate(env, origin, pending);
+
+    if (ctx?.waitUntil) {
+      ctx.waitUntil(run);
+    } else {
+      await run;
+    }
+
+    return;
+  }
+
+  await answerCallback(callbackId, env);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -16796,7 +17973,9 @@ function buildGuidePage(pageCtx = {}) {
     <h2>🔄 版本与更新</h2>
     <ul>
       <li>主菜单顶部、标题下面有一行当前版本号；有新版本时，那一行会变成可以点开的链接，机器人也会私聊通知主管理员一次（只通知一次，不刷屏）。</li>
-      <li>想手动确认时，点主菜单的「🔄 检查更新」；查太勤会被限速（5 分钟最多查一次），这是故意的，防止白白消耗额度。</li>
+      <li>想手动确认时，点主菜单的「🔄 检查更新」；查太勤会被限速（5 分钟最多查一次），这是故意的，防止白白消耗额度。检查走的是仓库网页通道，不再依赖容易被限流的接口；万一检查失败，卡上会把失败原因一并写明，不会只剩一句失败。</li>
+      <li><b class=\"k\">一键自更新（可选）：</b>启用后，检查更新卡上会多一行「自更新：就绪」；发现新版时还会多一颗「🆙 一键更新到 vX.Y.Z」按钮——点它、再确认一次，机器人就自己把新版拉下来换上，换完当场自检；自检没通过会自动换回上一版，卡上的「↩️ 回滚到上一版」也能随时手动退回。全程在手机上点两下就行，不用开电脑。没启用时卡上只显示「自更新：未配置」，其他功能完全不受影响。</li>
+      <li><b class=\"k\">怎么启用一键自更新：</b>给这个 Worker 加三个绑定（Cloudflare 控制台 → 这个 Worker → 设置 → 变量和机密）：两个普通变量 CF_ACCOUNT_ID（你的 Cloudflare 账号 ID，控制台首页或任意域名的概览页就能看到）和 CF_WORKER_ID（这个 Worker 的 ID，用下面这枚令牌查一次账号下的 Worker 列表，就能看到每个 Worker 的名字与 ID）；再加一个机密 CF_API_TOKEN，值是你在 Cloudflare「我的个人资料 → API 令牌」里新建的一枚令牌——用「编辑 Cloudflare Workers」模板、账户范围只选你自己这一个账号。三项都配齐后，打开检查更新卡看到「自更新：就绪」就是启用成功；若显示「自更新：令牌不可用」，多半是令牌填错或权限不够，回去核对令牌。</li>
       <li>升级不丢东西：访客、配置、备注都存在数据库里，按项目仓库里的部署教程、换上新版文件重新部署即可。</li>
     </ul>
   </section>
@@ -24028,6 +25207,22 @@ export default {
     try {
       if (
         request.method === 'GET' &&
+        requestUrl.pathname === '/api/version'
+      ) {
+        // 自更新部署后自检用：只回当前运行代码的版本
+        // 号（版本号在菜单与仓库里本就是公开信息）。
+        return Response.json(
+          { ok: true, version: BOT_VERSION },
+          {
+            headers: {
+              'cache-control': 'no-store'
+            }
+          }
+        );
+      }
+
+      if (
+        request.method === 'GET' &&
         requestUrl.pathname === '/verify'
       ) {
         return await handleVerifyPage(
@@ -24318,6 +25513,10 @@ export default {
     if (Math.random() < 0.01) {
       ctx.waitUntil(
         maybeCheckForUpdates(env)
+      );
+
+      ctx.waitUntil(
+        maybeFinalizeSelfUpdate(env)
       );
     }
 
