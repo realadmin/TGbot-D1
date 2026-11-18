@@ -19032,8 +19032,8 @@ function buildUserListPage(pageCtx = {}) {
   .b-ban { background: #5c2222; color: #f28b8b; }
   .b-dim { background: #2b3a47; color: #9db2c5; }
   .b-pass { background: #173f5f; color: #8ecdf0; }
-  .ops { margin-top: 9px; display: flex; gap: 8px; }
-  .ops button, .cf button { padding: 6px 13px; border-radius: 8px; border: 0; font-size: 13.5px; cursor: pointer; }
+  .ops { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .ops button, .cf button { flex: 0 0 auto; padding: 6px 13px; border-radius: 8px; border: 0; font-size: 13.5px; white-space: nowrap; cursor: pointer; }
   .rst { background: #2b5278; color: #fff; }
   .rwb { flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; padding: 6px 10px; }
   .ric { font-size: 17px; line-height: 1.1; }
