@@ -20740,21 +20740,38 @@ function statsGo(act) {
 // 统计块）先 viewSlideFinish 就地结算再走下一步，
 // 不落错格、不残留状态。取数时机不变：进入点块
 // 即 resetAndLoad，转圈在滑入的页面里转。
+// -v163b2 滑板几何改量测口径：旧法以 left:0 /
+// right:0 把 #paneList 拉成视口全宽（它流内受
+// main 的 12px 边距与 #uscroll 的 scrollbar-
+// gutter 约束、窄约 24px），排序行 space-
+// between 的两组滑行期按全宽顶到两边、落地撤
+// 板瞬间向中跳约 12px。新法 l2SlabOn 上板前先
+// 量两元素流内矩形、左与宽逐像素照抄（#l2head
+// 本是通栏，量得即全幅、照抄不缩），滑行全程
+// 内容盒不变宽；停靠位移相应改按视口宽平移
+// （按自身宽算的百分百在滑板变窄后会留一条
+// 缝，视口宽保证整页出屏），推入与滑出同口径。
 var l2Anim = 0, l2LandFn = null, l2AnimTimer = 0;
 function l2SlabOn(topPx) {
   var hd = document.getElementById('l2head');
   var pl = document.getElementById('paneList');
+  // 两条调用路径到这里时两元素都在流内：先量流
+  // 内矩形，滑板的左与宽逐像素照抄（-v163b2，
+  // 见转场块注）；量不到（宽为 0）退回旧口径拉
+  // 满，行为不劣于旧版。
+  var hdR = hd.getBoundingClientRect();
+  var plR = pl.getBoundingClientRect();
   hd.classList.add('l2ov');
   pl.classList.add('l2ov');
   hd.style.position = 'fixed';
   hd.style.top = '0';
-  hd.style.left = '0';
-  hd.style.right = '0';
+  if (hdR.width > 0) { hd.style.left = hdR.left + 'px'; hd.style.width = hdR.width + 'px'; hd.style.right = 'auto'; }
+  else { hd.style.left = '0'; hd.style.right = '0'; }
   hd.style.zIndex = '4';
   pl.style.position = 'fixed';
   pl.style.top = topPx + 'px';
-  pl.style.left = '0';
-  pl.style.right = '0';
+  if (plR.width > 0) { pl.style.left = plR.left + 'px'; pl.style.width = plR.width + 'px'; pl.style.right = 'auto'; }
+  else { pl.style.left = '0'; pl.style.right = '0'; }
   pl.style.bottom = '0';
   pl.style.zIndex = '4';
   pl.style.background = '#0f141a';
@@ -20768,6 +20785,7 @@ function l2SlabOff() {
   hd.style.top = '';
   hd.style.left = '';
   hd.style.right = '';
+  hd.style.width = '';
   hd.style.zIndex = '';
   hd.style.transition = '';
   hd.style.transform = '';
@@ -20775,6 +20793,7 @@ function l2SlabOff() {
   pl.style.top = '';
   pl.style.left = '';
   pl.style.right = '';
+  pl.style.width = '';
   pl.style.bottom = '';
   pl.style.zIndex = '';
   pl.style.transition = '';
@@ -20795,8 +20814,8 @@ function l2PushIn() {
   document.getElementById('l2head').style.display = 'flex';
   var hdH = hd.offsetHeight || 0;
   l2SlabOn(hdH);
-  hd.style.transform = 'translateX(100%)';
-  pl.style.transform = 'translateX(100%)';
+  hd.style.transform = 'translateX(100vw)';
+  pl.style.transform = 'translateX(100vw)';
   void pl.offsetWidth;
   hd.style.transition = 'transform .26s ease';
   pl.style.transition = 'transform .26s ease';
@@ -20836,8 +20855,8 @@ function l2PopOut() {
   var hd = document.getElementById('l2head');
   hd.style.transition = 'transform .22s ease';
   pl.style.transition = 'transform .22s ease';
-  hd.style.transform = 'translateX(100%)';
-  pl.style.transform = 'translateX(100%)';
+  hd.style.transform = 'translateX(100vw)';
+  pl.style.transform = 'translateX(100vw)';
   clearTimeout(l2AnimTimer);
   l2AnimTimer = setTimeout(viewSlideFinish, 240);
 }
