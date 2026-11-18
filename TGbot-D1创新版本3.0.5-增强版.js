@@ -99,6 +99,30 @@ const DEFAULTS = {
     '🚫 对方已将机器人拉黑，后续消息将无法送达。',
   unblock_notice_text:
     '✅ 对方已解除对机器人的拉黑，可以继续正常收发消息。',
+  visitor_blocked_text:
+    '⚠️ 您已被管理员封禁，无法继续发送消息。',
+  visitor_unblocked_text:
+    '✅ 管理员已解除对您的封禁，现在可以继续发送消息。',
+  keyword_hit_text:
+    '⚠️ 您的消息触发了关键词过滤器 ' +
+    '({count}/{threshold} 次)，消息已丢弃。',
+  verify_card_text:
+    '🔐 请点击下方按钮完成人机验证，' +
+    '链接 {minutes} 分钟内有效。' +
+    '验证通过后即可发送消息。',
+  pass_deliver_text:
+    '🎫 管理员发放了一张验证通行证\n\n' +
+    '如果人机验证一直过不去，点击下方按钮即可直接通过验证。\n' +
+    '通行证 {minutes} 分钟内有效，且只能使用一次。',
+  quiz_lock_text:
+    '🚫 答错次数过多，验证已锁定 ' +
+    '{minutes} 分钟，请稍后再试。',
+  filter_send_text:
+    '🚫 当前不允许发送{type}。',
+  filter_forward_text:
+    '🚫 当前不允许转发来自{source}的消息。',
+  unsupported_notice_text:
+    '⚠️ 这类消息机器人暂时无法转达，已提醒管理员。',
 
   topic_title_style: 'note_first',
   menu_btn_panel: 'true',
@@ -2785,7 +2809,7 @@ async function matchAutoReply(text, env) {
 }
 
 async function getFilterConfig(env) {
-  // 八个开关一次 IN 查询读回（此前逐个 getConfig 是 8 次往返，
+  // 八个开关与两句过滤拒绝文案一次 IN 查询读回（此前逐个 getConfig 是 8 次往返，
   // 且在每条访客消息的热路径上）。读失败时全部按默认开启
   // 处理，与转发热路径「读失败不丢消息」的口径一致。
   const keys = [
@@ -2796,7 +2820,9 @@ async function getFilterConfig(env) {
     'enable_sticker_forwarding',
     'enable_user_forwarding',
     'enable_group_forwarding',
-    'enable_channel_forwarding'
+    'enable_channel_forwarding',
+    'filter_send_text',
+    'filter_forward_text'
   ];
 
   const stored = {};
@@ -2804,7 +2830,9 @@ async function getFilterConfig(env) {
   try {
     const result = await env.TG_BOT_DB.prepare(
       'SELECT key, value FROM config ' +
-      'WHERE key IN (?, ?, ?, ?, ?, ?, ?, ?)'
+      'WHERE key IN (' +
+      keys.map(() => '?').join(', ') +
+      ')'
     )
       .bind(...keys)
       .all();
@@ -2830,6 +2858,16 @@ function buildFilterConfig(stored) {
           ? DEFAULTS[key]
           : 'true');
 
+  // 过滤拒绝文案与 textConfig 同口径：未存、存空都
+  // 回退默认值（带外写空不能让拒绝提示变成空句）。
+  const pickText = (key) => {
+    const v = stored[key];
+
+    return v === undefined || v === ''
+      ? DEFAULTS[key]
+      : v;
+  };
+
   return {
     media: toBoolText(pick('enable_image_forwarding')),
     link: toBoolText(pick('enable_link_forwarding')),
@@ -2848,7 +2886,9 @@ function buildFilterConfig(stored) {
     ),
     channel_forward: toBoolText(
       pick('enable_channel_forwarding')
-    )
+    ),
+    send_text: pickText('filter_send_text'),
+    forward_text: pickText('filter_forward_text')
   };
 }
 
@@ -2860,7 +2900,10 @@ async function checkForwardFilters(message, env) {
   if (kind === 'media' && !filters.media) {
     return {
       ok: false,
-      reason: '当前不允许发送图片、视频或文件。'
+      reason: fillTextTemplate(
+        filters.send_text,
+        { type: '图片、视频或文件' }
+      )
     };
   }
 
@@ -2870,7 +2913,10 @@ async function checkForwardFilters(message, env) {
   ) {
     return {
       ok: false,
-      reason: '当前不允许发送语音或音频。'
+      reason: fillTextTemplate(
+        filters.send_text,
+        { type: '语音或音频' }
+      )
     };
   }
 
@@ -2880,21 +2926,30 @@ async function checkForwardFilters(message, env) {
   ) {
     return {
       ok: false,
-      reason: '当前不允许发送贴纸或 GIF。'
+      reason: fillTextTemplate(
+        filters.send_text,
+        { type: '贴纸或 GIF' }
+      )
     };
   }
 
   if (kind === 'text' && !filters.text) {
     return {
       ok: false,
-      reason: '当前不允许发送文本。'
+      reason: fillTextTemplate(
+        filters.send_text,
+        { type: '文本' }
+      )
     };
   }
 
   if (hasLinks(message) && !filters.link) {
     return {
       ok: false,
-      reason: '当前不允许发送链接。'
+      reason: fillTextTemplate(
+        filters.send_text,
+        { type: '链接' }
+      )
     };
   }
 
@@ -2904,7 +2959,10 @@ async function checkForwardFilters(message, env) {
   ) {
     return {
       ok: false,
-      reason: '当前不允许转发来自访客的消息。'
+      reason: fillTextTemplate(
+        filters.forward_text,
+        { source: '访客' }
+      )
     };
   }
 
@@ -2914,7 +2972,10 @@ async function checkForwardFilters(message, env) {
   ) {
     return {
       ok: false,
-      reason: '当前不允许转发来自群组的消息。'
+      reason: fillTextTemplate(
+        filters.forward_text,
+        { source: '群组' }
+      )
     };
   }
 
@@ -2924,7 +2985,10 @@ async function checkForwardFilters(message, env) {
   ) {
     return {
       ok: false,
-      reason: '当前不允许转发来自频道的消息。'
+      reason: fillTextTemplate(
+        filters.forward_text,
+        { source: '频道' }
+      )
     };
   }
 
@@ -4000,7 +4064,7 @@ async function notifyVisitorUnsupported(message, env) {
 
     await telegramApi(env.BOT_TOKEN, 'sendMessage', {
       chat_id: message.chat.id,
-      text: '这类消息机器人暂时无法转达，已提醒管理员。',
+      text: await textConfig('unsupported_notice_text', env),
       reply_markup: SYS_TAG_MARKUP
     });
   } catch (_) {
@@ -6019,9 +6083,7 @@ async function handleVerification(
         'sendMessage',
         {
           chat_id: chatId,
-          text:
-            '🚫 答错次数过多，验证已锁定 ' +
-            `${quizLockMin} 分钟，请稍后再试。`,
+          text: await quizLockText(env, quizLockMin),
             reply_markup: SYS_TAG_MARKUP
         }
       );
@@ -6332,9 +6394,7 @@ async function sendSequencePrompt(
       'sendMessage',
       {
         chat_id: chatId,
-        text:
-          '🚫 答错次数过多，验证已锁定 ' +
-          `${remainMin} 分钟，请稍后再试。`,
+        text: await quizLockText(env, remainMin),
           reply_markup: SYS_TAG_MARKUP
       }
     );
@@ -6495,7 +6555,7 @@ async function handleSequenceCallback(
     if (
       user.user_state === USER_STATE.VERIFIED
     ) {
-      await ans('✅ 您已通过验证。', true);
+      await ans('✅ 已通过验证。', true);
 
       return;
     }
@@ -6664,8 +6724,7 @@ async function handleSequenceCallback(
     }
 
     const lockText =
-      '🚫 答错次数过多，验证已锁定 ' +
-      `${quizLockMin} 分钟，请稍后再试。`;
+      await quizLockText(env, quizLockMin);
 
     if (attempts >= quizMaxAttempts) {
       await dbConfigDelete(seqKey, env);
@@ -6815,6 +6874,43 @@ async function textConfig(key, env) {
   }
 
   return value;
+}
+
+// 文案模板占位符填充：{name} 逐个字面替换；管理员
+// 自定义文案里没写某个占位符时就不替换、按原文发
+// 送，不报错（占位符口径写在管理台各字段的说明里）。
+function fillTextTemplate(template, values) {
+  let out = String(template ?? '');
+
+  for (const [name, value] of Object.entries(values || {})) {
+    out = out.split(`{${name}}`).join(String(value));
+  }
+
+  return out;
+}
+
+// 嵌入引用时剥掉对方文案自带的领头 emoji：一小段
+// 消息只留一个领头 emoji 的口径下，被嵌入的文案
+// （如过滤模板的输出）若自带领头 emoji，拼进带
+// 前缀的句式就会双 emoji。只剥开头的第一个 emoji
+// （含变体选择符 / 肤色 / ZWJ 组合）及其后的空格；
+// 没有领头 emoji 时原样返回。
+function stripLeadingEmoji(text) {
+  return String(text ?? '').replace(
+    /^\p{Extended_Pictographic}(?:\uFE0F|[\u{1F3FB}-\u{1F3FF}]|\u200D\p{Extended_Pictographic}(?:\uFE0F|[\u{1F3FB}-\u{1F3FF}])?)*\s*/u,
+    ''
+  );
+}
+
+// 问答 / 顺序点击共用的锁定提示：三处发送点（问答答
+// 错锁定、顺序点击锁定中再进入、顺序点击点错锁定）
+// 共用同一句可配文案 quiz_lock_text，{minutes} 填本
+// 次锁定的分钟数。
+async function quizLockText(env, minutes) {
+  return fillTextTemplate(
+    await textConfig('quiz_lock_text', env),
+    { minutes }
+  );
 }
 
 // 旧定义时代 welcome_msg 的默认领衔句：-v161b8 起
@@ -7708,12 +7804,14 @@ async function sendTurnstilePrompt(
     'sendMessage',
     {
       chat_id: chatId,
-      text:
-        '请点击下方按钮完成人机验证，' +
-        '链接 ' +
-        Math.round((await verifyLinkTtlMs(env)) / 60000) +
-        ' 分钟内有效。' +
-        '验证通过后即可发送消息。',
+      text: fillTextTemplate(
+        await textConfig('verify_card_text', env),
+        {
+          minutes: Math.round(
+            (await verifyLinkTtlMs(env)) / 60000
+          )
+        }
+      ),
       reply_markup: {
         inline_keyboard: [
           [
@@ -8484,9 +8582,10 @@ async function applyBlockState(userId, blocked, env) {
           'sendMessage',
           {
             chat_id: uid,
-            text:
-              '⚠️ 您已被管理员封禁，' +
-              '无法继续发送消息。',
+            text: await textConfig(
+              'visitor_blocked_text',
+              env
+            ),
               reply_markup: SYS_TAG_MARKUP
           }
         );
@@ -8557,9 +8656,10 @@ async function applyBlockState(userId, blocked, env) {
       'sendMessage',
       {
         chat_id: uid,
-        text:
-          '✅ 管理员已解除对您的封禁，' +
-          '现在可以继续发送消息。',
+        text: await textConfig(
+          'visitor_unblocked_text',
+          env
+        ),
           reply_markup: SYS_TAG_MARKUP
       }
     );
@@ -8599,10 +8699,13 @@ async function handleBlockedKeyword(
     'sendMessage',
     {
       chat_id: chatId,
-      text:
-        `⚠️ 您的消息触发了关键词过滤器 ` +
-        `(${result.currentCount}/${threshold} 次)，` +
-        `消息已丢弃。`,
+      text: fillTextTemplate(
+        await textConfig('keyword_hit_text', env),
+        {
+          count: result.currentCount,
+          threshold
+        }
+      ),
         reply_markup: SYS_TAG_MARKUP
     }
   );
@@ -8911,9 +9014,10 @@ async function handlePrivateMessage(
       );
     }
 
-    // 被封禁的访客发 /start 一律静默：不发「您已通过验证」
-    // （与其实际状态相反、纯误导），也不走 handleStart
-    // 发验证提示。主管理员在上方已回菜单，不受影响。
+    // 被封禁的访客发 /start 一律静默：不重发欢迎消息
+    // （「验证成功」云云与其实际状态相反、纯误导），
+    // 也不走 handleStart 发验证提示。主管理员在上方
+    // 已回菜单，不受影响。
     if (user.is_blocked) {
       return;
     }
@@ -8939,7 +9043,7 @@ async function handlePrivateMessage(
         {
           chat_id: chatId,
           text:
-            '✅ 您是已授权协管员，可以在管理群访客话题中回复消息。',
+            '✅ 已获协管员授权，可以在管理群访客话题中回复消息。',
             reply_markup: SYS_TAG_MARKUP
         }
       );
@@ -8969,29 +9073,22 @@ async function handlePrivateMessage(
       user.user_state ===
       USER_STATE.VERIFIED
     ) {
+      // 已验证访客重发 /start 的回应已并入欢迎消息：
+      // 不再另发写死的单独提示，改走与验证成功回执同一
+      // 条发送口——文案取 welcomeMsgText（welcome_msg
+      // 的当前有效值，管理台改了就跟随）、挂系统提示
+      // 牌、记 receipt_msg_id 槽位；发送口内部的记账
+      // 重试与「记不上就自删防孤儿」对本场景同样适用，
+      // 一并复用。它不做任何状态迁移、也不清其他槽位
+      // 或通行证，没有多余副作用可带入。发前先清旧回
+      // 执槽位与旧口径一致：同类消息只留最新一条。
       await clearSlotMessage(
         env,
         chatId,
         'receipt_msg_id'
       );
 
-      const noticeSent = await telegramApi(
-        env.BOT_TOKEN,
-        'sendMessage',
-        {
-          chat_id: chatId,
-          text:
-            '您已通过验证，可以直接发送消息。',
-            reply_markup: SYS_TAG_MARKUP
-        }
-      );
-
-      await trackSlotMessage(
-        env,
-        chatId,
-        'receipt_msg_id',
-        noticeSent?.message_id
-      );
+      await sendVerifySuccessReceipt(env, chatId);
       // 与未验证分支同口径记下这条 /start（只记最新一条，
       // /help 不记）：已验证访客不会再有「验证成功收尾」
       // 来撤它，改由首条真实消息的回执清理点连带撤回
@@ -9084,7 +9181,7 @@ async function handlePrivateMessage(
         'sendMessage',
         {
           chat_id: chatId,
-          text: '🛠 网页管理台（链接 10 分钟内有效，过期重新发送 /panel）',
+          text: '🛠 网页管理台（链接 10 分钟内有效，过期重新发送 /panel）。',
           reply_markup: {
             inline_keyboard: [
               [
@@ -9119,7 +9216,7 @@ async function handlePrivateMessage(
             'sendMessage',
             {
               chat_id: chatId,
-              text: '当前没有处于暂停状态。',
+              text: 'ℹ️ 当前没有处于暂停状态。',
               reply_markup: SYS_TAG_MARKUP
             }
           );
@@ -9336,7 +9433,7 @@ async function handlePrivateMessage(
         {
           chat_id: chatId,
           text:
-            '请使用文字回答验证问题。',
+            'ℹ️ 请使用文字回答验证问题。',
             reply_markup: SYS_TAG_MARKUP
         }
       );
@@ -9363,7 +9460,7 @@ async function handlePrivateMessage(
       {
         chat_id: chatId,
         text:
-          '请使用 /start 命令开始验证。',
+          'ℹ️ 请使用 /start 命令开始验证。',
           reply_markup: SYS_TAG_MARKUP
       }
     );
@@ -9396,7 +9493,7 @@ async function handlePrivateMessage(
         {
           chat_id: chatId,
           text:
-            '您是管理员，私聊里请使用命令或菜单；' +
+            'ℹ️ 私聊里请使用命令或菜单；' +
             '要回复访客，请到管理群的话题里发送。',
             reply_markup: SYS_TAG_MARKUP
         }
@@ -9472,7 +9569,7 @@ async function handlePrivateMessage(
       {
         chat_id: chatId,
         text:
-          `⚠️ ${filterResult.reason}`,
+          filterResult.reason,
           reply_markup: SYS_TAG_MARKUP
       }
     );
@@ -9819,7 +9916,7 @@ async function handleAdminCommand(
       if (!state) {
         await sendEphemeralTopicNotice(
           message,
-          '当前没有处于暂停状态。',
+          'ℹ️ 当前没有处于暂停状态。',
           env,
           ctx
         );
@@ -9935,7 +10032,7 @@ async function handleAdminCommand(
     ) {
       await sendTopicNotice(
         message,
-        '不能对管理员账号执行此操作。',
+        '⚠️ 不能对管理员账号执行此操作。',
         env
       );
 
@@ -9955,7 +10052,7 @@ async function handleAdminCommand(
       await sendTopicNotice(
         message,
         '❌ 找不到该话题对应的访客 ID。\n' +
-        '也可以使用：/reverify 访客ID',
+        '也可以使用：/reverify 访客ID。',
         env
       );
 
@@ -10109,7 +10206,7 @@ async function handleAdminCommand(
       await sendTopicNotice(
         message,
         '❌ 找不到该话题对应的访客 ID。\n' +
-        '也可以使用：/ban 访客ID',
+        '也可以使用：/ban 访客ID。',
         env
       );
 
@@ -10145,7 +10242,7 @@ async function handleAdminCommand(
       await sendTopicNotice(
         message,
         '❌ 找不到该话题对应的访客 ID。\n' +
-        '也可以使用：/unban 访客ID',
+        '也可以使用：/unban 访客ID。',
         env
       );
 
@@ -10210,7 +10307,7 @@ async function handleAdminCommand(
       await sendTopicNotice(
         message,
         `❌ 删除消息失败：` +
-        `${error?.message || error}`,
+        `${error?.message || error}。`,
         env
       );
     }
@@ -10240,7 +10337,7 @@ async function handleAdminCommand(
           await sendTopicNotice(
             message,
             '⚠️ 话题侧已删除，但访客私聊中的' +
-              `原消息删除失败：${reason}`,
+              `原消息删除失败：${reason}。`,
             env
           );
         }
@@ -10287,7 +10384,7 @@ async function handleAdminCommand(
         text:
           `🧹 确认清空与访客 ${userId} 的全部聊天记录？\n` +
           '将删除：话题内的全部转发副本、访客私聊中的全部聊天副本，以及全部消息配对记录。\n' +
-          '注意：私聊里 48 小时前的消息删不掉，执行后会报告条数。\n' +
+          '⚠️ 私聊里 48 小时前的消息删不掉，执行后会报告条数。\n' +
           '话题本身和访客档案保留，对方之后仍可继续聊天。',
         reply_markup: {
           inline_keyboard: [
@@ -10398,7 +10495,7 @@ if (parsed.command === 'card') {
     await sendTopicNotice(
       message,
       `❌ 重新创建资料卡失败：` +
-      `${error?.message || error}`,
+      `${error?.message || error}。`,
       env
     );
   }
@@ -10418,7 +10515,7 @@ if (parsed.command === 'card') {
       await sendTopicNotice(
         message,
         '❌ 找不到该话题对应的访客 ID。\n' +
-        '也可以使用：/terminate 访客ID',
+        '也可以使用：/terminate 访客ID。',
         env
       );
 
@@ -10482,7 +10579,7 @@ if (parsed.command === 'card') {
       await sendTopicNotice(
         message,
         `❌ 删除话题失败：` +
-        `${error?.message || error}`,
+        `${error?.message || error}。`,
         env
       );
     }
@@ -10717,7 +10814,7 @@ const topicId =
           Number(topicId),
         text:
           `❌ 转发消息给访客 ${userId} 失败：` +
-          `${error?.message || error}`,
+          `${error?.message || error}。`,
           reply_markup: SYS_TAG_MARKUP
       }
     );
@@ -10869,7 +10966,7 @@ async function handleRelayEditedMessage(
             String(editedMessage.chat.id),
           text:
             `⚠️ 编辑后的消息未通过过滤：` +
-            `${filterResult.reason}`,
+            `${stripLeadingEmoji(filterResult.reason)}`,
             reply_markup: SYS_TAG_MARKUP
         }
       );
@@ -11171,7 +11268,7 @@ async function handleUserCardCallback(
     await answerCallback(
       callbackQuery.id,
       env,
-      '该按钮只能在管理群中使用。',
+      '⚠️ 该按钮只能在管理群中使用。',
       true
     );
 
@@ -11202,7 +11299,7 @@ async function handleUserCardCallback(
     await answerCallback(
       callbackQuery.id,
       env,
-      '无效操作。',
+      '❌ 无效操作。',
       true
     );
 
@@ -11213,7 +11310,7 @@ async function handleUserCardCallback(
     await answerCallback(
       callbackQuery.id,
       env,
-      '不能对管理员账号执行此操作。',
+      '⚠️ 不能对管理员账号执行此操作。',
       true
     );
 
@@ -11230,7 +11327,7 @@ async function handleUserCardCallback(
     await answerCallback(
       callbackQuery.id,
       env,
-      '无效操作。',
+      '❌ 无效操作。',
       true
     );
 
@@ -11269,7 +11366,7 @@ async function handleUserCardCallback(
         await answerCallback(
           callbackQuery.id,
           env,
-          '对方已被封禁，请先解封再设为信任。',
+          '⚠️ 对方已被封禁，请先解封再设为信任。',
           true
         );
 
@@ -11385,7 +11482,7 @@ async function handleUserCardCallback(
         callbackQuery.id,
         env,
         `❌ 刷新失败：` +
-        `${error?.message || error}`,
+        `${error?.message || error}。`,
         true
       );
     }
@@ -11508,7 +11605,7 @@ async function handleCallbackQuery(
     await answerCallback(
       callbackQuery.id,
       env,
-      '您无权执行该操作。',
+      '⚠️ 无权执行该操作。',
       true
     );
 
@@ -12123,7 +12220,7 @@ async function reconcileMemberBase(
         env,
         '⚠️ 管理群成员数与记录不符（记录 ' +
           `${expected} 人、实际 ${actual} 人），` +
-          '可能有未记录的进出，请人工核查'
+          '可能有未记录的进出，请人工核查。'
       );
     }
   } catch (error) {
@@ -12899,7 +12996,7 @@ async function handleClearCallback(
     await answerCallback(
       callbackQuery.id,
       env,
-      '参数错误。',
+      '❌ 参数错误。',
       true
     );
 
@@ -12913,7 +13010,7 @@ async function handleClearCallback(
     await answerCallback(
       callbackQuery.id,
       env,
-      '无权操作。',
+      '⚠️ 无权操作。',
       true
     );
 
@@ -12965,7 +13062,7 @@ async function handleClearCallback(
     await answerCallback(
       callbackQuery.id,
       env,
-      '整段对话清空仅主管理员可操作。',
+      '⚠️ 整段对话清空仅主管理员可操作。',
       true
     );
 
@@ -12980,7 +13077,7 @@ async function handleClearCallback(
     await answerCallback(
       callbackQuery.id,
       env,
-      '访客记录已不存在。',
+      'ℹ️ 访客记录已不存在。',
       true
     );
 
@@ -12994,7 +13091,7 @@ async function handleClearCallback(
     await answerCallback(
       callbackQuery.id,
       env,
-      '该话题已不属于这位访客。',
+      '⚠️ 该话题已不属于这位访客。',
       true
     );
 
@@ -13016,7 +13113,7 @@ async function handleClearCallback(
     await answerCallback(
       callbackQuery.id,
       env,
-      '这条确认已在执行或已执行过，请勿重复点击。',
+      '⚠️ 这条确认已在执行或已执行过，请勿重复点击。',
       true
     );
 
@@ -13571,7 +13668,7 @@ async function handlePauseCallback(
       await answerCallback(
         callbackId,
         env,
-        '时长无效。',
+        '❌ 时长无效。',
         true
       );
 
@@ -13605,7 +13702,7 @@ async function handlePauseCallback(
       await answerCallback(
         callbackId,
         env,
-        '当前没有处于暂停状态。'
+        'ℹ️ 当前没有处于暂停状态。'
       );
 
       await showMainMenu(senderId, env, messageId, 0, origin);
@@ -13618,7 +13715,7 @@ async function handlePauseCallback(
     await answerCallback(
       callbackId,
       env,
-      '▶️ 已恢复服务'
+      '▶️ 已恢复服务。'
     );
 
     await showMainMenu(senderId, env, messageId, 0, origin);
@@ -13640,7 +13737,7 @@ async function handleUpdateCheckCallback(
     await answerCallback(
       callbackQuery.id,
       env,
-      '仅主管理员可执行此操作。',
+      '⚠️ 仅主管理员可执行此操作。',
       true
     );
 
@@ -15496,7 +15593,7 @@ function buildGuidePage(pageCtx = {}) {
     <h2>🛡 验证</h2>
     <p>验证是用来挡垃圾机器人和广告号的：没通过验证的人，发什么都不会转进群里。</p>
     <ul>
-      <li><b class=\"k\">Turnstile 小程序验证（推荐）：</b>访客点「开始验证」按钮，弹出一个小页面自动完成人机校验，几秒通过，体验最顺。验证链接绑定访客本人，必须在 Telegram 里点开，转发给别人或用浏览器打开都用不了。</li>
+      <li><b class=\"k\">Turnstile 小程序验证（推荐）：</b>访客点验证卡下方的「🔐 点我完成人机验证」按钮，弹出一个小页面自动完成人机校验，几秒通过，体验最顺。验证链接绑定访客本人，必须在 Telegram 里点开，转发给别人或用浏览器打开都用不了。</li>
       <li><b class=\"k\">静态问答验证：</b>你出一道题，访客答对才放行；答案可以准备多个，用竖线 <code>|</code> 分隔，答中任意一个都算对。连着答错 5 次会被锁定 30 分钟（防有人对着答案穷举），锁定期间他发什么都不会有回应，过后自动解锁。次数和时长可以在管理台「基础配置」里改。注意：自带的示例题答案就写在机器人简介里、人人可查，正式用问答模式前，务必把问题和答案换成你自己的（答案还是默认值时，管理台会标红提醒）。</li>
             <li><b class=\"k\">顺序点击验证：</b>不用打开网页、也不用打字：机器人发一条带九宫格按钮的消息，访客按正文给出的顺序、在 60 秒内点完 4–5 个同类 emoji 即通过；每点对一个，盘面会重新洗牌；点错会换一整道新题，连错锁定与静态问答共用同一套次数与时长设置。</li>
 <li><b class=\"k\">在哪里切换：</b>网页管理台 → 基础配置 → 验证方式。选了 Turnstile 后，问题和答案两项会自动隐藏；如果还没配好 Turnstile 密钥，验证不会自动降级成问答（默认答案公开可抄，降级等于没验证）：访客会看到「验证服务尚未配置完成」的提示，机器人也会私聊提醒你补齐密钥、或改选静态问答 / 顺序点击。</li>
@@ -15514,7 +15611,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">资料卡：</b>每个话题顶部都钉着访客的资料卡（名字、ID、状态、你的备注）。卡片不见了就在话题里发 <code>/card</code> 重新生成；卡片上的按钮可以直接屏蔽 / 解除屏蔽、设为信任、刷新。</li>
       <li><b class=\"k\">引用回复会跟着走：</b>你在话题里引用某条消息再回复，访客那边看到的也是引用着他原话的回复；访客引用着回复你时同理，连他框选一小段文字的「部分引用」都会原样带过去。</li>
       <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，被改好的那条消息下方会出现一颗「✍🏼已编辑」标记按钮（点它不会有任何反应，只是标记）。Telegram 不给机器人提供官方的「已编辑」标记，这颗按钮就是补这个用的；它和普通聊天里的编辑一样安静——不会有新消息、不会弹窗提醒，没留意的话可能根本发现不了对方改过。访客编辑他的消息时，你这边也一样。这是写死的固定行为：两个方向的编辑都会自动附上标记，管理台里没有它的开关。只有原地改不动的极少数情况例外（比如转发配对已过期被清理、原地修改被拒绝）：这时机器人会以「回复旧副本」的形式补发一条只含新内容的消息，下方照样附「✍🏼已编辑」标记，原来的副本保留不动——这种时候才会多出一条新消息，顺着回复关系就能对上是哪条被改了。</li>
-      <li><b class=\"k\">自动消息带「系统提示」牌：</b>机器人自动发出的提示消息（欢迎语、验证提示、自动回复、熔断期间的回复、拉黑 / 解封通知这类），只要本身没有功能按钮，下方都会带一颗「系统提示」按钮，用来和真人发送的消息区分，点它不会有任何动作；验证按钮、通行证、资料卡、主菜单这些本来就带按钮的消息不再另加；主菜单有个例外：按钮被全部关掉后，菜单没了按钮，就会带上这颗牌子。消息被原地改写时牌子也在，靠改写出现的报告也会补上——比如熔断恢复后，「请稍后再试」会原地改成「✅ 服务已恢复」，下方的「系统提示」照样保留；/clear 的确认卡点下后会原地改写成进度与结果报告，下方同样带这颗牌子。</li>
+      <li><b class=\"k\">自动消息带「系统提示」牌：</b>机器人自动发出的提示消息（欢迎消息、验证提示、自动回复、熔断期间的回复、拉黑 / 解封通知这类），只要本身没有功能按钮，下方都会带一颗「系统提示」按钮，用来和真人发送的消息区分，点它不会有任何动作；验证按钮、通行证、资料卡、主菜单这些本来就带按钮的消息不再另加；主菜单有个例外：按钮被全部关掉后，菜单没了按钮，就会带上这颗牌子。消息被原地改写时牌子也在，靠改写出现的报告也会补上——比如熔断恢复后，「请稍后再试」会原地改成「✅ 服务已恢复」，下方的「系统提示」照样保留；/clear 的确认卡点下后会原地改写成进度与结果报告，下方同样带这颗牌子。</li>
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。注意：访客私聊那边的原消息只能删 48 小时以内的，超了删不掉时会在话题里留一行说明。</li>
       <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，欢迎消息、验证卡这类机器人单独记账的流程消息、还有熔断期间发出的回复卡也一并删掉，话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。这个操作只有主管理员能做，协管员发命令或点确认都会被拦下。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
@@ -15556,7 +15653,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
       <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到访客列表；这一区还有一份「成员看门狗豁免名单」，把合法的其他机器人或账号 ID 填进去，它们进管理群时就不会触发成员告警。</li>
       <li><b class=\"k\">服务熔断：</b>被消息轰炸时在这里一键暂停机器人（或用 /pause 命令），可设定暂停时长、到期自动恢复；还能设置暂停期间给访客的回复语句，或关掉回复保持完全静默。</li>
-      <li><b class=\"k\">文案与呈现：</b>答错、熔断恢复、熔断编辑警告、拉黑 / 解封这几句机器人说的话，能改成你自己的口气；话题名的样式（备注在前还是名字在前、带不带 ID）、主菜单上显示哪些按钮、访客列表默认排序与每页条数、时间显示的时区（默认 Asia/Singapore），也都在这里。</li>
+      <li><b class=\"k\">文案与呈现：</b>答错与锁定提示、人机验证卡正文、通行证送达、熔断恢复、熔断编辑警告、拉黑 / 解封提醒、发给访客的封禁 / 解封通知、关键词命中与类型过滤的拒绝提示、特殊类型无法转达提示，这些机器人说的话都能改成你自己的口气；话题名的样式（备注在前还是名字在前、带不带 ID）、主菜单上显示哪些按钮、访客列表默认排序与每页条数、时间显示的时区（默认 Asia/Singapore），也都在这里。</li>
       <li><b class=\"k\">安全与审计：</b>网页链接万一泄露（截图、转发、浏览器历史都可能漏出去），可以在这里一键让访客列表 / 网页管理台 / 新手引导某一页的已发链接全部失效，再重新发送 /start 换新链接；谁在什么时候做过删除、发通行证、改配置这类敏感操作，这里也留有一份审计记录可查（保留 90 天）。吊销只影响网页链接，验证链接与一次性通行证不受影响；若怀疑签名密钥泄露，仅吊销不够，需要到 Cloudflare 换掉 LINK_SECRET（未设置时为 WEBHOOK_SECRET）并用新值重跑一次 setWebhook，旧签名才会全部作废。</li>
     </ul>
     <div class=\"tip\">管理台的网页链接 10 分钟过期；剩不到 2 分钟时，页面顶部会先亮一条横幅提醒；打开时、或者开着页面闲置超时后保存时，都会提示过期，重新发送 /start、在新主菜单上重新打开就行。</div>
@@ -15611,7 +15708,7 @@ function buildGuidePage(pageCtx = {}) {
 
   <section id=\"g-limits\">
     <h2>🚧 已知不支持清单</h2>
-    <p>下面这些消息类型，Telegram 没有给机器人留「原样转发本体」的路。访客发来、本体复制失败时，话题里会落一张<b class=\"k\">占位卡</b>：写明类型，并尽量附上内容摘要（投票的问题与选项、位置的经纬度、名片的姓名电话等），访客那边也会收到一句「这类消息机器人暂时无法转达，已提醒管理员。」（10 分钟内只提示一次）。占位卡和普通转发消息一样建了配对：你在话题里<b class=\"k\">回复占位卡，回复照样能转到访客私聊</b>；用 /delete 删占位卡，也会连带处理那条原消息。</p>
+    <p>下面这些消息类型，Telegram 没有给机器人留「原样转发本体」的路。访客发来、本体复制失败时，话题里会落一张<b class=\"k\">占位卡</b>：写明类型，并尽量附上内容摘要（投票的问题与选项、位置的经纬度、名片的姓名电话等），访客那边也会收到一句「⚠️ 这类消息机器人暂时无法转达，已提醒管理员。」（10 分钟内只提示一次）。占位卡和普通转发消息一样建了配对：你在话题里<b class=\"k\">回复占位卡，回复照样能转到访客私聊</b>；用 /delete 删占位卡，也会连带处理那条原消息。</p>
     <ul>
       <li><b class=\"k\">投票：</b>投票本体转不过来，占位卡会带上问题与选项的文字（测验题不会带正确答案），但投不了票、也看不到投票结果。需要表决时，让访客用文字把想法发过来。</li>
       <li><b class=\"k\">实时位置：</b>位置本体转不过来；实时位置的后续移动走的是「编辑消息」，机器人不处理位置类编辑，位置不会跟着更新。一次性位置同样只有占位卡。</li>
@@ -15899,6 +15996,18 @@ function buildPanelPage(pageCtx = {}) {
     <label>问答答错提示（未到锁定次数时）</label>
     <textarea id="s_vwrong" rows="2"></textarea>
     <button class="save" data-k="quiz_wrong_text" data-t="s_vwrong">保存</button>
+    <label>问答 / 顺序点击锁定提示（答错次数过多、验证被锁定时发出）</label>
+    <textarea id="s_qlock" rows="2"></textarea>
+    <div class="hint">{minutes} 会替换成锁定的分钟数；不写占位符就按原文发送。</div>
+    <button class="save" data-k="quiz_lock_text" data-t="s_qlock">保存</button>
+    <label>人机验证卡正文（Turnstile 模式验证卡上的说明文字）</label>
+    <textarea id="s_vcard" rows="2"></textarea>
+    <div class="hint">{minutes} 会替换成验证链接的有效分钟数；不写占位符就按原文发送。</div>
+    <button class="save" data-k="verify_card_text" data-t="s_vcard">保存</button>
+    <label>通行证送达文案（发证时私聊发给访客的消息）</label>
+    <textarea id="s_pass" rows="2"></textarea>
+    <div class="hint">{minutes} 会替换成通行证的有效分钟数；不写占位符就按原文发送。</div>
+    <button class="save" data-k="pass_deliver_text" data-t="s_pass">保存</button>
     <label>服务恢复提示（熔断恢复时，原暂停消息翻成这句）</label>
     <textarea id="s_restored" rows="2"></textarea>
     <button class="save" data-k="pause_restored_text" data-t="s_restored">保存</button>
@@ -15911,6 +16020,27 @@ function buildPanelPage(pageCtx = {}) {
     <label>解封提醒（发到访客的话题里）</label>
     <textarea id="s_unblock" rows="2"></textarea>
     <button class="save" data-k="unblock_notice_text" data-t="s_unblock">保存</button>
+    <label>封禁通知（发给被封禁的访客）</label>
+    <textarea id="s_vblocked" rows="2"></textarea>
+    <button class="save" data-k="visitor_blocked_text" data-t="s_vblocked">保存</button>
+    <label>解封通知（发给被解封的访客）</label>
+    <textarea id="s_vunblocked" rows="2"></textarea>
+    <button class="save" data-k="visitor_unblocked_text" data-t="s_vunblocked">保存</button>
+    <label>关键词命中提示（访客消息命中屏蔽关键词时发出）</label>
+    <textarea id="s_kwhit" rows="2"></textarea>
+    <div class="hint">{count} 会替换成当前命中次数、{threshold} 替换成自动封禁的阈值；不写占位符就按原文发送。</div>
+    <button class="save" data-k="keyword_hit_text" data-t="s_kwhit">保存</button>
+    <label>类型过滤拒绝提示 · 发送类（发给访客）</label>
+    <textarea id="s_fsend" rows="2"></textarea>
+    <div class="hint">{type} 会替换成被拦下的类型：图片、视频或文件 / 语音或音频 / 贴纸或 GIF / 文本 / 链接；不写占位符就按原文发送。</div>
+    <button class="save" data-k="filter_send_text" data-t="s_fsend">保存</button>
+    <label>类型过滤拒绝提示 · 转发类（发给访客）</label>
+    <textarea id="s_ffwd" rows="2"></textarea>
+    <div class="hint">{source} 会替换成转发来源：访客 / 群组 / 频道；不写占位符就按原文发送。</div>
+    <button class="save" data-k="filter_forward_text" data-t="s_ffwd">保存</button>
+    <label>特殊类型无法转达提示（发给访客）</label>
+    <textarea id="s_unsup" rows="2"></textarea>
+    <button class="save" data-k="unsupported_notice_text" data-t="s_unsup">保存</button>
     <label>话题名样式</label>
     <select id="s_title">
       <option value="note_first">备注｜名字 (ID)（现行）</option>
@@ -16289,6 +16419,15 @@ fetch('/api/config?' + qs.toString())
     setVal('s_pausewarn', d.pause_warn_text || '');
     setVal('s_block', d.block_notice_text || '');
     setVal('s_unblock', d.unblock_notice_text || '');
+    setVal('s_qlock', d.quiz_lock_text || '');
+    setVal('s_vcard', d.verify_card_text || '');
+    setVal('s_pass', d.pass_deliver_text || '');
+    setVal('s_vblocked', d.visitor_blocked_text || '');
+    setVal('s_vunblocked', d.visitor_unblocked_text || '');
+    setVal('s_kwhit', d.keyword_hit_text || '');
+    setVal('s_fsend', d.filter_send_text || '');
+    setVal('s_ffwd', d.filter_forward_text || '');
+    setVal('s_unsup', d.unsupported_notice_text || '');
     setVal('s_title', d.topic_title_style || 'note_first');
     setVal('m_panel', d.menu_buttons && d.menu_buttons.panel ? 'true' : 'false');
     setVal('m_list', d.menu_buttons && d.menu_buttons.list ? 'true' : 'false');
@@ -16631,7 +16770,16 @@ function validateScalarConfig(key, rawValue) {
     pause_restored_text: 300,
     pause_warn_text: 300,
     block_notice_text: 300,
-    unblock_notice_text: 300
+    unblock_notice_text: 300,
+    visitor_blocked_text: 300,
+    visitor_unblocked_text: 300,
+    keyword_hit_text: 300,
+    quiz_lock_text: 300,
+    unsupported_notice_text: 300,
+    filter_send_text: 300,
+    filter_forward_text: 300,
+    verify_card_text: 500,
+    pass_deliver_text: 500
   };
 
   if (TEXT_LIMITS[key]) {
@@ -17015,6 +17163,24 @@ async function handleConfigApi(request, env) {
       cfgText('block_notice_text'),
     unblock_notice_text:
       cfgText('unblock_notice_text'),
+    visitor_blocked_text:
+      cfgText('visitor_blocked_text'),
+    visitor_unblocked_text:
+      cfgText('visitor_unblocked_text'),
+    keyword_hit_text:
+      cfgText('keyword_hit_text'),
+    verify_card_text:
+      cfgText('verify_card_text'),
+    pass_deliver_text:
+      cfgText('pass_deliver_text'),
+    quiz_lock_text:
+      cfgText('quiz_lock_text'),
+    filter_send_text:
+      cfgText('filter_send_text'),
+    filter_forward_text:
+      cfgText('filter_forward_text'),
+    unsupported_notice_text:
+      cfgText('unsupported_notice_text'),
     topic_title_style:
       cfg('topic_title_style', 'note_first'),
     menu_buttons: {
@@ -18688,10 +18854,10 @@ async function handleUserListAction(request, env) {
     try {
       passSent = await telegramApi(env.BOT_TOKEN, 'sendMessage', {
         chat_id: targetId,
-        text:
-          '🎫 管理员为你发放了一张验证通行证\n\n' +
-          '如果人机验证一直过不去，点击下方按钮即可直接通过验证。\n' +
-          '⏰ 通行证 ' + passMins + ' 分钟内有效，且只能使用一次。',
+        text: fillTextTemplate(
+          await textConfig('pass_deliver_text', env),
+          { minutes: passMins }
+        ),
         reply_markup: {
           inline_keyboard: [
             [
