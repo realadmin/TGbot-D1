@@ -7722,6 +7722,715 @@ async function telegramInitDataUserId(initDataRaw, botToken) {
   }
 }
 
+// initData 验签（带失败原因版，供 /api/app-auth）：与
+// telegramInitDataUserId 同一官方算法、同一新鲜窗
+// （auth_date 1 小时内、另留 300 秒时钟偏差）——主小
+// 程序打开瞬间即回传验证，窗口足够。失败拆三类：
+// bad_data（缺 hash / 结构坏 / 无 user）、bad_hash
+// （签名对不上，含篡改）、expired（auth_date 太旧或
+// 超前）。是否主管理员由调用方再判（not_admin）。
+async function validateTelegramInitData(initDataRaw, botToken) {
+  try {
+    const params = new URLSearchParams(
+      String(initDataRaw || '')
+    );
+    const hash = params.get('hash');
+
+    if (!hash) {
+      return { error: 'bad_data' };
+    }
+
+    params.delete('hash');
+
+    const pairs = [];
+
+    for (const [k, v] of params.entries()) {
+      pairs.push(`${k}=${v}`);
+    }
+
+    pairs.sort();
+
+    if (!pairs.length) {
+      return { error: 'bad_data' };
+    }
+
+    const enc = new TextEncoder();
+
+    const webAppKey = await crypto.subtle.importKey(
+      'raw',
+      enc.encode('WebAppData'),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+
+    const secret = await crypto.subtle.sign(
+      'HMAC',
+      webAppKey,
+      enc.encode(String(botToken || ''))
+    );
+
+    const secretKey = await crypto.subtle.importKey(
+      'raw',
+      secret,
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+
+    const sig = await crypto.subtle.sign(
+      'HMAC',
+      secretKey,
+      enc.encode(pairs.join('\n'))
+    );
+
+    const hex = [...new Uint8Array(sig)]
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+
+    if (!timingSafeEqualString(hex, hash)) {
+      return { error: 'bad_hash' };
+    }
+
+    const authDate = Number(params.get('auth_date') || 0);
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    if (
+      !authDate ||
+      authDate > nowSec + 300 ||
+      nowSec - authDate > 3600
+    ) {
+      return { error: 'expired' };
+    }
+
+    const user = JSON.parse(params.get('user') || 'null');
+
+    if (!user || user.id == null) {
+      return { error: 'bad_data' };
+    }
+
+    return { userId: String(user.id) };
+  } catch {
+    return { error: 'bad_data' };
+  }
+}
+
+// /api/app-auth 粗粒度尝试限流：按来源 IP 的 SHA-256
+// 摘要分桶的模块级计数（单 isolate 内有效、随 isolate
+// 回收清零）。刻意不落 D1：未鉴权尝试若每次都读写数
+// 据库，限流本身就成了写放大入口（第十一轮审计低
+// 7）。窗口 10 分钟、每来源至多 60 次——正常打开小
+// 程序只验签一次，余量远高于弱网重发所需。
+const APP_AUTH_RATE_WINDOW_MS = 10 * 60 * 1000;
+const APP_AUTH_RATE_MAX_ATTEMPTS = 60;
+const appAuthAttemptBuckets = new Map();
+
+async function appAuthRateLimited(request) {
+  const ip =
+    request.headers.get('CF-Connecting-IP') || '';
+
+  if (!ip) {
+    return false;
+  }
+
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(ip)
+  );
+
+  const key = [...new Uint8Array(digest)]
+    .slice(0, 8)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+
+  const now = Date.now();
+
+  let bucket = appAuthAttemptBuckets.get(key);
+
+  if (
+    !bucket ||
+    now - bucket.start >= APP_AUTH_RATE_WINDOW_MS
+  ) {
+    bucket = { start: now, count: 0 };
+    appAuthAttemptBuckets.set(key, bucket);
+  }
+
+  bucket.count += 1;
+
+  if (appAuthAttemptBuckets.size > 512) {
+    for (const [k, v] of appAuthAttemptBuckets) {
+      if (now - v.start >= APP_AUTH_RATE_WINDOW_MS) {
+        appAuthAttemptBuckets.delete(k);
+      }
+    }
+  }
+
+  return bucket.count > APP_AUTH_RATE_MAX_ATTEMPTS;
+}
+
+function appAuthFailedResponse() {
+  return Response.json(
+    { ok: false, error: 'auth_failed' },
+    { status: 403 }
+  );
+}
+
+// POST /api/app-auth：主小程序唯一的登录入口。只认
+// Telegram initData 验签——没有任何查询参数、备用口
+// 令或链接签名旁路；验签通过且为主管理员（与管理台
+// 同口径，协管员与访客一律拒）才签发 6 小时会话凭据。
+async function handleAppAuth(request, env) {
+  // 与同文件其余网页 POST 同口径的请求体上限（低
+  // 7）：先过体积再读体，不让超大 JSON 白吃解析。
+  if (
+    Number(
+      request.headers.get('content-length') || 0
+    ) > 16384
+  ) {
+    return Response.json(
+      { ok: false, error: 'too large' },
+      { status: 413 }
+    );
+  }
+
+  if (await appAuthRateLimited(request)) {
+    return Response.json(
+      { ok: false, error: 'auth_failed' },
+      { status: 429 }
+    );
+  }
+
+  let body;
+
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json(
+      { ok: false, error: 'bad json' },
+      { status: 400 }
+    );
+  }
+
+  const initData = String(body?.initData || '');
+
+  // 验签四路结论（数据坏 / 签名假 / 已过期 / 非管理
+  // 员）对外一律同一状态码与同一文案，不给未鉴权者
+  // 区分 initData 真伪、新鲜度与管理员资格的预言机
+  // （低 8）；具体原因只记服务端日志。
+  if (!initData) {
+    console.warn('小程序验签失败：bad_data（缺 initData）');
+
+    return appAuthFailedResponse();
+  }
+
+  const verdict = await validateTelegramInitData(
+    initData,
+    env.BOT_TOKEN
+  );
+
+  if (verdict.error) {
+    console.warn('小程序验签失败：', verdict.error);
+
+    return appAuthFailedResponse();
+  }
+
+  if (!isPrimaryAdmin(verdict.userId, env)) {
+    console.warn('小程序验签失败：not_admin');
+
+    return appAuthFailedResponse();
+  }
+
+  const session = await mintAppSession(verdict.userId, env);
+
+  // exp 与 e 同值（会话到期毫秒），供外壳按到期时
+  // 刻排续期定时器与到期看门狗（第十一轮修复批 B
+  // 中 1）。
+  return Response.json({ ok: true, ...session, exp: session.e });
+}
+
+// GET /app：主小程序外壳（BotFather 里填的地址就是
+// 它）。外壳本身不带任何凭据即可打开，真正的门是页
+// 面起来后把 Telegram initData 回传 /api/app-auth 验
+// 签换会话凭据；没有 initData（普通浏览器直开）只显
+// 示「请在 Telegram 中打开」提示。三页以 iframe 承
+// 载、凭据走查询串——与签名链接打开三页时完全一致
+// 的传参方式，页面脚本零感知。内嵌脚本刻意不用任何
+// 反斜杠转义序列（外层是模板字面量，转义会被煮熟）。
+function buildAppShellPage() {
+  return `<!doctype html>
+<html lang=\"zh-CN\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>机器人管理</title>
+<script src=\"https://telegram.org/js/telegram-web-app.js\" onerror=\"window.__tgSdkFailed=1\"></script>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; background: #0f141a; }
+body { display: flex; flex-direction: column; font-family: sans-serif; color: #e8eef4; }
+#apptabs { display: flex; gap: 8px; padding: 10px 12px; background: #17212b; }
+#apptabs button { flex: 1 1 0; height: 40px; border: 0; border-radius: 8px; background: #232f3d; color: #aebccb; font-size: 15px; cursor: pointer; }
+#apptabs button.on { background: #2b5278; color: #fff; }
+#appmsg { padding: 26px 20px; font-size: 15px; line-height: 1.7; color: #aebccb; text-align: center; }
+#appframe { flex: 1 1 auto; width: 100%; border: 0; display: none; background: #0f141a; opacity: 1; transition: opacity .28s ease; }
+#appbar { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: #6e2a2a; color: #ffd9d9; font-size: 14px; line-height: 1.5; }
+#appbar[hidden] { display: none; }
+#appbar span { flex: 1 1 auto; }
+#appbar button { flex: 0 0 auto; height: 32px; padding: 0 14px; border: 0; border-radius: 8px; background: #2b5278; color: #fff; font-size: 14px; cursor: pointer; }
+#appretry { padding: 26px 20px; font-size: 15px; line-height: 1.7; color: #aebccb; text-align: center; }
+#appretry[hidden] { display: none; }
+#appretry button { margin-top: 14px; height: 40px; padding: 0 22px; border: 0; border-radius: 8px; background: #2b5278; color: #fff; font-size: 15px; cursor: pointer; }
+#appconfirm { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: #57451a; color: #ffe9b0; font-size: 14px; line-height: 1.5; }
+#appconfirm[hidden] { display: none; }
+#appconfirm span { flex: 1 1 auto; }
+#appconfirm button { flex: 0 0 auto; height: 32px; padding: 0 14px; border: 0; border-radius: 8px; background: #2b5278; color: #fff; font-size: 14px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div id=\"apptabs\">
+<button type=\"button\" data-tab=\"/users\">访客列表</button>
+<button type=\"button\" data-tab=\"/panel\">管理台</button>
+<button type=\"button\" data-tab=\"/guide\">新手引导</button>
+</div>
+<div id=\"appmsg\">正在验证身份…</div>
+<div id=\"appbar\" hidden><span id=\"appbartext\"></span><button type=\"button\" id=\"appbarbtn\">重试</button></div>
+<div id=\"appretry\" hidden><div id=\"appretrytext\"></div><button type=\"button\" id=\"appretrybtn\">重试</button></div>
+<div id=\"appconfirm\" hidden><span id=\"appconfirmtext\"></span><button type=\"button\" id=\"appconfirmgo\">切换</button><button type=\"button\" id=\"appconfirmstay\">留下</button></div>
+<iframe id=\"appframe\" title=\"app\"></iframe>
+<script>
+var creds = null;
+var credsExp = 0;
+var curTab = '/users';
+var bootState = 'boot';
+var msgEl = document.getElementById('appmsg');
+var frame = document.getElementById('appframe');
+var barEl = document.getElementById('appbar');
+var barTextEl = document.getElementById('appbartext');
+var barBtn = document.getElementById('appbarbtn');
+var retryEl = document.getElementById('appretry');
+var retryTextEl = document.getElementById('appretrytext');
+var retryBtn = document.getElementById('appretrybtn');
+var tabsEl = document.getElementById('apptabs');
+var confirmEl = document.getElementById('appconfirm');
+var confirmTextEl = document.getElementById('appconfirmtext');
+var confirmGoBtn = document.getElementById('appconfirmgo');
+var confirmStayBtn = document.getElementById('appconfirmstay');
+var tabBtns = document.querySelectorAll('#apptabs button');
+var ERR_TEXT = {
+  bad_data: '没能读到 Telegram 传来的身份信息，请关掉小程序后重新打开。',
+  bad_hash: '身份校验没通过，请关掉小程序后重新打开。',
+  expired: '这次打开已经过期，请关掉小程序后重新打开。',
+  not_admin: '只有主管理员能打开这个小程序。',
+  auth_failed: '身份验证失败，请关掉小程序后重新打开。',
+  'bad json': '请求格式错误，请关掉小程序后重新打开。'
+};
+// 页签切换平滑过渡（-v163b6）：切换仍是换 src 重
+// 载（加载语义不变，与此前一致），只给呈现加淡入
+// 淡出：点页签先把 frame 透明度降到 0（frame 与页
+// 面底色同为深色，不闪白），新页 load 后经 CSS 过
+// 渡（opacity .28s）在原地淡入。连点页签以序号守
+// 卫：只有最后一次切换的 load 或兜底计时能淡入，
+// 迟到的 load 不会把旧页闪回来；showMsg 同样作废
+// 在途切换。第十一轮修复批 B（低 12）：1600ms 兜
+// 底不再无条件淡入——load 到了先同源检视 iframe
+// 文档，正常页才淡入；命中会话失效/服务不可用文
+// 案的错误页不装正常（见 inspectFrame）；超时未
+// 到的只亮「加载较慢」错误条，等真 load 再检视。
+var frameSeq = 0, frameTimer = 0;
+var refreshTimer = 0, expireTimer = 0;
+var authSeq = 0;
+function frameShow(seq) {
+  if (seq !== frameSeq) return;
+  if (frameTimer) { clearTimeout(frameTimer); frameTimer = 0; }
+  frame.style.opacity = '1';
+}
+function hideBar() { barEl.hidden = true; }
+// 未保存草稿守卫（第十一轮修复批 C，中 5）：切页签
+// 前同源询问当前 iframe 页面的 __hasUnsavedDraft
+// （三页各自暴露同名口径，见各页脚本），脏时先弹
+// 确认条让用户决定，不再无条件重载把草稿冲掉。
+var pendingTabPath = null;
+function frameDirty() {
+  try {
+    var w = frame.contentWindow;
+    return !!(w && typeof w.__hasUnsavedDraft === 'function' && w.__hasUnsavedDraft());
+  } catch (e) { return false; }
+}
+function hideConfirm() { confirmEl.hidden = true; pendingTabPath = null; }
+function showConfirm(path) {
+  pendingTabPath = path;
+  confirmTextEl.textContent = '有未保存的修改，仍要切换？';
+  confirmEl.hidden = false;
+}
+confirmGoBtn.onclick = function () { var p = pendingTabPath; hideConfirm(); if (p) loadTab(p); };
+confirmStayBtn.onclick = function () { hideConfirm(); };
+function requestTab(path) {
+  if (creds && bootState === 'ready' && frameDirty()) { showConfirm(path); return; }
+  hideConfirm();
+  loadTab(path);
+}
+function showBar(text, fn) {
+  barTextEl.textContent = text;
+  barBtn.onclick = fn || null;
+  barEl.hidden = false;
+}
+function hideRetry() { retryEl.hidden = true; }
+function showRetry(text, btnLabel, fn) {
+  frameSeq++;
+  if (frameTimer) { clearTimeout(frameTimer); frameTimer = 0; }
+  frame.style.display = 'none';
+  msgEl.style.display = 'none';
+  retryTextEl.textContent = text;
+  retryBtn.textContent = btnLabel || '重试';
+  retryBtn.onclick = fn || null;
+  retryEl.hidden = false;
+}
+function showMsg(t) {
+  frameSeq++;
+  if (frameTimer) { clearTimeout(frameTimer); frameTimer = 0; }
+  frame.style.display = 'none';
+  retryEl.hidden = true;
+  msgEl.style.display = 'block';
+  msgEl.textContent = t;
+}
+// initData 取数（中 2）：首选官方脚本给的
+// Telegram.WebApp.initData；脚本没加载出来或没给
+// 数据时，自行解析 location.hash 里的 tgWebAppData
+// 兜底（官方脚本本来就是从那里解析出 initData
+// 的）。两路都空才算没数据，并区分「脚本没加载
+// 出来」（可重试）与「不在 Telegram 里打开」。
+function initDataFromHash() {
+  var h = String(location.hash || '');
+  if (h.charAt(0) === '#') h = h.slice(1);
+  if (!h) return '';
+  var parts = h.split('&');
+  for (var i = 0; i < parts.length; i++) {
+    var eq = parts[i].indexOf('=');
+    if (eq > 0 && parts[i].slice(0, eq) === 'tgWebAppData') {
+      try { return decodeURIComponent(parts[i].slice(eq + 1)); } catch (e) { return ''; }
+    }
+  }
+  return '';
+}
+function getInitData() {
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg && tg.initData) return { data: tg.initData, sdkFailed: false };
+  var hd = initDataFromHash();
+  if (hd) return { data: hd, sdkFailed: false };
+  return { data: '', sdkFailed: !tg };
+}
+// 验签请求（批 A 契约 + 低 13）：带 12 秒超时，
+// 不让请求挂死在「正在验证身份…」；结论按状态码
+// 归因——200 成功 / 503 服务端暂不可用 / 429 尝
+// 试过频 / 403、400 凭据失败 / 其余与网络异常归
+// 暂时失败，不再笼统报「网络不畅」。
+function doAuth(done) {
+  var got = getInitData();
+  if (!got.data) { done({ ok: false, kind: 'nodata', sdkFailed: got.sdkFailed }); return; }
+  var settled = false;
+  var timer = 0;
+  var ctl = null;
+  function finish(res) {
+    if (settled) return;
+    settled = true;
+    if (timer) { clearTimeout(timer); timer = 0; }
+    done(res);
+  }
+  try {
+    if (window.AbortController) {
+      ctl = new AbortController();
+      timer = setTimeout(function () { try { ctl.abort(); } catch (e) {} }, 12000);
+    }
+  } catch (e) { ctl = null; }
+  var opts = { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ initData: got.data }) };
+  if (ctl) opts.signal = ctl.signal;
+  fetch('/api/app-auth', opts).then(function (r) {
+    return r.json().then(function (d) { return { status: r.status, d: d }; }, function () { return { status: r.status, d: null }; });
+  }).then(function (res) {
+    var d = res.d;
+    if (res.status === 200 && d && d.ok && d.u && d.s) {
+      finish({ ok: true, creds: d, exp: Number(d.exp || d.e || 0) });
+    } else if (res.status === 503) {
+      finish({ ok: false, kind: 'unavailable' });
+    } else if (res.status === 429) {
+      finish({ ok: false, kind: 'rate' });
+    } else if (res.status === 403 || res.status === 400) {
+      finish({ ok: false, kind: 'cred', error: (d && d.error) || '' });
+    } else {
+      finish({ ok: false, kind: 'temp' });
+    }
+  }).catch(function () { finish({ ok: false, kind: 'temp' }); });
+}
+// 会话续期（中 1）：凭据到期前 10 分钟静默换新会
+// 话并重载当前页签（地址换上新凭据）；换新失败
+// 每分钟重试；到期看门狗再兜一次，仍不行才弹恢
+// 复层。页面从后台回前台且已进入续期窗时立即补
+// 一次，不等可能被系统节流的定时器。
+function scheduleSessionTimers() {
+  if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = 0; }
+  if (expireTimer) { clearTimeout(expireTimer); expireTimer = 0; }
+  if (!credsExp) return;
+  var now = Date.now();
+  var untilRefresh = credsExp - 600000 - now;
+  if (untilRefresh < 30000) untilRefresh = 30000;
+  refreshTimer = setTimeout(proactiveRefresh, Math.min(untilRefresh, 2147483647));
+  expireTimer = setTimeout(expireWatchdog, Math.min(Math.max(credsExp - now, 0) + 2000, 2147483647));
+}
+function proactiveRefresh() {
+  refreshSession(function (ok) {
+    if (ok) {
+      reloadAfterRefresh();
+    } else {
+      refreshTimer = setTimeout(proactiveRefresh, 60000);
+    }
+  });
+}
+// 续期成功后的重载也要过草稿守卫（批 C，中 5）：
+// 当前页有未保存修改时不静默重载，弹恢复层让用
+// 户决定（凭据已换新，只推迟重载）。
+function reloadAfterRefresh() {
+  if (bootState !== 'ready' || !retryEl.hidden) return;
+  if (frameDirty()) {
+    showRetry('会话已续期，但当前页有未保存的修改，没有自动刷新。点「刷新页面」重载页面（未保存的修改会丢失）。', '刷新页面', function () { loadTab(curTab); });
+    return;
+  }
+  loadTab(curTab);
+}
+function expireWatchdog() {
+  refreshSession(function (ok) {
+    if (ok) {
+      reloadAfterRefresh();
+    } else {
+      showRetry('会话已过期，自动续期没成功。点「重新进入」重新验证身份，或关闭小程序后重新打开。', '重新进入', bootApp);
+    }
+  });
+}
+function refreshSession(done) {
+  var my = ++authSeq;
+  doAuth(function (res) {
+    if (my !== authSeq) { if (done) done(false); return; }
+    if (res.ok) {
+      creds = res.creds;
+      credsExp = res.exp;
+      scheduleSessionTimers();
+      if (done) done(true);
+    } else if (done) {
+      done(false);
+    }
+  });
+}
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden || !creds) return;
+  if (credsExp && credsExp - Date.now() < 600000) proactiveRefresh();
+});
+// iframe 加载结果检视（低 12 + 中 1）：外壳与三
+// 页同源，可读 iframe 文档文本。正常页淡入；会
+// 话失效页先静默换新会话重载本页签、换不动才弹
+// 恢复层；服务不可用页亮错误条给重试，不把错误
+// 页装成正常页淡入。
+function inspectFrame(seq) {
+  var t = '';
+  try {
+    var d = frame.contentDocument;
+    if (d && d.body) t = String(d.body.textContent || '');
+  } catch (e) { t = ''; }
+  if (t && t.indexOf('链接无效或已过期') >= 0) {
+    hideBar();
+    refreshSession(function (ok) {
+      if (seq !== frameSeq) return;
+      if (ok) loadTab(curTab);
+      else showRetry('会话已过期，自动续期没成功。点「重新进入」重新验证身份，或关闭小程序后重新打开。', '重新进入', bootApp);
+    });
+    return;
+  }
+  if (t && t.indexOf('服务暂时不可用') >= 0) {
+    showBar('服务暂时不可用，请稍后重试。', function () { loadTab(curTab); });
+    return;
+  }
+  hideBar();
+  frameShow(seq);
+}
+function loadTab(path) {
+  if (!creds) {
+    if (bootState !== 'booting') bootApp();
+    return;
+  }
+  if (credsExp && credsExp <= Date.now()) {
+    refreshSession(function (ok) {
+      if (ok) loadTab(path);
+      else showRetry('会话已过期，自动续期没成功。点「重新进入」重新验证身份，或关闭小程序后重新打开。', '重新进入', bootApp);
+    });
+    return;
+  }
+  curTab = path;
+  hideConfirm();
+  hideRetry();
+  for (var i = 0; i < tabBtns.length; i++) {
+    tabBtns[i].className = tabBtns[i].getAttribute('data-tab') === path ? 'on' : '';
+  }
+  msgEl.style.display = 'none';
+  frame.style.display = 'block';
+  var seq = ++frameSeq;
+  frame.style.opacity = '0';
+  frame.onload = function () { inspectFrame(seq); };
+  frame.src = path + '?u=' + encodeURIComponent(creds.u) + '&e=' + encodeURIComponent(creds.e) + '&s=' + encodeURIComponent(creds.s);
+  if (frameTimer) clearTimeout(frameTimer);
+  frameTimer = setTimeout(function () {
+    if (seq !== frameSeq) return;
+    showBar('页面加载较慢，可能网络不畅，点此重试。', function () { loadTab(curTab); });
+  }, 1600);
+}
+for (var j = 0; j < tabBtns.length; j++) {
+  tabBtns[j].addEventListener('click', function () {
+    requestTab(this.getAttribute('data-tab'));
+  });
+}
+// 主题衔接（低 14）：外壳底色与页签条跟随
+// Telegram 主题参数，顶栏与背景色同步给客户端，
+// 不再写死深色、与浅色主题割裂；三页内部设计不
+// 动。主题切换时经 themeChanged 事件重取。
+var themeHooked = false;
+function applyTheme() {
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (!tg) return;
+  var tp = tg.themeParams || {};
+  var bg = tp.bg_color || '';
+  var sec = tp.secondary_bg_color || '';
+  if (bg) {
+    document.documentElement.style.background = bg;
+    document.body.style.background = bg;
+    frame.style.background = bg;
+  }
+  if (sec) tabsEl.style.background = sec;
+  if (tp.text_color) {
+    msgEl.style.color = tp.text_color;
+    retryEl.style.color = tp.text_color;
+  }
+  try { if (tg.setHeaderColor) tg.setHeaderColor(sec || bg || '#17212b'); } catch (e) {}
+  try { if (tg.setBackgroundColor) tg.setBackgroundColor(bg || '#0f141a'); } catch (e) {}
+  if (!themeHooked && tg.onEvent) {
+    themeHooked = true;
+    try { tg.onEvent('themeChanged', applyTheme); } catch (e) {}
+  }
+}
+// boot（低 13）：失败按归因给明确错误 + 重试入
+// 口（恢复层按钮、或错误态下点任意页签都会重走
+// boot），不再一次性失败只能关掉小程序重开。
+function bootApp() {
+  if (bootState === 'booting') return;
+  hideBar();
+  hideRetry();
+  var got = getInitData();
+  if (!got.data) {
+    bootState = 'error';
+    if (got.sdkFailed) {
+      showRetry('身份组件加载失败，请检查网络后重试。', '重试', bootApp);
+    } else {
+      showMsg('请在 Telegram 中打开本小程序：回到与机器人的聊天，点聊天列表或机器人资料页上的「打开」。');
+    }
+    return;
+  }
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) {
+    if (tg.ready) tg.ready();
+    if (tg.expand) tg.expand();
+  }
+  bootState = 'booting';
+  showMsg('正在验证身份…');
+  var my = ++authSeq;
+  doAuth(function (res) {
+    if (my !== authSeq) return;
+    if (res.ok) {
+      creds = res.creds;
+      credsExp = res.exp;
+      bootState = 'ready';
+      scheduleSessionTimers();
+      loadTab(curTab);
+    } else {
+      bootState = 'error';
+      if (res.kind === 'unavailable') {
+        showRetry('服务暂时不可用，身份验证没完成，请稍后重试。', '重试', bootApp);
+      } else if (res.kind === 'rate') {
+        showRetry('验证尝试过于频繁，请稍后再试。', '重试', bootApp);
+      } else if (res.kind === 'cred') {
+        showRetry(ERR_TEXT[res.error] || '身份验证失败，请关掉小程序后重新打开。', '重新进入', bootApp);
+      } else if (res.kind === 'nodata' && res.sdkFailed) {
+        showRetry('身份组件加载失败，请检查网络后重试。', '重试', bootApp);
+      } else {
+        showRetry('网络不畅，身份验证没完成，请检查网络后重试。', '重试', bootApp);
+      }
+    }
+  });
+}
+applyTheme();
+bootApp();
+</script>
+<script>
+// ===== WebView 保活（Telegram iOS WebView keepalive）=====
+// 这是 Telegram iOS WebView 的保活构成，不是探针、也不是日志层：
+// 外壳 window 上注册两条 passive 空转监听（touchmove / scroll，
+// 处理函数 webviewKeepaliveNoop 本身什么都不做，注册在位才是
+// 关键）；另有每 250ms 一次的跨框采样，读内容 iframe 的滚动
+// 位置、高度与焦点元素（采样串字段 ifY / ifH / ifAe），只在
+// 采样值变化时写入一个隐形节点（opacity:0、pointer-events
+// none、带 aria-hidden）。
+// 这套构成是真机逐级拆解实证的承重件：删掉任一监听或停掉
+// 采样，iOS WebView 会在拖动等手势中失活（输入框焦点被夺
+// 走）。勿删、勿改节奏与字段、勿「优化」。外围仅两点（b23
+// 起）：页面隐藏（document.hidden）时跳过采样 tick；隐形
+// 节点带 aria-hidden。
+(function () {
+  var webviewKeepaliveBarText = null;
+  function webviewKeepaliveElementName(el) {
+    if (!el) return 'null';
+    var s = el.tagName || '?';
+    if (el.id) s += '#' + el.id;
+    return s;
+  }
+  function webviewKeepaliveSample() {
+    var f = document.getElementById('appframe');
+    if (!f) return 'if=no';
+    try {
+      var w = f.contentWindow;
+      if (!w) return 'if=nowin';
+      return 'ifY=' + Math.round(w.pageYOffset || 0) + ' ifH=' + w.innerHeight + ' ifAe=' + webviewKeepaliveElementName(w.document.activeElement);
+    } catch (e) { return 'if=ERR'; }
+  }
+  function webviewKeepaliveNoop() {}
+  var webviewKeepaliveBar = document.createElement('div');
+  webviewKeepaliveBar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:rgba(10,16,22,.85);color:#9fe8a9;font:9px/1.35 monospace;padding:3px 6px;pointer-events:none;max-height:52px;overflow:hidden;opacity:0;';
+  webviewKeepaliveBarText = document.createElement('div');
+  webviewKeepaliveBarText.style.cssText = 'white-space:pre-wrap;word-break:break-all;';
+  webviewKeepaliveBar.appendChild(webviewKeepaliveBarText);
+  webviewKeepaliveBar.setAttribute('aria-hidden', 'true');
+  document.body.appendChild(webviewKeepaliveBar);
+  window.addEventListener('touchmove', webviewKeepaliveNoop, { passive: true });
+  window.addEventListener('scroll', webviewKeepaliveNoop, { passive: true });
+  var webviewKeepaliveLastSample = '';
+  setInterval(function () {
+    if (document.hidden) return;
+    var s = webviewKeepaliveSample();
+    if (s !== webviewKeepaliveLastSample) { webviewKeepaliveLastSample = s; webviewKeepaliveBarText.textContent = s; }
+  }, 250);
+  webviewKeepaliveBarText.textContent = webviewKeepaliveSample();
+})();
+</script>
+</body>
+</html>`;
+}
+
+function handleAppShellPage() {
+  return new Response(buildAppShellPage(), {
+    status: 200,
+    headers: {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+      'referrer-policy': 'no-referrer',
+      'x-content-type-options': 'nosniff'
+    }
+  });
+}
+
 async function sendTestVerifyPrompt(
   chatId,
   env,
@@ -13401,7 +14110,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.6.3';
+const BOT_VERSION = 'v1.7.0';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -13892,6 +14601,15 @@ async function handleUpdateCheckCallback(
 
 const USERLIST_LINK_TTL_MS = 10 * 60 * 1000;
 
+// 主小程序会话（/app 外壳 + /api/app-auth 验签后签发）：
+// 会话有效期 6 小时（每次打开小程序都重新验 initData
+// 换新会话，长短不敏感，取数小时级即可）。会话签名带
+// app. 前缀与链接签名分流——链接签名是纯 hex，不含 '.'
+// 与 'p'，不可能撞前缀；checkUserListAuth 见前缀走会话
+// 校验、其余走原链接校验，旧路径行为逐字不变。
+const APP_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
+const APP_SESSION_SIG_PREFIX = 'app.';
+
 // 签名链接按用途分权：访客列表（usrlist）/ 网页管理台（panel）/
 // 新手引导（guide）三套签名互不通用——只读性质的引导链接
 // 不再等于全权管理凭据，列表链接也改不了配置。
@@ -13911,15 +14629,176 @@ function panelScopeForPath(path) {
 // 单独让某一类链接立即失效。epoch 掺入签名载荷——吊销
 // 即代次 +1，旧链接的签名随即对不上、验签失败。验证
 // 链接与通行证不掺 epoch，不受吊销影响。
-async function getLinkEpoch(env, scope) {
-  const raw = await dbConfigGet(
-    `linkepoch:${scope}`,
-    env
+const LINK_EPOCH_SCOPES = ['usrlist', 'panel', 'guide'];
+
+// 鉴权存储不可用标记错误：epoch 读取遇 D1 异常时抛
+// 出，由 fetch 的网页路由层据此回受控 503（API 给
+// JSON、页面给友好错误页），不再直穿成未捕获 500
+// （第十一轮审计中 4）。其余异常不带此标记、照旧上抛。
+function authStoreUnavailableError(cause) {
+  const error = new Error('auth store unavailable');
+
+  error.code = 'AUTH_STORE_UNAVAILABLE';
+  error.cause = cause;
+
+  return error;
+}
+
+function authStoreUnavailableResponse(pathname) {
+  if (String(pathname || '').startsWith('/api/')) {
+    return Response.json(
+      { ok: false, error: 'unavailable' },
+      { status: 503 }
+    );
+  }
+
+  return new Response(
+    '<!doctype html><meta charset="utf-8">' +
+    '<p style="font-family:sans-serif;padding:24px">' +
+    '服务暂时不可用，请稍后重试。' +
+    '</p>',
+    {
+      status: 503,
+      headers: {
+        'content-type': 'text/html; charset=utf-8',
+        'referrer-policy': 'no-referrer',
+        'x-content-type-options': 'nosniff'
+      }
+    }
   );
+}
 
-  const n = Number(raw);
+// epoch 行值解析：行不存在 = 0（合法初始态）；行在但
+// 值不是非负整数字符串 = 数据损坏，返回 null（不可
+// 信）。唯一写入方（吊销）只写 String(整数)，其余形
+// 态一律按损坏处理（第十一轮审计低 6 的 fail-closed
+// 口径，鉴权侧据 corrupt 集合拒绝）。
+function parseLinkEpochValue(raw) {
+  if (raw == null) {
+    return 0;
+  }
 
-  return Number.isInteger(n) && n > 0 ? n : 0;
+  const text = String(raw).trim();
+
+  if (!/^\d{1,15}$/.test(text)) {
+    return null;
+  }
+
+  const n = Number(text);
+
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+// epoch 状态按请求备忘（挂法同请求级访客行缓存）：
+// 三个 scope 一条查询取齐（低 10），同一请求内后续
+// 读取零成本；吊销写后由吊销 handler 清备忘防读到
+// 吊销前的值。D1 读失败抛 AUTH_STORE_UNAVAILABLE。
+function linkEpochCache(env) {
+  const cache = env?.__linkEpochCache;
+
+  return cache instanceof Map ? cache : null;
+}
+
+async function loadLinkEpochState(env) {
+  const cache = linkEpochCache(env);
+
+  if (cache?.has('state')) {
+    return cache.get('state');
+  }
+
+  let result;
+
+  try {
+    result = await env.TG_BOT_DB.prepare(
+      'SELECT key, value FROM config WHERE key IN (?, ?, ?)'
+    )
+      .bind(
+        ...LINK_EPOCH_SCOPES.map(
+          (scope) => `linkepoch:${scope}`
+        )
+      )
+      .all();
+  } catch (error) {
+    throw authStoreUnavailableError(error);
+  }
+
+  const epochs = new Map();
+  const corrupt = new Set();
+  const seen = new Set();
+
+  for (const row of result?.results || []) {
+    const scope = String(row.key || '').slice(
+      'linkepoch:'.length
+    );
+
+    if (!LINK_EPOCH_SCOPES.includes(scope)) {
+      continue;
+    }
+
+    seen.add(scope);
+
+    const parsed = parseLinkEpochValue(row.value);
+
+    if (parsed == null) {
+      corrupt.add(scope);
+      epochs.set(scope, 0);
+    } else {
+      epochs.set(scope, parsed);
+    }
+  }
+
+  for (const scope of LINK_EPOCH_SCOPES) {
+    if (!seen.has(scope)) {
+      epochs.set(scope, 0);
+    }
+  }
+
+  const state = { epochs, corrupt };
+
+  if (cache) {
+    cache.set('state', state);
+  }
+
+  return state;
+}
+
+// epoch 行损坏的节流告警（每 scope 每小时至多一条，
+// config 时间戳节流，与既有 alertat 口径一致）：损坏
+// 意味着吊销状态不可信、鉴权侧已按拒绝处理，告警是
+// 给管理员留的修复线索。
+async function alertLinkEpochCorrupt(env, scope) {
+  try {
+    const key = `alertat:linkepoch:${scope}`;
+
+    const last = Number(
+      (await dbConfigGet(key, env)) || 0
+    );
+
+    if (Date.now() - last < 60 * 60 * 1000) {
+      return;
+    }
+
+    await dbConfigPut(key, String(Date.now()), env);
+
+    await notifyPrimaryAdmins(
+      env,
+      '⚠️ 链接吊销代次数据损坏（' + scope +
+      '）：相关网页入口已按鉴权失败处理，吊销状态' +
+      '可能已失效。请检查配置项 linkepoch:' + scope +
+      ' 并重新执行一次吊销以修复。'
+    );
+  } catch (error) {
+    console.error(
+      '发送 epoch 损坏告警失败：',
+      error?.message || error
+    );
+  }
+}
+
+async function getLinkEpoch(env, scope) {
+  const state = await loadLinkEpochState(env);
+
+  return state.epochs.get(scope) ?? 0;
 }
 
 async function buildSignedPanelUrl(
@@ -13981,15 +14860,46 @@ async function checkUserListAuth(
   const exp = Number(expRaw);
   const now = Date.now();
 
-  if (
-    !Number.isFinite(exp) ||
-    exp <= now ||
-    exp > now + USERLIST_LINK_TTL_MS + 60 * 1000
-  ) {
+  if (!Number.isFinite(exp) || exp <= now) {
     return null;
   }
 
-  const epoch = await getLinkEpoch(env, scope);
+  // 小程序会话凭据（签名带 app. 前缀）：自带有效期上
+  // 限与三用途 epoch 绑定，细则见 checkAppSessionAuth；
+  // 通过即按主管理员凭据放行（三页页面、GET 查询串与
+  // POST body 三种传参最终都收口到本函数）。不带前缀
+  // 的一律继续走下方原链接校验，逐字不变。
+  if (
+    String(signature || '').startsWith(
+      APP_SESSION_SIG_PREFIX
+    )
+  ) {
+    return (await checkAppSessionAuth(
+      id,
+      exp,
+      String(signature),
+      env
+    ))
+      ? id
+      : null;
+  }
+
+  if (exp > now + USERLIST_LINK_TTL_MS + 60 * 1000) {
+    return null;
+  }
+
+  const epochState = await loadLinkEpochState(env);
+
+  // epoch 行损坏 = 吊销状态不可信：fail-closed 拒绝
+  // 并留节流告警，不再把坏值归一成 0 放行旧凭据
+  // （第十一轮审计低 6）。
+  if (epochState.corrupt.has(scope)) {
+    await alertLinkEpochCorrupt(env, scope);
+
+    return null;
+  }
+
+  const epoch = epochState.epochs.get(scope) ?? 0;
 
   const expected = await hmacSha256Hex(
     linkSecret(env),
@@ -14010,6 +14920,108 @@ async function checkUserListAuth(
   }
 
   return id;
+}
+
+// 小程序会话凭据校验：exp 须落在会话有效期窗口内；
+// 凭据自带签发时三页全部用途的 epoch 三元组（明文携
+// 带、被签名覆盖，改一字签名即对不上）——先在本地验
+// 格式与 HMAC（零 D1，伪造凭据到此为止，第十一轮审
+// 计低 9），通过后才读当前 epoch 做吊销核对：任一
+// 用途在管理台被「吊销链接」都会连带让全部小程序会
+// 话失效（吊销后重新打开小程序验签换新会话即可）。
+// 签名与链接共用 linkSecret，载荷另带 app: 域分
+// 隔，链接签名无法挪作会话签名（且会话签名带 app.
+// 前缀先行分流）。
+async function checkAppSessionAuth(id, exp, signature, env) {
+  const now = Date.now();
+
+  if (
+    !Number.isFinite(exp) ||
+    exp <= now ||
+    exp > now + APP_SESSION_TTL_MS + 60 * 1000
+  ) {
+    return false;
+  }
+
+  const match =
+    /^app\.(\d{1,15})\.(\d{1,15})\.(\d{1,15})\.([0-9a-f]{64})$/.exec(
+      String(signature || '')
+    );
+
+  if (!match) {
+    return false;
+  }
+
+  const carried = [
+    Number(match[1]),
+    Number(match[2]),
+    Number(match[3])
+  ];
+
+  const expected =
+    APP_SESSION_SIG_PREFIX +
+    carried.join('.') +
+    '.' +
+    (await hmacSha256Hex(
+      linkSecret(env),
+      `app:${id}:${exp}:${carried.join('.')}`
+    ));
+
+  if (!timingSafeEqualString(expected, String(signature))) {
+    return false;
+  }
+
+  if (!isPrimaryAdmin(id, env)) {
+    return false;
+  }
+
+  // 吊销核对段：三 scope 当前 epoch（一条批量查询、
+  // 按请求备忘）；与签发值不符即已吊销，数据损坏同
+  // 样拒（fail-closed）并留节流告警。
+  const state = await loadLinkEpochState(env);
+
+  for (let i = 0; i < LINK_EPOCH_SCOPES.length; i += 1) {
+    const scope = LINK_EPOCH_SCOPES[i];
+
+    if (state.corrupt.has(scope)) {
+      await alertLinkEpochCorrupt(env, scope);
+
+      return false;
+    }
+
+    if (state.epochs.get(scope) !== carried[i]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// 为已验明身份的主管理员签发小程序会话凭据：返回的
+// { u, e, s } 与签名链接同名同位，三页与数据 API 既有
+// 的传参方式（GET 查询串 / POST body）原样复用。签
+// 名串自带 epoch 三元组（app.<e1>.<e2>.<e3>.<签名>），
+// 校验侧先本地验签、后读库核对吊销（见
+// checkAppSessionAuth）。
+async function mintAppSession(adminId, env) {
+  const exp = Date.now() + APP_SESSION_TTL_MS;
+
+  const state = await loadLinkEpochState(env);
+
+  const triple = LINK_EPOCH_SCOPES
+    .map((scope) => state.epochs.get(scope) ?? 0)
+    .join('.');
+
+  const signature =
+    APP_SESSION_SIG_PREFIX +
+    triple +
+    '.' +
+    (await hmacSha256Hex(
+      linkSecret(env),
+      `app:${adminId}:${exp}:${triple}`
+    ));
+
+  return { u: String(adminId), e: exp, s: signature };
 }
 
 async function panelQueryAdminId(
@@ -14444,10 +15456,27 @@ async function signedPageResponse(
     await panelQueryAdminId(request, env, scope);
 
   if (!adminId) {
+    // 带 app. 前缀凭据来的请求是小程序会话失效
+    // （第十一轮修复批 B 中 1）：文案改指小程序的
+    // 自救路径，不再让用户去找小程序里不存在的主
+    // 菜单；链接模式文案逐字不变。
+    let shownText = expiredText;
+
+    try {
+      const sParam0 =
+        new URL(request.url).searchParams.get('s') || '';
+
+      if (sParam0.startsWith(APP_SESSION_SIG_PREFIX)) {
+        shownText =
+          '会话已失效，请关闭小程序后重新打开，' +
+          '或点小程序顶部的「重新进入」。';
+      }
+    } catch (_) {}
+
     return new Response(
       '<!doctype html><meta charset="utf-8">' +
       '<p style="font-family:sans-serif;padding:24px">' +
-      expiredText +
+      shownText +
       '</p>',
       {
         status: 403,
@@ -14462,8 +15491,26 @@ async function signedPageResponse(
 
   const pageCtx = {
     botUsername: '',
-    auditDegraded: false
+    auditDegraded: false,
+    appMode: false
   };
+
+  // 小程序会话打开的页面不挂链接过期横幅：会话凭据
+  // 6 小时、每次打开小程序都重新验签换新，没有「链
+  // 接即将过期」的概念。识别只看验签已通过前提下的
+  // 签名形态——带 app. 前缀者必为会话凭据（链接签名
+  // 是纯 hex，不可能带前缀）；横幅脚本本体与链接路
+  // 径零改动。
+  try {
+    const sParam =
+      new URL(request.url).searchParams.get('s') || '';
+
+    pageCtx.appMode = sParam.startsWith(
+      APP_SESSION_SIG_PREFIX
+    );
+  } catch (_) {
+    pageCtx.appMode = false;
+  }
 
   try {
     const cached = String(
@@ -15645,6 +16692,7 @@ function buildGuidePage(pageCtx = {}) {
     <h2>🚀 开始使用</h2>
     <ol>
       <li><b class=\"k\">打开主菜单：</b>在机器人私聊里发送 <code>/start</code>，网页管理台、访客列表和这本引导都在这里。菜单只留最新一份：再发一次 /start，上一次的 /start 和旧菜单会被自动删掉，不会在聊天里堆积（若隔了超过 48 小时才回来，旧菜单已过 Telegram 的删除期限、删不掉，会留在那里，手动删一下即可）；留下的这条 /start 点一下就能再发，网页链接过期时靠它刷新最方便。</li>
+      <li><b class=\"k\">（可选）装上主小程序入口：</b>在 BotFather 里发送 <code>/mybots</code> → 选你的机器人 → Bot Settings → Main App，把地址填成 <code>https://<你的 Worker 域名>/app</code>（域名换成你自己 Worker 的）。填好之后，就能从聊天列表或机器人资料页点「打开」直接进入小程序：访客列表、管理台和这本引导是同一个小程序里的三个页签，点顶部页签切换。在小程序里切换页签时，如果当前页有还没保存的修改，会先弹确认，确认后才切换，不会悄悄丢掉。注意别把两种打开方式的有效期混为一谈：从主菜单打开的是 10 分钟有效的签名链接；小程序用的是独立会话（约 6 小时、到期前自动续期），万一提示失效，关掉小程序重新打开、或点小程序顶部的「重新进入」即可。</li>
       <li><b class=\"k\">先定验证方式：</b>进「网页管理台 → 基础配置」，选一种验证方式（推荐 Turnstile，访客点一下就通过），顺便把欢迎消息改成你想在访客验证成功时对他说的话（验证成功时发给他，就是「🎉 验证成功」那条）。</li>
       <li><b class=\"k\">把机器人发给访客：</b>访客打开私聊、完成验证之后给你发消息，你的群里就会自动多出一个以他名字命名的话题。</li>
       <li><b class=\"k\">在话题里直接回复：</b>不需要任何额外设置，在他的话题里打字、发图，就是发给他本人。</li>
@@ -15716,10 +16764,10 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
       <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到访客列表；这一区还有一份「成员看门狗豁免名单」，把合法的其他机器人或账号 ID 填进去，它们进管理群时就不会触发成员告警。</li>
       <li><b class=\"k\">服务熔断：</b>被消息轰炸时在这里一键暂停机器人（或用 /pause 命令），可设定暂停时长、到期自动恢复；还能设置暂停期间给访客的回复语句，或关掉回复保持完全静默。</li>
-      <li><b class=\"k\">文案与呈现：</b>答错与锁定提示、人机验证卡正文、通行证送达、熔断恢复、熔断编辑警告、拉黑 / 解封提醒、发给访客的封禁 / 解封通知、关键词命中与类型过滤的拒绝提示、特殊类型无法转达提示，这些机器人说的话都能改成你自己的口气；话题名的样式（备注在前还是名字在前、带不带 ID）、主菜单上显示哪些按钮、访客列表默认排序与每页条数、时间显示的时区（默认 Asia/Singapore），也都在这里。</li>
+      <li><b class=\"k\">文案与呈现：</b>机器人对访客说的话大多能改成你自己的口气：管理台可配文案共 19 项，欢迎消息在「基础配置」、熔断期间回复在「服务熔断」，其余都在这一区——答错提示与锁定提示、人机验证卡正文、通行证送达、熔断恢复、熔断编辑警告、拉黑 / 解封提醒、发给访客的封禁 / 解封通知、关键词命中与类型过滤的拒绝提示（类型过滤分发送类与转发类两条模板）、特殊类型无法转达提示；话题名的样式（备注在前还是名字在前、带不带 ID）、主菜单上显示哪些按钮、访客列表默认排序与每页条数、时间显示的时区（默认 Asia/Singapore），也都在这里。</li>
       <li><b class=\"k\">安全与审计：</b>网页链接万一泄露（截图、转发、浏览器历史都可能漏出去），可以在这里一键让访客列表 / 网页管理台 / 新手引导某一页的已发链接全部失效，再重新发送 /start 换新链接；谁在什么时候做过删除、发通行证、改配置这类敏感操作，这里也留有一份审计记录可查（保留 90 天）。吊销只影响网页链接，验证链接与一次性通行证不受影响；若怀疑签名密钥泄露，仅吊销不够，需要到 Cloudflare 换掉 LINK_SECRET（未设置时为 WEBHOOK_SECRET）并用新值重跑一次 setWebhook，旧签名才会全部作废。</li>
     </ul>
-    <div class=\"tip\">管理台的网页链接 10 分钟过期；剩不到 2 分钟时，页面顶部会先亮一条横幅提醒；打开时、或者开着页面闲置超时后保存时，都会提示过期，重新发送 /start、在新主菜单上重新打开就行。</div>
+    <div class=\"tip\">${pageCtx.appMode ? '你现在是在小程序里打开管理台：登录会话有效 6 小时，外壳会在到期前自动换新；万一页面提示失效，关掉小程序重新打开、或点小程序顶部的「重新进入」即可。' : '管理台的网页链接 10 分钟过期；剩不到 2 分钟时，页面顶部会先亮一条横幅提醒；打开时、或者开着页面闲置超时后保存时，都会提示过期，重新发送 /start、在新主菜单上重新打开就行。'}</div>
   </section>
 
   <section id=\"g-users\">
@@ -15766,7 +16814,7 @@ function buildGuidePage(pageCtx = {}) {
     <p class=\"q\">访客说验证一直过不了，怎么办？</p>
     <p>先让他换个网络或重启 App 再试。还是不行，就给他发一张一次性通行证：打开访客列表，在他那一行点「🎫 通行证」，机器人会私聊发给他一张 30 分钟有效的通行证，他点开确认就能通过，不用再折腾验证。你也可以发 /testverify 自己点一遍，看看验证页是否正常，或者在管理台临时把验证方式切成静态问答或顺序点击，让他先通过。</p>
     <p class=\"q\">网页打开提示「链接无效或已过期」？</p>
-    <p>管理台、访客列表和这本引导的链接都是 10 分钟有效的签名链接：打开时报错、或者页面开久了点保存提示「链接已过期」，都是它到期了。重新发送 /start，在新主菜单上重新打开即可；保存失败的那次修改不会生效，记得重新填一遍。</p>
+    <p>${pageCtx.appMode ? '你现在是在小程序里打开的：小程序的登录会话有效 6 小时，外壳会在到期前自动换新会话；万一页面提示失效，关掉小程序重新打开、或点小程序顶部的「重新进入」即可恢复；' : '管理台、访客列表和这本引导的链接都是 10 分钟有效的签名链接：打开时报错、或者页面开久了点保存提示「链接已过期」，都是它到期了。重新发送 /start，在新主菜单上重新打开即可；'}保存失败的那次修改不会生效，记得重新填一遍。</p>
   </section>
 
   <section id=\"g-limits\">
@@ -15783,6 +16831,10 @@ function buildGuidePage(pageCtx = {}) {
 
 </main>
 <script>
+  // 未保存草稿口径（第十一轮修复批 C，中 5）：本页
+  // 没有可编辑字段，恒干净；暴露同名查询口径与另
+  // 外两页统一，外壳切页签前的询问在此恒放行。
+  window.__hasUnsavedDraft = function () { return false; };
   var gPad = 0;
   function gFixPad() {
     var hd = document.getElementById('ghead');
@@ -15860,7 +16912,7 @@ function buildGuidePage(pageCtx = {}) {
   }, { passive: true });
   gSpy();
 </script>
-${expiryBannerScript(pageCtx.botUsername)}
+${pageCtx.appMode ? '' : expiryBannerScript(pageCtx.botUsername)}
 </body>
 </html>`;
 }
@@ -16169,6 +17221,7 @@ function buildPanelPage(pageCtx = {}) {
 <script>
 var qs = new URLSearchParams(location.search);
 var AUTH = { u: qs.get('u'), e: qs.get('e'), s: qs.get('s') };
+var APPMODE = !!(AUTH.s && AUTH.s.indexOf('app.') === 0);
 var FILTER_DEFS = [
   ['enable_image_forwarding', '图片/视频/文件'],
   ['enable_link_forwarding', '链接'],
@@ -16188,7 +17241,7 @@ function toast(msg) {
   setTimeout(function () { t.style.display = 'none'; }, 2200);
 }
 
-var ERROR_TEXT = { unauthorized: '链接已过期，重新发送 /start 换新菜单', 'too large': '内容太长', 'bad json': '请求格式错误', 'bad userId': '参数错误', nonce_invalid: '操作凭据已失效，请重试' };
+var ERROR_TEXT = { unauthorized: APPMODE ? '会话已失效，请关闭小程序后重新打开，或点小程序顶部的「重新进入」。' : '链接已过期，重新发送 /start 换新菜单', 'too large': '内容太长', 'bad json': '请求格式错误', 'bad userId': '参数错误', nonce_invalid: '操作凭据已失效，请重试' };
 function translateError(d) {
   if (d && d.error && ERROR_TEXT[d.error]) d.error = ERROR_TEXT[d.error];
   return d;
@@ -16209,6 +17262,9 @@ function saveConfig(key, value) {
   return post('/api/nonce', { scope: 'panel', action: 'config_set', target: key, params: { value: String(value) } }).then(function (m) {
     if (!m || !m.ok || !m.nonce) return { ok: false, error: (m && m.error) || '凭据签发失败' };
     return post('/api/config/set', { key: key, value: value, nonce: m.nonce });
+  }).then(function (d) {
+    if (d && d.ok) panelMarkSaved(key, value);
+    return d;
   });
 }
 
@@ -16314,6 +17370,43 @@ function renderFilters(vals) {
   });
 }
 
+// 未保存草稿口径（第十一轮修复批 C，中 5）：外壳
+// 切页签前同源询问本页的 __hasUnsavedDraft。基线
+// 在配置填充完成后由 panelSnapshot 拍下（填充前
+// 分区未解隐、字段不可编辑，不会漏记），逐字段
+// 保存成功后由 panelMarkSaved 把该字段基线更新
+// 为已保存值；查询时逐字段现值与基线比对，改回
+// 原值即不算脏。开关类即时保存字段（不在 .save
+// 逐字段保存之列）没有草稿概念，不在此口径内。
+var panelBase = null;
+function panelFieldVal(el) { return el.type === 'checkbox' ? String(el.checked) : String(el.value); }
+function panelSnapshot() {
+  panelBase = {};
+  var btns = document.querySelectorAll('.save[data-k]');
+  for (var i = 0; i < btns.length; i++) {
+    var el = document.getElementById(btns[i].getAttribute('data-t'));
+    if (el) panelBase[el.id] = panelFieldVal(el);
+  }
+}
+function panelMarkSaved(key, value) {
+  if (!panelBase) return;
+  var btns = document.querySelectorAll('.save[data-k]');
+  for (var i = 0; i < btns.length; i++) {
+    if (btns[i].getAttribute('data-k') !== key) continue;
+    var el = document.getElementById(btns[i].getAttribute('data-t'));
+    if (el) panelBase[el.id] = String(value);
+  }
+}
+window.__hasUnsavedDraft = function () {
+  if (!panelBase) return false;
+  var btns = document.querySelectorAll('.save[data-k]');
+  for (var i = 0; i < btns.length; i++) {
+    var el = document.getElementById(btns[i].getAttribute('data-t'));
+    if (!el || !(el.id in panelBase)) continue;
+    if (panelFieldVal(el) !== panelBase[el.id]) return true;
+  }
+  return false;
+};
 var saveBtns = document.querySelectorAll('.save[data-k]');
 for (var i = 0; i < saveBtns.length; i++) {
   saveBtns[i].onclick = function () {
@@ -16446,7 +17539,7 @@ fetch('/api/config?' + qs.toString())
     function setChk(id, on) { var el = document.getElementById(id); if (el) el.checked = !!on; }
     if (!d.ok) {
       document.getElementById('loading').className = 'loadfail';
-      setText('loading', '加载失败：无权访问或链接已过期，请回主菜单重新打开。');
+      setText('loading', APPMODE ? '加载失败：会话已失效，请关闭小程序后重新打开，或点小程序顶部的「重新进入」。' : '加载失败：无权访问或链接已过期，请回主菜单重新打开。');
       return;
     }
     document.getElementById('loading').hidden = true;
@@ -16508,10 +17601,11 @@ fetch('/api/config?' + qs.toString())
     var secs = document.querySelectorAll('section');
     for (var j = 0; j < secs.length; j++) secs[j].hidden = false;
     pSpy();
+    panelSnapshot();
   })
   .catch(function () {
     document.getElementById('loading').className = 'loadfail';
-    document.getElementById('loading').textContent = '加载失败，请回主菜单重新打开。';
+    document.getElementById('loading').textContent = APPMODE ? '加载失败，请关闭小程序后重新打开，或点小程序顶部的「重新进入」。' : '加载失败，请回主菜单重新打开。';
   });
 var pPad = 0;
 function pFixPad() {
@@ -16551,8 +17645,172 @@ function pScrollToY(endY) {
     var e = 1 - Math.pow(1 - p, 3);
     window.scrollTo(Math.round(startX * (1 - e)), Math.round(startY + dy * e));
     pAnim = p < 1 ? requestAnimationFrame(pStep) : 0;
+    if (p >= 1) pkbResume();
   }
   pAnim = requestAnimationFrame(pStep);
+}
+// 键盘避让（-v163b6）：本页是窗口滚动（与列表页
+// 的内滚 #uscroll 不同），文本控件聚焦后此前没有
+// 任何滚动照顾：键盘升起、布局视口收缩时，控件连
+// 同它的保存按钮被压在键盘后面，原生聚焦滚动即
+// 便发生也是瞬移硬切。本路径在本页内自带一份与
+// 列表页备注避让同口径的实现：120ms 轮询逐拍实
+// 测几何、每拍只做最小揭示（控件下沿连同其后最
+// 近的保存按钮须落在可见带内、下沿留 12px，上
+// 沿不被固定页眉压住）、2px 材料门；滚动写入走
+// 280ms easeOutCubic 补间（PKB_DUR，与列表页
+// NEKB 同值同缓动），与 chip 导航的 pAnim 补间
+// 互斥（起步先停对方，chip 点击先停本看守）。程
+// 序滚动只经 window.scrollTo 写入，不会触发
+// wheel/touchstart 这两个真实输入事件，不存在
+// 把自己的滚动误判成手动滚动的面；wheel/
+// touchstart 一到先停补间让路（看守仍按拍校
+// 正，与列表页一致）。失焦停表，键盘收起不回
+// 滚。事件用 focusin/focusout 委托，静态与后加
+// 的文本控件一并覆盖。
+// 用户接管（-v163b7）：持续校正没有出口时，聚
+// 焦中拖动页面会被看守逐拍拉回、键盘也不收
+// （iOS 拖动不失焦）。本轮加接管判定：真实手
+// 势开窗内（touchstart/wheel 开窗、touchend 留
+// 动量尾巴、手动滚动事件续窗），非程序写入的
+// 滚动位移逐事件累计，单次手势累计超过
+// PKB_TAKEOVER_PX 即判定用户接管——主动失
+// 焦（键盘随之收起）、停看守停补间，本次会
+// 话不再校正。阈值 -v163b7 初版为 32px，
+// -v163b8 按主人拍板降到与本页材料门同量级
+// 的 2px：只要真实手动拖动产生实际位移就让
+// 位，不再等累计一截；2px 以内只剩点按抖动
+// 与亚像素噪声，不触发、纯点按不失焦。程序
+// 写入逐次记位
+// （pkbProgY/pkbProgAt），记位吻合的滚动不累
+// 计，补间自身位移绝不误判；手势窗开启期间
+// tick 不发起校正，不与手指抢位。失焦无数据
+// 副作用：本页字段只经保存按钮落库，focusout
+// 委托只停看守，文本框没有落库用的 blur/change
+// 监听（change 落库的只有开关 checkbox，不在此
+// 路径），接管失焦不存不弃、内容留待点回继续。
+// 批 C 修正（中 3）：接管失焦只认触摸来源的手势
+// 窗（pkbTouchUntil：touchstart 开窗、touchend
+// 动量尾、窗内滚动续窗，时长与手势窗同口径）；
+// wheel 开的窗只保留停补间让路与窗内不校正，不
+// 再累计触发接管——桌面端滚轮/触控板滚动不再被
+// 误判成「拖动让位」而失焦。触摸路径的阈值、累
+// 计与锁定语义一字未动。
+var PKB_DUR = 280;
+var pkbTimer = 0, pkbEl = null;
+var pkbAnim = 0, pkbFrom = 0, pkbTo = 0, pkbT0 = 0;
+var PKB_TAKEOVER_PX = 2;
+var pkbUsrAcc = 0, pkbLastY = 0, pkbHoldUntil = 0, pkbProgY = -1, pkbProgAt = 0;
+var pkbTouchUntil = 0;
+function pkbAnimStop() {
+  if (pkbAnim) { cancelAnimationFrame(pkbAnim); pkbAnim = 0; }
+}
+window.addEventListener('wheel', pkbAnimStop, { passive: true });
+window.addEventListener('touchstart', pkbAnimStop, { passive: true });
+function pkbGesture(ev) {
+  var now = Date.now();
+  if (now > pkbHoldUntil) pkbUsrAcc = 0;
+  pkbHoldUntil = now + (ev && ev.type === 'wheel' ? 600 : 5000);
+  if (ev && ev.type === 'touchstart') pkbTouchUntil = now + 5000;
+  pkbLastY = window.pageYOffset || 0;
+}
+function pkbGestureEnd() { pkbHoldUntil = Date.now() + 900; pkbTouchUntil = Date.now() + 900; }
+window.addEventListener('touchstart', pkbGesture, { passive: true });
+window.addEventListener('touchend', pkbGestureEnd, { passive: true });
+window.addEventListener('touchcancel', pkbGestureEnd, { passive: true });
+window.addEventListener('wheel', pkbGesture, { passive: true });
+window.addEventListener('scroll', function () {
+  var y = window.pageYOffset || 0;
+  var dy = y - pkbLastY;
+  pkbLastY = y;
+  if (!pkbEl) { pkbUsrAcc = 0; return; }
+  var now = Date.now();
+  if (now - pkbProgAt < 600 && Math.abs(y - pkbProgY) <= 1) return;
+  if (now > pkbHoldUntil) return;
+  if (now <= pkbTouchUntil) {
+    pkbUsrAcc += Math.abs(dy);
+    if (pkbTouchUntil < now + 600) pkbTouchUntil = now + 600;
+  }
+  if (pkbHoldUntil < now + 600) pkbHoldUntil = now + 600;
+  if (pkbUsrAcc > PKB_TAKEOVER_PX) pkbTakeover();
+}, { passive: true });
+function pkbTakeover() {
+  var el = pkbEl;
+  pkbStop();
+  if (el && el.blur) el.blur();
+}
+function pkbStop() {
+  if (pkbTimer) { clearInterval(pkbTimer); pkbTimer = 0; }
+  pkbAnimStop();
+  pkbEl = null;
+}
+function pkbIsText(el) {
+  if (!el) return false;
+  if (el.tagName === 'TEXTAREA') return true;
+  return el.tagName === 'INPUT' && (el.type === 'text' || el.type === 'number');
+}
+function pkbWatch(el) {
+  pkbStop();
+  pkbEl = el;
+  pkbUsrAcc = 0; pkbHoldUntil = 0; pkbTouchUntil = 0;
+  pkbLastY = window.pageYOffset || 0;
+  pkbProgY = pkbLastY; pkbProgAt = Date.now();
+  pkbTimer = setInterval(pkbTick, 120);
+  pkbTick();
+}
+function pkbScrollTo(target) {
+  var cur = window.pageYOffset || 0;
+  if (pkbAnim && pkbTo === target) return;
+  if (Math.abs(target - cur) <= 2) {
+    pkbAnimStop();
+    if (target !== cur) { window.scrollTo(window.pageXOffset || 0, target); pkbProgY = target; pkbProgAt = Date.now(); }
+    return;
+  }
+  pStopAnim();
+  pkbFrom = cur; pkbTo = target; pkbT0 = 0;
+  if (!pkbAnim) pkbAnim = requestAnimationFrame(pkbStep);
+}
+function pkbStep(ts) {
+  pkbAnim = 0;
+  if (!pkbEl) return;
+  if (!pkbT0) pkbT0 = ts;
+  var p = Math.min(1, (ts - pkbT0) / PKB_DUR);
+  var e = 1 - Math.pow(1 - p, 3);
+  window.scrollTo(window.pageXOffset || 0, p >= 1 ? pkbTo : Math.round(pkbFrom + (pkbTo - pkbFrom) * e));
+  pkbProgY = window.pageYOffset || 0; pkbProgAt = Date.now();
+  if (p < 1) pkbAnim = requestAnimationFrame(pkbStep);
+}
+function pkbTick() {
+  var el = pkbEl;
+  if (!el || document.activeElement !== el) { pkbStop(); return; }
+  if (Date.now() < pkbHoldUntil) return;
+  var visH = window.visualViewport ? Math.round(window.visualViewport.height) : window.innerHeight;
+  var er = el.getBoundingClientRect();
+  var bot = er.bottom;
+  var sib = el.nextElementSibling;
+  for (var i = 0; sib && i < 4; i++) {
+    if (sib.classList && sib.classList.contains('save')) { bot = Math.max(bot, sib.getBoundingClientRect().bottom); break; }
+    sib = sib.nextElementSibling;
+  }
+  var dy = 0;
+  if (bot > visH - 12) dy = Math.ceil(bot - (visH - 12));
+  else if (er.top < (pPad || 0) + 8) dy = Math.floor(er.top - ((pPad || 0) + 8));
+  if (Math.abs(dy) <= 2) return;
+  pkbScrollTo(Math.max(0, (window.pageYOffset || 0) + dy));
+}
+document.addEventListener('focusin', function (ev) { if (pkbIsText(ev.target)) pkbWatch(ev.target); });
+document.addEventListener('focusout', function (ev) { if (pkbIsText(ev.target)) pkbStop(); });
+// chip 导航后看守恢复（第十一轮修复批 C，低
+// 11）：chip 点击先停看守再 pScrollToY 定位，字
+// 段并未失焦、focusin 不会再来，看守原先无重启
+// 路径、整场停摆。导航补间落点（pStep 完成时）
+// 与被让路取消（chip 处理里 700ms 兜底计时，覆
+// 盖 600ms 的最长补间时长）后各查一次：焦点仍
+// 在适格文本控件上且看守未在跑，就重新 watch。
+function pkbResume() {
+  if (pkbEl) return;
+  var ae = document.activeElement;
+  if (pkbIsText(ae)) pkbWatch(ae);
 }
 var pChips = document.querySelectorAll('.chip');
 for (var pi = 0; pi < pChips.length; pi++) {
@@ -16562,8 +17820,10 @@ for (var pi = 0; pi < pChips.length; pi++) {
     var target = document.querySelector(id);
     if (!target) return;
     ev.preventDefault();
+    pkbStop();
     var pad = parseInt(window.getComputedStyle(document.documentElement).scrollPaddingTop, 10) || 0;
     pScrollToY((window.pageYOffset || 0) + target.getBoundingClientRect().top - pad);
+    setTimeout(pkbResume, 700);
     try { history.replaceState(null, '', id); } catch (e) {}
   });
 }
@@ -16590,7 +17850,7 @@ window.addEventListener('scroll', function () {
 }, { passive: true });
 
 function revokeLinks(scope, label) {
-  var extra = scope === 'panel' ? '\\n注意：本管理台页面也会立即失效，需回机器人主菜单重新打开。' : '';
+  var extra = scope === 'panel' ? '\\n' + (APPMODE ? '注意：本管理台页面与小程序会话也会立即失效，需关闭小程序后重新打开。' : '注意：本管理台页面也会立即失效，需回机器人主菜单重新打开。') + '' : '';
   if (!confirm('确认让所有「' + label + '」网页链接立即失效？' + extra)) return;
   post('/api/config/revoke-links', { scope: scope }).then(function (d) {
     if (d.ok) toast('已吊销：' + label + '的旧链接全部失效');
@@ -16660,7 +17920,7 @@ document.getElementById('audit_next').onclick = function () {
   }).catch(function () {});
 };
 </script>
-${expiryBannerScript(pageCtx.botUsername)}
+${pageCtx.appMode ? '' : expiryBannerScript(pageCtx.botUsername)}
 </body>
 </html>`;
 }
@@ -18243,6 +19503,10 @@ async function handleRevokeLinks(request, env) {
     env
   );
 
+  // epoch 已变：清掉本请求的 epoch 备忘，后续读取
+  // 不会读到吊销前的值。
+  linkEpochCache(env)?.clear();
+
   await writeAdminAudit(
     env,
     parsed.adminId,
@@ -19174,6 +20438,7 @@ function buildUserListPage(pageCtx = {}) {
 <script>
 var qs = new URLSearchParams(location.search);
 var AUTH = { u: qs.get('u'), e: qs.get('e'), s: qs.get('s') };
+var APPMODE = !!(AUTH.s && AUTH.s.indexOf('app.') === 0);
 var rows = [], filt = 'all', query = '', sortMode = '';
 var listTotal = 0;
 var GROUP_C = '';
@@ -19308,6 +20573,7 @@ uScr.addEventListener('scroll', function () {
   var flS = document.getElementById('ufloat');
   if (flS) flS.classList.remove('dodgesmooth');
   if (!dodgeRaf) dodgeLoop();
+  neKbOnScroll();
   var now = Date.now();
   if (now - scrollTick < 120) return;
   scrollTick = now;
@@ -19317,6 +20583,165 @@ uScr.addEventListener('scroll', function () {
   uTopBtn();
   uSearchAutoHide();
 }, { passive: true });
+// 备注编辑键盘避让（-v163b4）：列表页是内滚架构
+// （窗口不滚、#uscroll 内滚），iOS 原生「聚焦滚到
+// 光标」只认窗口滚动、对内滚容器不作为；搜索胶囊
+// 的键盘状态机又只服务 #usearch 展开态、只补偿浮
+// 动组 transform，从不滚动内容——备注编辑器（.ne）
+// 点开聚焦后无人把卡片滚进可见带，键盘升起、布局
+// 视口收缩时编辑器下沿就留在键盘后面。本路径独立
+// 于搜索状态机（不碰 stShift/stPair/kbDodge），但
+// 沿用本页既有口径：120ms 轮询跟随几何（点开后约
+// 520ms 几何才动、vv-resize 先行，单次滚动必然差
+// 一截，故聚焦期间逐拍实测、分步校正到停稳）、
+// 2px 材料门防抖、程序滚动先置 progScrollUntil
+// 豁免（与位置回拉/平滑回顶同一口径，免得滚动监
+// 听把这当手动滚动）。每拍只做最小揭示：编辑器
+// 整体（含保存/取消行）须落在容器可见带内、下沿
+// 留 12px 呼吸；已在带内不动。键盘收起后该位置
+// 仍是合法滚动位，不回滚、不留错位；失焦或编辑
+// 器关闭时 tick 自检自停，blur 监听再兜底停表。
+var neKbTimer = 0, neKbTa = null, neKbEl = null;
+// 平滑补间（-v163b5）：scrollTop 的写入改走 rAF
+// 逐帧趋近，时长 280ms、easeOutCubic（与平滑回
+// 顶 uScrollTop 同一缓动）。tick 仍按 120ms 拍实
+// 测几何算绝对目标：已在向同一目标补间则不重启、
+// 不排队；目标变了（键盘还在长高）就从当前位顺
+// 势改向；材料门内的小差直接落位，终帧精确写目
+// 标值。豁免在补间开始时按全程置位、逐帧再刷新，
+// 覆盖整个动画期。用户手动滚动让路与平滑回顶同
+// 一口径：wheel/touchstart 一到先取消进行中的补
+// 间，不让动画跟手指对着干（看守本身仍按拍继续
+// 校正，与 -v163b4 的持续照顾口径一致）；失焦或
+// 编辑器关闭时 neKbStop 连补间一并停。
+// 用户接管（-v163b7）：与管理台 pkb 同口径——
+// 持续校正没有出口时，聚焦中拖动 #uscroll 会被
+// 看守逐拍拉回、键盘也不收。本轮加接管判定：
+// 真实手势开窗内、非程序写入的滚动位移逐事件
+// 累计（经全页唯一 scroll 监听头部的
+// neKbOnScroll 钩子接入，不新增 scroll 监听），
+// 单次手势累计超过 NEKB_TAKEOVER_PX 即主动
+// 失焦（键盘随之收起）、停看守停补间，本次
+// 会话不再校正。阈值 -v163b7 初版为 32px，
+// -v163b8 与 pkb 同步降到与本页材料门同量级
+// 的 2px：真实手动拖动一产生实际位移就让
+// 位；2px 以内不触发、纯点按不失焦。程序写
+// 入逐次记位（neKbProgY/neKbProgAt）并有
+// progScrollUntil 豁免，补间自身位移绝不误判；
+// 手势窗内 tick 不发起校正。失焦无数据副作
+// 用：备注的保存/取消都是显式按钮，blur 只停
+// 看守，编辑器不关、草稿不丢，点回输入框即重
+// 新聚焦、看守重启。
+// 批 C 修正（中 3）：与管理台 pkb 同口径——接管
+// 失焦只认触摸来源的手势窗（neKbTouchUntil），
+// wheel 开的窗不再累计触发接管，桌面端滚轮滚动
+// 不再误失焦；触摸路径语义一字未动。
+var NEKB_DUR = 280;
+var neKbAnim = 0, neKbFrom = 0, neKbTo = 0, neKbT0 = 0;
+var NEKB_TAKEOVER_PX = 2;
+var neKbUsrAcc = 0, neKbLastY = 0, neKbHoldUntil = 0, neKbProgY = -1, neKbProgAt = 0;
+var neKbTouchUntil = 0;
+function neKbAnimStop() {
+  if (neKbAnim) { cancelAnimationFrame(neKbAnim); neKbAnim = 0; }
+}
+window.addEventListener('wheel', neKbAnimStop, { passive: true });
+window.addEventListener('touchstart', neKbAnimStop, { passive: true });
+function neKbGesture(ev) {
+  var now = Date.now();
+  if (now > neKbHoldUntil) neKbUsrAcc = 0;
+  neKbHoldUntil = now + (ev && ev.type === 'wheel' ? 600 : 5000);
+  if (ev && ev.type === 'touchstart') neKbTouchUntil = now + 5000;
+  neKbLastY = uScr.scrollTop || 0;
+}
+function neKbGestureEnd() { neKbHoldUntil = Date.now() + 900; neKbTouchUntil = Date.now() + 900; }
+window.addEventListener('touchstart', neKbGesture, { passive: true });
+window.addEventListener('touchend', neKbGestureEnd, { passive: true });
+window.addEventListener('touchcancel', neKbGestureEnd, { passive: true });
+window.addEventListener('wheel', neKbGesture, { passive: true });
+function neKbOnScroll() {
+  var y = uScr.scrollTop || 0;
+  var dy = y - neKbLastY;
+  neKbLastY = y;
+  if (!neKbTa) { neKbUsrAcc = 0; return; }
+  var now = Date.now();
+  if (now < progScrollUntil && now - neKbProgAt < 600 && Math.abs(y - neKbProgY) <= 1) return;
+  if (now > neKbHoldUntil) return;
+  if (now <= neKbTouchUntil) {
+    neKbUsrAcc += Math.abs(dy);
+    if (neKbTouchUntil < now + 600) neKbTouchUntil = now + 600;
+  }
+  if (neKbHoldUntil < now + 600) neKbHoldUntil = now + 600;
+  if (neKbUsrAcc > NEKB_TAKEOVER_PX) neKbTakeover();
+}
+function neKbTakeover() {
+  var ta = neKbTa;
+  neKbStop();
+  if (ta && ta.blur) ta.blur();
+}
+function neKbStop() {
+  if (neKbTimer) { clearInterval(neKbTimer); neKbTimer = 0; }
+  neKbAnimStop();
+  neKbTa = null; neKbEl = null;
+}
+function neKbWatch(ta, ne) {
+  neKbStop();
+  neKbTa = ta; neKbEl = ne;
+  neKbUsrAcc = 0; neKbHoldUntil = 0; neKbTouchUntil = 0;
+  neKbLastY = uScr.scrollTop || 0;
+  neKbProgY = neKbLastY; neKbProgAt = Date.now();
+  neKbTimer = setInterval(neKbTick, 120);
+  neKbTick();
+}
+function neKbScrollTo(target) {
+  var cur = uScr.scrollTop || 0;
+  if (neKbAnim && neKbTo === target) return;
+  if (Math.abs(target - cur) <= 2) {
+    neKbAnimStop();
+    if (target !== cur) { progScrollUntil = Date.now() + 400; uScr.scrollTop = target; neKbProgY = target; neKbProgAt = Date.now(); }
+    return;
+  }
+  neKbFrom = cur; neKbTo = target; neKbT0 = 0;
+  progScrollUntil = Date.now() + NEKB_DUR + 200;
+  if (!neKbAnim) neKbAnim = requestAnimationFrame(neKbStep);
+}
+function neKbStep(ts) {
+  neKbAnim = 0;
+  if (!neKbTa) return;
+  if (!neKbT0) neKbT0 = ts;
+  var p = Math.min(1, (ts - neKbT0) / NEKB_DUR);
+  var e = 1 - Math.pow(1 - p, 3);
+  progScrollUntil = Date.now() + 400;
+  uScr.scrollTop = p >= 1 ? neKbTo : Math.round(neKbFrom + (neKbTo - neKbFrom) * e);
+  neKbProgY = uScr.scrollTop || 0; neKbProgAt = Date.now();
+  if (p < 1) neKbAnim = requestAnimationFrame(neKbStep);
+}
+function neKbTick() {
+  var ta = neKbTa, ne = neKbEl;
+  if (!ta || !ne || document.activeElement !== ta || !ne.classList.contains('open')) { neKbStop(); return; }
+  if (Date.now() < neKbHoldUntil) return;
+  var cr = uScr.getBoundingClientRect();
+  var visH = window.visualViewport ? Math.round(window.visualViewport.height) : window.innerHeight;
+  var visBot = Math.min(cr.bottom, visH);
+  var er = ne.getBoundingClientRect();
+  var dy = 0;
+  if (er.bottom > visBot - 12) dy = Math.ceil(er.bottom - (visBot - 12));
+  else if (er.top < cr.top + 8) dy = Math.floor(er.top - (cr.top + 8));
+  if (Math.abs(dy) <= 2) return;
+  neKbScrollTo(Math.max(0, (uScr.scrollTop || 0) + dy));
+}
+// 未保存草稿口径（第十一轮修复批 C，中 5）：外壳
+// 切页签前同源询问本页的 __hasUnsavedDraft。备注
+// 编辑器打开且内容改过（与打开时存下的 data-orig
+// 比对，两边都 trim，与保存口径一致）才算脏；搜
+// 索词、筛选等页面状态不算草稿。
+window.__hasUnsavedDraft = function () {
+  var tas = document.querySelectorAll('.ne.open textarea');
+  for (var i = 0; i < tas.length; i++) {
+    var orig = tas[i].getAttribute('data-orig') || '';
+    if (tas[i].value.trim() !== orig.trim()) return true;
+  }
+  return false;
+};
 var listLoading = false;
 function showListLoading() {
   listLoading = true;
@@ -19370,7 +20795,7 @@ function loadUsers() {
     .then(function (d) {
       if (mySeq !== loadSeq) return;
       if (!d.ok) {
-        document.getElementById('list').innerHTML = '<div class="empty">加载失败：无权访问或链接已过期，请回主菜单重新打开。</div>';
+        document.getElementById('list').innerHTML = '<div class="empty">加载失败：' + (APPMODE ? '会话已失效，请关闭小程序后重新打开，或点小程序顶部的「重新进入」。' : '无权访问或链接已过期，请回主菜单重新打开。') + '</div>';
         showListDone();
         return;
       }
@@ -19439,7 +20864,7 @@ function loadUsers() {
     })
     .catch(function () {
       if (mySeq !== loadSeq) return;
-      document.getElementById('list').innerHTML = '<div class="empty">加载失败，请回主菜单重新打开。</div>';
+      document.getElementById('list').innerHTML = '<div class="empty">加载失败，' + (APPMODE ? '请关闭小程序后重新打开，或点小程序顶部的「重新进入」。' : '请回主菜单重新打开。') + '</div>';
       showListDone();
     });
 }
@@ -19452,7 +20877,7 @@ function resetAndLoad() {
   loadUsers();
 }
 
-var ERROR_TEXT = { unauthorized: '链接已过期，重新发送 /start 换新菜单', 'too large': '内容太长', 'bad json': '请求格式错误', 'bad userId': '参数错误', nonce_invalid: '操作凭据已失效，请重试' };
+var ERROR_TEXT = { unauthorized: APPMODE ? '会话已失效，请关闭小程序后重新打开，或点小程序顶部的「重新进入」。' : '链接已过期，重新发送 /start 换新菜单', 'too large': '内容太长', 'bad json': '请求格式错误', 'bad userId': '参数错误', nonce_invalid: '操作凭据已失效，请重试' };
 function translateError(d) {
   if (d && d.error && ERROR_TEXT[d.error]) d.error = ERROR_TEXT[d.error];
   return d;
@@ -19575,6 +21000,8 @@ function render() {
     ta.maxLength = 500;
     ta.placeholder = '给这个访客写点备注（仅管理员可见）…';
     ne.appendChild(ta);
+    ta.addEventListener('focus', function () { neKbWatch(ta, ne); });
+    ta.addEventListener('blur', function () { neKbStop(); });
     var nerow = document.createElement('div');
     nerow.className = 'row';
     var sv = document.createElement('button');
@@ -19613,7 +21040,7 @@ function render() {
     var nb = document.createElement('button');
     nb.className = 'ntb';
     nb.textContent = '📝 备注';
-    nb.onclick = function () { ta.value = u.note || ''; ne.className = 'ne open'; ta.focus(); };
+    nb.onclick = function () { ta.value = u.note || ''; ta.setAttribute('data-orig', u.note || ''); ne.className = 'ne open'; ta.focus(); neKbWatch(ta, ne); };
     ops.appendChild(nb);
     if (u.topic && u.topic_id && GROUP_C) {
       var jb = document.createElement('button');
@@ -20955,7 +22382,7 @@ function statsFail() {
   box.textContent = '';
   var e = document.createElement('div');
   e.className = 'sloading';
-  e.textContent = '统计加载失败（不影响访客列表）';
+  e.textContent = APPMODE ? '统计加载失败，请稍后重试；若反复失败，可能是会话已失效，请关闭小程序后重新打开。' : '统计加载失败（不影响访客列表）';
   box.appendChild(e);
 }
 
@@ -21322,7 +22749,7 @@ window.addEventListener('resize', function () {
 });
 ufPosInit();
 </script>
-${expiryBannerScript(pageCtx.botUsername)}
+${pageCtx.appMode ? '' : expiryBannerScript(pageCtx.botUsername)}
 </body>
 </html>`;
 }
@@ -22594,177 +24021,204 @@ export default {
     // 请求级访客行缓存（见 dbUserGet）：浅拷贝一份
     // env 并挂空 Map，本请求的全部处理（含 waitUntil
     // 续跑）共用这份 env，缓存随请求结束自然释放。
-    env = { ...env, __userRowCache: new Map() };
+    env = { ...env, __userRowCache: new Map(), __linkEpochCache: new Map() };
 
     const requestUrl = new URL(request.url);
 
-    if (
-      request.method === 'GET' &&
-      requestUrl.pathname === '/verify'
-    ) {
-      return handleVerifyPage(
-        request,
-        env
-      );
-    }
+    try {
+      if (
+        request.method === 'GET' &&
+        requestUrl.pathname === '/verify'
+      ) {
+        return await handleVerifyPage(
+          request,
+          env
+        );
+      }
 
-    if (
-      request.method === 'POST' &&
-      requestUrl.pathname ===
-        '/verify/confirm'
-    ) {
-      return handleVerifyConfirm(
-        request,
-        env
-      );
-    }
+      if (
+        request.method === 'POST' &&
+        requestUrl.pathname ===
+          '/verify/confirm'
+      ) {
+        return await handleVerifyConfirm(
+          request,
+          env
+        );
+      }
 
-    if (
-      request.method === 'GET' &&
-      requestUrl.pathname === '/pass'
-    ) {
-      return handlePassPage(
-        request,
-        env
-      );
-    }
+      if (
+        request.method === 'GET' &&
+        requestUrl.pathname === '/pass'
+      ) {
+        return await handlePassPage(
+          request,
+          env
+        );
+      }
 
-    if (
-      request.method === 'POST' &&
-      requestUrl.pathname === '/pass/confirm'
-    ) {
-      return handlePassConfirm(
-        request,
-        env
-      );
-    }
+      if (
+        request.method === 'POST' &&
+        requestUrl.pathname === '/pass/confirm'
+      ) {
+        return await handlePassConfirm(
+          request,
+          env
+        );
+      }
 
-    if (
-      request.method === 'GET' &&
-      requestUrl.pathname === '/users'
-    ) {
-      return handleUserListPage(
-        request,
-        env
-      );
-    }
+      if (
+        request.method === 'GET' &&
+        requestUrl.pathname === '/users'
+      ) {
+        return await handleUserListPage(
+          request,
+          env
+        );
+      }
 
-    if (
-      request.method === 'GET' &&
-      requestUrl.pathname === '/api/users'
-    ) {
-      return withNoStore(handleUserListApi(request, env));
-    }
+      if (
+        request.method === 'GET' &&
+        requestUrl.pathname === '/api/users'
+      ) {
+        return await withNoStore(handleUserListApi(request, env));
+      }
 
-    if (
-      request.method === 'GET' &&
-      requestUrl.pathname === '/api/stats'
-    ) {
-      return withNoStore(handleStatsApi(request, env));
-    }
+      if (
+        request.method === 'GET' &&
+        requestUrl.pathname === '/api/stats'
+      ) {
+        return await withNoStore(handleStatsApi(request, env));
+      }
 
-    if (
-      request.method === 'GET' &&
-      requestUrl.pathname === '/panel'
-    ) {
-      return handlePanelPage(
-        request,
-        env
-      );
-    }
+      if (
+        request.method === 'GET' &&
+        requestUrl.pathname === '/panel'
+      ) {
+        return await handlePanelPage(
+          request,
+          env
+        );
+      }
 
-    if (
-      request.method === 'GET' &&
-      requestUrl.pathname === '/guide'
-    ) {
-      return handleGuidePage(
-        request,
-        env
-      );
-    }
+      if (
+        request.method === 'GET' &&
+        requestUrl.pathname === '/guide'
+      ) {
+        return await handleGuidePage(
+          request,
+          env
+        );
+      }
 
-    if (
-      request.method === 'GET' &&
-      requestUrl.pathname === '/api/config'
-    ) {
-      return withNoStore(handleConfigApi(request, env));
-    }
+      if (
+        request.method === 'GET' &&
+        requestUrl.pathname === '/app'
+      ) {
+        return await handleAppShellPage();
+      }
 
-    if (
-      request.method === 'POST' &&
-      requestUrl.pathname === '/api/config/set'
-    ) {
-      return handleConfigSet(
-        request,
-        env
-      );
-    }
+      if (
+        request.method === 'POST' &&
+        requestUrl.pathname === '/api/app-auth'
+      ) {
+        return await withNoStore(handleAppAuth(request, env));
+      }
 
-    if (
-      request.method === 'POST' &&
-      requestUrl.pathname === '/api/config/toggle'
-    ) {
-      return handleConfigToggle(
-        request,
-        env
-      );
-    }
+      if (
+        request.method === 'GET' &&
+        requestUrl.pathname === '/api/config'
+      ) {
+        return await withNoStore(handleConfigApi(request, env));
+      }
 
-    if (
-      request.method === 'POST' &&
-      requestUrl.pathname === '/api/config/list'
-    ) {
-      return handleConfigList(
-        request,
-        env
-      );
-    }
+      if (
+        request.method === 'POST' &&
+        requestUrl.pathname === '/api/config/set'
+      ) {
+        return await handleConfigSet(
+          request,
+          env
+        );
+      }
 
-    if (
-      request.method === 'POST' &&
-      requestUrl.pathname === '/api/config/pause'
-    ) {
-      return handleConfigPause(
-        request,
-        env
-      );
-    }
+      if (
+        request.method === 'POST' &&
+        requestUrl.pathname === '/api/config/toggle'
+      ) {
+        return await handleConfigToggle(
+          request,
+          env
+        );
+      }
 
-    if (
-      request.method === 'POST' &&
-      requestUrl.pathname === '/api/users/action'
-    ) {
-      return handleUserListAction(
-        request,
-        env
-      );
-    }
+      if (
+        request.method === 'POST' &&
+        requestUrl.pathname === '/api/config/list'
+      ) {
+        return await handleConfigList(
+          request,
+          env
+        );
+      }
 
-    if (
-      request.method === 'POST' &&
-      requestUrl.pathname === '/api/nonce'
-    ) {
-      return handleNonceMint(
-        request,
-        env
-      );
-    }
+      if (
+        request.method === 'POST' &&
+        requestUrl.pathname === '/api/config/pause'
+      ) {
+        return await handleConfigPause(
+          request,
+          env
+        );
+      }
 
-    if (
-      request.method === 'POST' &&
-      requestUrl.pathname === '/api/config/revoke-links'
-    ) {
-      return handleRevokeLinks(
-        request,
-        env
-      );
-    }
+      if (
+        request.method === 'POST' &&
+        requestUrl.pathname === '/api/users/action'
+      ) {
+        return await handleUserListAction(
+          request,
+          env
+        );
+      }
 
-    if (
-      request.method === 'GET' &&
-      requestUrl.pathname === '/api/audit'
-    ) {
-      return withNoStore(handleAuditApi(request, env));
+      if (
+        request.method === 'POST' &&
+        requestUrl.pathname === '/api/nonce'
+      ) {
+        return await handleNonceMint(
+          request,
+          env
+        );
+      }
+
+      if (
+        request.method === 'POST' &&
+        requestUrl.pathname === '/api/config/revoke-links'
+      ) {
+        return await handleRevokeLinks(
+          request,
+          env
+        );
+      }
+
+      if (
+        request.method === 'GET' &&
+        requestUrl.pathname === '/api/audit'
+      ) {
+        return await withNoStore(handleAuditApi(request, env));
+      }
+    } catch (error) {
+      // 鉴权存储（epoch）读取失败的受控降级（第十一轮
+      // 审计中 4）：API 回 503 JSON、页面回友好错误
+      // 页；其余异常照旧上抛，不改变任何既有失败形态。
+      if (error?.code === 'AUTH_STORE_UNAVAILABLE') {
+        return authStoreUnavailableResponse(
+          requestUrl.pathname
+        );
+      }
+
+      throw error;
     }
 
     if (request.method === 'GET') {
