@@ -13401,7 +13401,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.6.2';
+const BOT_VERSION = 'v1.6.3';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -19033,12 +19033,11 @@ function buildUserListPage(pageCtx = {}) {
   .b-dim { background: #2b3a47; color: #9db2c5; }
   .b-pass { background: #173f5f; color: #8ecdf0; }
   .ops { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 8px; }
-  .ops button, .cf button { flex: 0 0 auto; padding: 6px 13px; border-radius: 8px; border: 0; font-size: 13.5px; white-space: nowrap; cursor: pointer; }
+  .ops button, .cf button { height: 42px; padding: 6px 13px; border-radius: 8px; border: 0; font-size: 13.5px; white-space: nowrap; cursor: pointer; }
+  .cf button { flex: 0 0 auto; }
+  .ops button { flex: 1 1 30%; display: flex; align-items: center; justify-content: center; gap: 5px; padding: 6px 4px; }
   .rst { background: #2b5278; color: #fff; }
-  .rwb { flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; padding: 6px 10px; }
   .ric { font-size: 17px; line-height: 1.1; }
-  .rlab { line-height: 1.25; text-align: center; }
-  @media (min-width: 560px) { .rwb { flex-direction: row; gap: 5px; } .rlab br { display: none; } }
   .del { background: #5c2222; color: #ffb4b4; }
   .cf { margin-top: 9px; display: none; gap: 8px; flex-wrap: wrap; }
   .cf.open { display: flex; }
@@ -19600,8 +19599,8 @@ function render() {
     var ops = document.createElement('div');
     ops.className = 'ops';
     var rb = document.createElement('button');
-    rb.className = 'rst rwb';
-    rb.innerHTML = '<span class="ric">🔄</span><span class="rlab">重置<br>验证</span>';
+    rb.className = 'rst';
+    rb.innerHTML = '<span class="ric">🔄</span>重置验证';
     rb.onclick = function () {
       rb.disabled = true;
       act(u.id, 'reset', false).then(function (d) {
