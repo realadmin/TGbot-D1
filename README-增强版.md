@@ -191,7 +191,7 @@
 
 22. **自动检查更新与命令菜单**（v1.0.2 新增）
     - 机器人会定期比对本仓库最新 Release，主菜单显示当前版本与更新状态；发现新版会私聊通知主管理员一次。主菜单有「🔄 检查更新」按钮，私聊命令 `/version` 也可查看。
-    - 命令按作用域注册：私聊有 `/start`、`/help`、`/testverify`、`/version`、`/panel`（主管理员直达网页管理台，v1.2.3）、`/pause`、`/resume`，话题命令有 `/ban`、`/unban`、`/delete`、`/clear`、`/terminate`、`/card`、`/reverify`、`/note`、`/notedelete`、`/pause`、`/resume`。
+    - 命令菜单按身份分开注册（v1.6.2）：访客在私聊里点开菜单只看得到 `/start`、`/help`；主管理员在自己的私聊里另有 `/testverify`、`/version`、`/panel`（主管理员直达网页管理台，v1.2.3）、`/pause`、`/resume`；话题命令 `/ban`、`/unban`、`/delete`、`/clear`、`/terminate`、`/card`、`/reverify`、`/note`、`/notedelete`、`/pause`、`/resume` 只出现在接待群里。
 
 ## 与原版部署的差异
 
