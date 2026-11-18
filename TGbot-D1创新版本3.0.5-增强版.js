@@ -62,7 +62,7 @@ const USER_STATE = {
 
 const DEFAULTS = {
   welcome_msg:
-    '在发消息之前，先完成人机验证，验证完成之后请等待3秒钟之后再发送消息以防发生失败！',
+    '🎉 验证成功！现在可以开始发送消息了。',
   verif_q:
     '问题：1+1=?\n\n提示：\n1. 正确答案不是“2”。\n2. 答案在机器人简介内，请看简介的答案进行回答。',
   verif_a: '3',
@@ -89,8 +89,6 @@ const DEFAULTS = {
   relay_fail_notice_enabled: 'true',
   block_notice_enabled: 'true',
 
-  verify_success_text:
-    '🎉 验证成功！现在可以开始发送消息了。',
   quiz_wrong_text:
     '🥺 抱歉，这次没有回答正确，请重新查看提示后再试。',
   pause_restored_text:
@@ -150,7 +148,6 @@ const USER_UPDATE_FIELDS = new Set([
   'admin_note',
   'verify_prompt_msg_id',
   'receipt_msg_id',
-  'welcome_msg_id',
   'is_trusted',
   'relay_exempt',
   'topic_creating',
@@ -930,12 +927,6 @@ async function dbMigrate(env) {
   await ensureUserColumn(
     env,
     'receipt_msg_id',
-    'INTEGER'
-  );
-
-  await ensureUserColumn(
-    env,
-    'welcome_msg_id',
     'INTEGER'
   );
 
@@ -5787,30 +5778,11 @@ async function handleStart(
   env,
   origin = ''
 ) {
-  const welcomeMessage = await getConfig(
-    'welcome_msg',
-    env
-  );
-
-  const welcomeSent = await telegramApi(
-    env.BOT_TOKEN,
-    'sendMessage',
-    {
-      chat_id: chatId,
-      text: welcomeMessage,
-      reply_markup: SYS_TAG_MARKUP
-    }
-  );
-
-  // 欢迎语登记进槽位：重发 /start 时新换旧、只留最新一条；
-  // 验证成功时连同访客的 /start 一并撤回（见 cleanupAfterVerified）。
-  await trackSlotMessage(
-    env,
-    chatId,
-    'welcome_msg_id',
-    welcomeSent?.message_id
-  );
-
+  // 只发验证提示本身：提示之前原有一条领衔欢迎语，
+  // 内容与提示重叠、徒增一条消息，已整条摘除，其
+  // 专属槽位 welcome_msg_id 一并退役。welcome_msg
+  // 配置本身已改定义为验证成功问候（验证成功回执的
+  // 文案来源，见 welcomeMsgText），不在此处发送。
   const mode =
     await getEffectiveVerifyMode(env);
 
@@ -6845,6 +6817,30 @@ async function textConfig(key, env) {
   return value;
 }
 
+// 旧定义时代 welcome_msg 的默认领衔句：-v161b8 起
+// welcome_msg 改定义为「验证成功问候」（验证成功回执
+// 的文案来源），库里若还存着旧默认领衔句（长句是旧
+// 版默认原文；短句是更早的默认、也是线上实际存量），
+// 视为未设置——绝不能把它们当成功问候发出。
+const LEGACY_WELCOME_MSGS = new Set([
+  '在发消息之前，先完成人机验证，验证完成之后请等待3秒钟之后再发送消息以防发生失败！',
+  '在发消息之前，先完成人机验证'
+]);
+
+// 欢迎消息（验证成功问候）的读取口：存量恰为任一旧
+// 默认领衔句（原样或仅首尾空白有别）、或 trim 后为
+// 空时，一律回退新默认值；其余存量（管理员自定义的
+// 问候文案）原样使用。
+async function welcomeMsgText(env) {
+  const value = await getConfig('welcome_msg', env);
+
+  if (!value.trim() || LEGACY_WELCOME_MSGS.has(value.trim())) {
+    return DEFAULTS.welcome_msg;
+  }
+
+  return value;
+}
+
 async function clampedIntConfig(key, env, def, min, max) {
   const n = Number(await getConfig(key, env, String(def)));
 
@@ -7216,7 +7212,7 @@ async function quietDeleteMessage(env, chatId, messageId) {
   }
 }
 
-// 记账槽位：column 为 verify_prompt_msg_id / receipt_msg_id / welcome_msg_id。
+// 记账槽位：column 为 verify_prompt_msg_id / receipt_msg_id。
 // 写入新 ID 前先删掉槽里的旧消息，保证同类消息只留最新一条。
 async function trackSlotMessage(env, userId, column, messageId) {
   if (!messageId) {
@@ -7260,7 +7256,8 @@ async function clearSlotMessage(env, userId, column) {
   await quietDeleteMessage(env, userId, oldId);
 }
 
-// 验证成功回执（🎉）的统一发送口：发 verify_success_text
+// 验证成功回执（🎉）的统一发送口：发欢迎消息
+// （welcome_msg，-v161b8 起改定义为验证成功问候）
 // 并把回执编号记进 receipt_msg_id 槽位。记账（trackSlotMessage）
 // 失败时原地重试至多 3 次（间隔 300ms，照资料卡写回重试的
 // 先例）；仍记不上就把刚发出的这条回执反手删掉——宁可这
@@ -7276,7 +7273,7 @@ async function sendVerifySuccessReceipt(env, userId) {
       'sendMessage',
       {
         chat_id: userId,
-        text: await textConfig('verify_success_text', env),
+        text: await welcomeMsgText(env),
         reply_markup: SYS_TAG_MARKUP
       }
     );
@@ -7423,7 +7420,7 @@ async function deletePauseCardsForUser(env, userId) {
 
 // 任意入口验证通过后的联动清理：撤回验证提示；
 // 若还有未使用的通行证，一并删消息并作废（人已通过，证留着只是风险）；
-// 欢迎语与访客那条 /start 的使命也到此结束，一并撤回，
+// 访客那条 /start 的使命也到此结束，一并撤回，
 // 私聊里只留成功回执（回执仍按原口径留到第一条正文转发后再删）。
 async function cleanupAfterVerified(env, userId) {
   await clearSlotMessage(
@@ -7435,12 +7432,6 @@ async function cleanupAfterVerified(env, userId) {
   await voidUserPass(env, userId);
 
   await dbConfigDelete(`promptat:${userId}`, env);
-
-  await clearSlotMessage(
-    env,
-    userId,
-    'welcome_msg_id'
-  );
 
   await clearTrackedStartMessage(env, userId);
 
@@ -8922,7 +8913,7 @@ async function handlePrivateMessage(
 
     // 被封禁的访客发 /start 一律静默：不发「您已通过验证」
     // （与其实际状态相反、纯误导），也不走 handleStart
-    // 发欢迎语与验证提示。主管理员在上方已回菜单，不受影响。
+    // 发验证提示。主管理员在上方已回菜单，不受影响。
     if (user.is_blocked) {
       return;
     }
@@ -9015,7 +9006,7 @@ async function handlePrivateMessage(
 
     } else {
       // 记下这条 /start 的编号（只记最新一条）：验证成功时
-      // 连同欢迎语一并撤回（见 cleanupAfterVerified）。
+      // 一并撤回（见 cleanupAfterVerified）。
       // /help 同样会走 handleStart，但清理对象是 /start 本身，不记。
       if (commandText === '/start' && message.message_id) {
         await dbConfigPut(
@@ -12631,6 +12622,55 @@ async function wipeConversationCopies(
       env
     );
 
+  // 熔断三类卡（「请稍后再试」/ 警告 /「✅ 服务已
+  // 恢复」）：与删人路径 purgeManagedUser 同口径，在
+  // 这里连本体带记账行一并删——此前只有网页版靠 purge
+  // 兜到，话题 /clear 走不到，卡会留在访客私聊里。静
+  // 默尽力、不计入下面的删除计数（同
+  // deletePauseCardsForUser 既有口径）。pausenote: 是
+  // 「本轮已通知」占用行，不在这里动：网页版随后
+  // purge 删档时一并删；/clear 档案与占用都保留（删
+  // 了占用、本轮会再补发一张卡）。
+  await deletePauseCardsForUser(env, userId);
+
+  // 机器人自发私聊消息的槽位组：欢迎回执
+  // （receipt_msg_id）与验证卡（verify_prompt_msg_id）
+  // 不在 rxmap 配对表里，上面的收集够不着——此前清
+  // 空永远漏删它们，网页版清完还整行删档、编号永久
+  // 丢失（主人真机复现）。把两槽位拼成一个「只有私
+  // 聊侧」的组顶到最前面：与配对组共用同一份预算与
+  // 计数口径（计入私聊 ok/failed），且顶在首位不会
+  // 被配对量饿死。结算（删掉或确认删不掉）后把两槽
+  // 位归零，防残留编号被后续流程误用；没结算（瞬时
+  // 失败 / 预算耗尽没轮到）则槽位原样保留，下次清
+  // 空按槽位接着删，partial/remaining 如实计入。
+  const slotUser = await dbUserGet(userId, env);
+
+  const slotIds = [
+    ...new Set(
+      [
+        Number(slotUser?.receipt_msg_id || 0),
+        Number(slotUser?.verify_prompt_msg_id || 0)
+      ].filter((id) => id > 0)
+    )
+  ];
+
+  let slotUnit = null;
+
+  if (slotIds.length) {
+    slotUnit = {
+      priv: null,
+      topic: null,
+      privExtra: slotIds,
+      topicExtra: [],
+      keys: []
+    };
+
+    units.unshift(slotUnit);
+  }
+
+  let slotSettled = false;
+
   const budget = { stats: { n: 0 }, limit: 40 };
 
   let priv = { ok: 0, failed: 0 };
@@ -12744,6 +12784,10 @@ async function wipeConversationCopies(
           outcome === 'ok' || outcome === 'stuck'
       );
 
+      if (unit === slotUnit) {
+        slotSettled = settled;
+      }
+
       if (!settled) {
         remaining += 1;
 
@@ -12811,6 +12855,21 @@ async function wipeConversationCopies(
         );
       }
     }
+  }
+
+  // 槽位组已结算才归零两槽位：回执/验证卡的编号从
+  // 此作废，不会再被回执清理等后续流程当成活消息误
+  // 删或误判；没结算的保留原值，下次清空接着删。
+  if (slotUnit && slotSettled) {
+    await dbUserUpdate(
+      userId,
+      {
+        receipt_msg_id: null,
+        verify_prompt_msg_id: null
+      },
+      env,
+      { touchActivity: false }
+    );
   }
 
   return {
@@ -13182,7 +13241,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.6.1';
+const BOT_VERSION = 'v1.6.2';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -15426,7 +15485,7 @@ function buildGuidePage(pageCtx = {}) {
     <h2>🚀 开始使用</h2>
     <ol>
       <li><b class=\"k\">打开主菜单：</b>在机器人私聊里发送 <code>/start</code>，网页管理台、访客列表和这本引导都在这里。菜单只留最新一份：再发一次 /start，上一次的 /start 和旧菜单会被自动删掉，不会在聊天里堆积（若隔了超过 48 小时才回来，旧菜单已过 Telegram 的删除期限、删不掉，会留在那里，手动删一下即可）；留下的这条 /start 点一下就能再发，网页链接过期时靠它刷新最方便。</li>
-      <li><b class=\"k\">先定验证方式：</b>进「网页管理台 → 基础配置」，选一种验证方式（推荐 Turnstile，访客点一下就通过），顺便把欢迎消息改成你想对访客说的第一句话。</li>
+      <li><b class=\"k\">先定验证方式：</b>进「网页管理台 → 基础配置」，选一种验证方式（推荐 Turnstile，访客点一下就通过），顺便把欢迎消息改成你想在访客验证成功时对他说的话（验证成功时发给他，就是「🎉 验证成功」那条）。</li>
       <li><b class=\"k\">把机器人发给访客：</b>访客打开私聊、完成验证之后给你发消息，你的群里就会自动多出一个以他名字命名的话题。</li>
       <li><b class=\"k\">在话题里直接回复：</b>不需要任何额外设置，在他的话题里打字、发图，就是发给他本人。</li>
     </ol>
@@ -15444,8 +15503,8 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">让某人重新验证：</b>打开他的话题，发送 <code>/reverify</code>，他下一次发消息前要重新过一遍验证。</li>
       <li><b class=\"k\">自己先试一遍：</b>私聊发送 <code>/testverify</code> 会拿到一个测试验证链接，点开能看到访客眼中的验证页长什么样；测试模式只是看看样子，不会真的放行或记录任何人。</li>
       <li><b class=\"k\">🎫 一次性通行证（救济通道）：</b>个别访客怎么也过不了验证（比如网络连不上验证服务）时，在访客列表里他那一行点「🎫 通行证」，机器人会私聊发给他一条带通行证链接的消息（默认 30 分钟内有效，有效期可在管理台「基础配置」里改），他点开链接、在确认页点一下即通过验证。通行证链接必须本人点开才有效，转发给别人没用，用过即作废；不依赖 Turnstile 配置，没配密钥也能发。</li>
-      <li><b class=\"k\">🤝 信任：</b>熟人可以免掉验证：在访客列表他那一行点「🤝 信任」，或在他话题的资料卡上点「设为信任」，他立即通过验证（会收到验证成功提示）。信任只有一个开关，开启后一并免验证、免转发限流、免类型过滤、免超时清理（删档版与温和版都免）；屏蔽关键词与关键词自动封禁也一并豁免——他发的话、改的话带着关键词也照常送达、不计数。点「取消信任」收回。注意：对他「重置验证」或在话题里发 /reverify 会连信任一起撤销；被封禁的人要先解封才能设信任；资料卡上的信任按钮只有主管理员能操作。</li>
-      <li><b class=\"k\">验证消息会自己清理：</b>验证提示、欢迎消息、通行证和「🎉 验证成功」这类流程消息，用完后会被机器人自动删掉，不在访客对话里堆积：反复索要验证只留最新一条提示，通过验证时提示、欢迎消息和访客自己发的那条 /start 会一并清掉，成功提示在他发出第一条消息、刚进入处理时就清掉（那条消息就算被关键词、类型过滤或限流拦下也照清）；过期没用的通行证会在他下次来发消息时清扫。</li>
+      <li><b class=\"k\">🤝 信任：</b>熟人可以免掉验证：在访客列表他那一行点「🤝 信任」，或在他话题的资料卡上点「设为信任」，他立即通过验证（会收到欢迎消息，就是验证成功时发的那句问候）。信任只有一个开关，开启后一并免验证、免转发限流、免类型过滤、免超时清理（删档版与温和版都免）；屏蔽关键词与关键词自动封禁也一并豁免——他发的话、改的话带着关键词也照常送达、不计数。点「取消信任」收回。注意：对他「重置验证」或在话题里发 /reverify 会连信任一起撤销；被封禁的人要先解封才能设信任；资料卡上的信任按钮只有主管理员能操作。</li>
+      <li><b class=\"k\">验证消息会自己清理：</b>验证提示、通行证和「🎉 验证成功」（即欢迎消息）这类流程消息，用完后会被机器人自动删掉，不在访客对话里堆积：反复索要验证只留最新一条提示，通过验证时提示和访客自己发的那条 /start 会一并清掉，成功提示在他发出第一条消息、刚进入处理时就清掉（那条消息就算被关键词、类型过滤或限流拦下也照清）；过期没用的通行证会在他下次来发消息时清扫。</li>
     </ul>
   </section>
 
@@ -15457,7 +15516,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，被改好的那条消息下方会出现一颗「✍🏼已编辑」标记按钮（点它不会有任何反应，只是标记）。Telegram 不给机器人提供官方的「已编辑」标记，这颗按钮就是补这个用的；它和普通聊天里的编辑一样安静——不会有新消息、不会弹窗提醒，没留意的话可能根本发现不了对方改过。访客编辑他的消息时，你这边也一样。这是写死的固定行为：两个方向的编辑都会自动附上标记，管理台里没有它的开关。只有原地改不动的极少数情况例外（比如转发配对已过期被清理、原地修改被拒绝）：这时机器人会以「回复旧副本」的形式补发一条只含新内容的消息，下方照样附「✍🏼已编辑」标记，原来的副本保留不动——这种时候才会多出一条新消息，顺着回复关系就能对上是哪条被改了。</li>
       <li><b class=\"k\">自动消息带「系统提示」牌：</b>机器人自动发出的提示消息（欢迎语、验证提示、自动回复、熔断期间的回复、拉黑 / 解封通知这类），只要本身没有功能按钮，下方都会带一颗「系统提示」按钮，用来和真人发送的消息区分，点它不会有任何动作；验证按钮、通行证、资料卡、主菜单这些本来就带按钮的消息不再另加；主菜单有个例外：按钮被全部关掉后，菜单没了按钮，就会带上这颗牌子。消息被原地改写时牌子也在，靠改写出现的报告也会补上——比如熔断恢复后，「请稍后再试」会原地改成「✅ 服务已恢复」，下方的「系统提示」照样保留；/clear 的确认卡点下后会原地改写成进度与结果报告，下方同样带这颗牌子。</li>
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。注意：访客私聊那边的原消息只能删 48 小时以内的，超了删不掉时会在话题里留一行说明。</li>
-      <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。这个操作只有主管理员能做，协管员发命令或点确认都会被拦下。</li>
+      <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，欢迎消息、验证卡这类机器人单独记账的流程消息、还有熔断期间发出的回复卡也一并删掉，话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。这个操作只有主管理员能做，协管员发命令或点确认都会被拦下。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
       <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在；发出 ✅ 提醒的同时，之前那条 🚫 提醒会被一并删掉，话题里只留最新状态。</li>
       <li><b class=\"k\">转发失败有提醒：</b>投票、位置、游戏这类本体转不过来的消息，会在话题里落一张占位卡、访客那边也会收到一句提示（见文末「不支持清单」）；其他复制失败会在话题里留一行 ⚠️ 提醒你留意；要是在群里手动关闭了某个话题，访客再发消息时机器人会先把话题重新打开再投递，不会另建新话题；访客短时间内发得太频繁时，超出部分会被限流丢弃，并在话题里提醒一次。</li>
@@ -15473,7 +15532,7 @@ function buildGuidePage(pageCtx = {}) {
     <div class=\"cmd\"><code>/unban</code><div>解除封禁：他会收到一条「✅ 管理员已解除对您的封禁，现在可以继续发送消息。」，之后恢复正常转发。</div></div>
     <div class=\"cmd\"><code>/delete</code><div>先回复选中一条消息、再发这条命令：双向删除那条消息。</div></div>
     <div class=\"cmd\"><code>/terminate</code><div>结束会话并删掉整个话题（删了找不回来，谨慎用）。</div></div>
-    <div class=\"cmd\"><code>/clear</code><div>清空和这位访客的整段聊天记录：话题里的转发副本和访客私聊里的副本一起删（会先弹确认按钮），话题和访客档案保留；私聊里 48 小时前的消息删不掉，清完会报告条数。</div></div>
+    <div class=\"cmd\"><code>/clear</code><div>清空和这位访客的整段聊天记录：话题里的转发副本和访客私聊里的副本一起删（会先弹确认按钮），私聊里的欢迎消息、验证卡与熔断回复卡也一并删掉，话题和访客档案保留；私聊里 48 小时前的消息删不掉，清完会报告条数。</div></div>
     <div class=\"cmd\"><code>/card</code><div>重新生成这个话题的资料卡。</div></div>
     <div class=\"cmd\"><code>/reverify</code><div>让这位访客重新做一次验证。</div></div>
     <div class=\"cmd\"><code>/note 内容</code><div>给这位访客存一条只有管理员看得到的备注（如「老客户，注意时效」）；只发 /note 是查看，/notedelete 是删除。备注除了显示在资料卡上，还会同步到话题名最前面（格式「备注｜名字 (ID)」），在群的话题列表里一眼就能看到。</div></div>
@@ -15497,7 +15556,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
       <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到访客列表；这一区还有一份「成员看门狗豁免名单」，把合法的其他机器人或账号 ID 填进去，它们进管理群时就不会触发成员告警。</li>
       <li><b class=\"k\">服务熔断：</b>被消息轰炸时在这里一键暂停机器人（或用 /pause 命令），可设定暂停时长、到期自动恢复；还能设置暂停期间给访客的回复语句，或关掉回复保持完全静默。</li>
-      <li><b class=\"k\">文案与呈现：</b>验证成功 / 答错、熔断恢复、熔断编辑警告、拉黑 / 解封这几句机器人说的话，能改成你自己的口气；话题名的样式（备注在前还是名字在前、带不带 ID）、主菜单上显示哪些按钮、访客列表默认排序与每页条数、时间显示的时区（默认 Asia/Singapore），也都在这里。</li>
+      <li><b class=\"k\">文案与呈现：</b>答错、熔断恢复、熔断编辑警告、拉黑 / 解封这几句机器人说的话，能改成你自己的口气；话题名的样式（备注在前还是名字在前、带不带 ID）、主菜单上显示哪些按钮、访客列表默认排序与每页条数、时间显示的时区（默认 Asia/Singapore），也都在这里。</li>
       <li><b class=\"k\">安全与审计：</b>网页链接万一泄露（截图、转发、浏览器历史都可能漏出去），可以在这里一键让访客列表 / 网页管理台 / 新手引导某一页的已发链接全部失效，再重新发送 /start 换新链接；谁在什么时候做过删除、发通行证、改配置这类敏感操作，这里也留有一份审计记录可查（保留 90 天）。吊销只影响网页链接，验证链接与一次性通行证不受影响；若怀疑签名密钥泄露，仅吊销不够，需要到 Cloudflare 换掉 LINK_SECRET（未设置时为 WEBHOOK_SECRET）并用新值重跑一次 setWebhook，旧签名才会全部作废。</li>
     </ul>
     <div class=\"tip\">管理台的网页链接 10 分钟过期；剩不到 2 分钟时，页面顶部会先亮一条横幅提醒；打开时、或者开着页面闲置超时后保存时，都会提示过期，重新发送 /start、在新主菜单上重新打开就行。</div>
@@ -15509,7 +15568,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">两个标签页：</b>「访客列表」和「数据统计」，默认打开列表页，点顶部标签切换。</li>
       <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。这组按钮可以长按拖动摆放：按住任意一颗拖动、松手吸附到屏幕左侧或右侧，觉得挡住列表就把它挪开；展开搜索时它回到输入法上方（靠左时搜索框改为向右展开），收起回到放它的位置，拖回右下角原位会恢复自动避让分页条；关掉页面再打开则回到原位。页眉下方的「全部 / 已验证 / 待验证 / 已屏蔽 / 被屏蔽」是快速筛选（「被屏蔽」列的是拉黑了机器人的人）；筛选下方的一行按钮管排序——左半选按最后活跃还是首次来访（第一次与机器人互动的时间）排，右半选倒序还是正序。在列表上左右滑动，也能在五个筛选和「数据统计」之间切换。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
       <li><b class=\"k\">位置会记住：</b>每个筛选与搜索组合下翻到的页码和滚动位置都会被记住，切去别处再切回来，会自动回到离开时的位置（内容是重新拉取的新数据）；手动更换排序会清掉全部位置记忆，各视图都从第一页重新开始。</li>
-      <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词封禁对他同样无效）和「🚫 屏蔽 / ✅ 解封」（与 /ban、/unban 同一套封禁：屏蔽后他再发来的新消息会被立即删掉；解封时他会收到一条解除通知）；设为信任的人行上会挂「🤝 已信任」徽标，屏蔽中的人挂「已屏蔽」徽标。</li>
+      <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里的欢迎消息、验证卡与熔断回复卡也一并删掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词封禁对他同样无效）和「🚫 屏蔽 / ✅ 解封」（与 /ban、/unban 同一套封禁：屏蔽后他再发来的新消息会被立即删掉；解封时他会收到一条解除通知）；设为信任的人行上会挂「🤝 已信任」徽标，屏蔽中的人挂「已屏蔽」徽标。</li>
       <li><b class=\"k\">统计页：</b>总览一排九个数字，排在前面的是和列表筛选对应的五个：访客总数、已验证、待验证、已屏蔽、被屏蔽，后面是未开始、已信任、建有专属话题的人数和没用掉的通行证数；再往下是过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃（活跃还分新客和老客）、收发了多少条消息。这九个数字都能点：前五个点开会直接切到访客列表并选中对应筛选；后四个在列表里没有单独的筛选，点开会整页推入一个只属于这批人的名单页——顶部是返回箭头、人群名和紧跟在名字后面的人数，名单上方有和访客列表同一条排序栏（按最后活跃或首次来访、正序或倒序），两边共用一份排序设置：在这边改了排序，回到访客列表也是这个顺序，反过来也一样；点返回箭头回到统计页。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
     </ul>
   </section>
@@ -15712,6 +15771,7 @@ function buildPanelPage(pageCtx = {}) {
     <label>欢迎消息</label>
     <textarea id="f_welcome" rows="4"></textarea>
     <button class="save" data-k="welcome_msg" data-t="f_welcome">保存</button>
+    <div class="hint">访客验证成功时发给他的问候（就是「🎉 验证成功」那条）：带「系统提示」牌，他发出第一条消息时自动撤回。</div>
     <label>验证方式</label>
     <select id="f_verifymode">
       <option value="turnstile">Turnstile 小程序验证</option>
@@ -15836,9 +15896,6 @@ function buildPanelPage(pageCtx = {}) {
   </section>
   <section id="sec-style" hidden>
     <h2>🎨 文案与呈现</h2>
-    <label>验证成功提示（发给访客）</label>
-    <textarea id="s_vsuccess" rows="2"></textarea>
-    <button class="save" data-k="verify_success_text" data-t="s_vsuccess">保存</button>
     <label>问答答错提示（未到锁定次数时）</label>
     <textarea id="s_vwrong" rows="2"></textarea>
     <button class="save" data-k="quiz_wrong_text" data-t="s_vwrong">保存</button>
@@ -16227,7 +16284,6 @@ fetch('/api/config?' + qs.toString())
     setVal('t_reaction', d.reaction_sync_enabled ? 'true' : 'false');
     setVal('t_relayfail', d.relay_fail_notice_enabled ? 'true' : 'false');
     setVal('t_blocknotice', d.block_notice_enabled ? 'true' : 'false');
-    setVal('s_vsuccess', d.verify_success_text || '');
     setVal('s_vwrong', d.quiz_wrong_text || '');
     setVal('s_restored', d.pause_restored_text || '');
     setVal('s_pausewarn', d.pause_warn_text || '');
@@ -16571,7 +16627,6 @@ function validateScalarConfig(key, rawValue) {
   }
 
   const TEXT_LIMITS = {
-    verify_success_text: 300,
     quiz_wrong_text: 300,
     pause_restored_text: 300,
     pause_warn_text: 300,
@@ -16824,6 +16879,26 @@ async function handleConfigApi(request, env) {
     return value;
   };
 
+  // 欢迎消息（验证成功问候）的展示与发送侧 welcomeMsgText
+  // 同一口径：存量为旧领衔句（长/短）或空白时回显当前默
+  // 认值——那两句已废弃，不该再躺在管理台字段里冒充现
+  // 行问候；真自定义原样回显。仅此一键在展示侧走解析，
+  // 其余键的回显语义不变；保存路径不经此处。
+  const cfgWelcome = () => {
+    const value = cfgAll.welcome_msg;
+
+    if (
+      value === undefined ||
+      value === null ||
+      !String(value).trim() ||
+      LEGACY_WELCOME_MSGS.has(String(value).trim())
+    ) {
+      return DEFAULTS.welcome_msg;
+    }
+
+    return value;
+  };
+
   // 展示值与运行时同一口径（trunc + 范围钳制；两个 TTL
   // 还要求整数，非整数运行时按关闭处理，展示同步为 0），
   // 免得带外坏值在面板上显示成运行时根本不会用的数。
@@ -16876,7 +16951,7 @@ async function handleConfigApi(request, env) {
 
   return Response.json({
     ok: true,
-    welcome_msg: cfg('welcome_msg'),
+    welcome_msg: cfgWelcome(),
     verif_q: cfg('verif_q'),
     verif_a: cfg('verif_a'),
     verify_mode: cfg('verify_mode', 'turnstile'),
@@ -16930,8 +17005,6 @@ async function handleConfigApi(request, env) {
       (cfg('relay_fail_notice_enabled', 'true')) === 'true',
     block_notice_enabled:
       (cfg('block_notice_enabled', 'true')) === 'true',
-    verify_success_text:
-      cfgText('verify_success_text'),
     quiz_wrong_text:
       cfgText('quiz_wrong_text'),
     pause_restored_text:
