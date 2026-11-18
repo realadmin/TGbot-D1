@@ -8234,7 +8234,7 @@ function inspectFrame(seq) {
     var d = frame.contentDocument;
     if (d && d.body) t = String(d.body.textContent || '');
   } catch (e) { t = ''; }
-  if (t && t.indexOf('链接无效或已过期') >= 0) {
+  if (isShortErrorPage(t, '链接无效或已过期')) {
     hideBar();
     refreshSession(function (ok) {
       if (seq !== frameSeq) return;
@@ -8243,12 +8243,24 @@ function inspectFrame(seq) {
     });
     return;
   }
-  if (t && t.indexOf('服务暂时不可用') >= 0) {
+  if (isShortErrorPage(t, '服务暂时不可用')) {
     showBar('服务暂时不可用，请稍后重试。', function () { loadTab(curTab); });
     return;
   }
   hideBar();
   frameShow(seq);
+}
+// 错误页判定收紧（-v170b3）：失效/不可用页的特征是
+// 「整页只有一句短文案」——正文 trim 后以标记开头、
+// 且总长 ≤ 120 字才算错误页。实测量级：三页链接无
+// 效页正文 27/28/27 字、服务暂时不可用页 14 字，
+// 120 留足余量；正常页正文是千字级（引导页约 1.6
+// 万字），且引导页常见问题里正当引用了「链接无效
+// 或已过期」原句——旧口径只查子串包含会把引导页误
+// 判成失效页、续期重载死循环（本版修复点）。
+function isShortErrorPage(t, marker) {
+  var s = String(t || '').trim();
+  return s.length > 0 && s.length <= 120 && s.indexOf(marker) === 0;
 }
 function loadTab(path) {
   if (!creds) {
