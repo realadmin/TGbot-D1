@@ -14182,7 +14182,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.7.1';
+const BOT_VERSION = 'v1.7.2';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -14461,6 +14461,22 @@ async function checkForUpdates(env, force = false) {
     next.tag &&
     compareVersions(next.tag, BOT_VERSION) > 0
   ) {
+    if (force) {
+      // 手动检查（检查更新卡 / /version 命令）：结果当
+      // 场就摆在发起人面前，卡片与命令回复本身就是通
+      // 知，不再另发一条大意相同的独立通知（主人
+      // 2026-11-23 指出连发两条太累赘）。仍占用通知名
+      // 额：这个版本已经当面告知过，之后被动检查不再
+      // 对同一版本补发。
+      await dbConfigClaim(
+        UPDATE_NOTIFIED_KEY,
+        next.tag,
+        env
+      );
+
+      return next;
+    }
+
     // 先原子占用通知名额再发送，避免并发检查重复通知；
     // 若一个管理员都没送达，释放名额留待下次重试。
     const claimed = await dbConfigClaim(
@@ -14470,6 +14486,28 @@ async function checkForUpdates(env, force = false) {
     );
 
     if (claimed) {
+      // 文案按自更新就绪状态分流：就绪时引导去检查更
+      // 新卡点一键更新；未配置/令牌不可用时保留手动部
+      // 署说明。
+      let suReady = false;
+
+      try {
+        const suState = await selfUpdateCardState(
+          env,
+          next
+        );
+
+        suReady = suState.line === '自更新：就绪';
+      } catch (_) {
+        suReady = false;
+      }
+
+      const guidance = suReady
+        ? '自更新已就绪：打开机器人的「检查更新」，' +
+          '点「一键更新」即可自动完成更新。'
+        : '到 GitHub 仓库的 Release 页下载新版代码，' +
+          '粘贴到 Worker 里部署即可（与平时部署方法相同）。';
+
       let delivered = 0;
 
       for (const adminId of
@@ -14484,8 +14522,7 @@ async function checkForUpdates(env, force = false) {
                 '🆕 <b>机器人有新版本可用</b>\n\n' +
                 `当前版本：${BOT_VERSION}\n` +
                 `最新版本：<a href="${escapeHtml(next.url)}">${escapeHtml(next.tag)}</a>\n\n` +
-                '到 GitHub 仓库的 Release 页下载新版代码，' +
-                '粘贴到 Worker 里部署即可（与平时部署方法相同）。',
+                guidance,
               parse_mode: 'HTML',
               disable_web_page_preview: true,
               reply_markup: SYS_TAG_MARKUP
@@ -15183,11 +15220,44 @@ async function selfUpdateCardState(env, cache) {
   return out;
 }
 
-async function selfUpdateVerify(env, origin, scriptName, newVersionId, targetTag) {
-  const delays = [0, 800, 1500, 2500, 4000];
-  let versionOk = false;
+// 验证轮询节奏（-v171b8 重做）：首版时间表只有
+// [0, .8, 1.5, 2.5, 4] 秒五轮，切 100% 后约 13 秒就
+// 判失败回滚——2026-11-23 首次真实自更新双机同栽：
+// 新版本建成、绑定齐全、部署确实切到了新版，但自访
+// /api/version 在这点窗口里始终没返回目标版本号。
+// 存量证据无法区分是边缘传播超过窗口、还是 Worker
+// 自访自身 workers.dev 域名拿不到端点应答，故验证改
+// 成双腿判定（见 selfUpdateVerify），总窗口放宽到约
+// 90 秒（下列间隔累计，另加每轮请求延迟）。
+const SELFUPDATE_VERIFY_DELAYS_MS = [
+  0, 1000, 2000, 3000, 5000, 8000, 12000, 16000, 20000,
+  23000
+];
 
-  for (const delay of delays) {
+// 部署确认腿的门槛：deployments 连续读到新版为当前
+// 部署至少 3 轮、且切换后已过至少 15 秒，才允许在端
+// 点不可达时单独判过。
+const SELFUPDATE_VERIFY_FALLBACK_MIN_MS = 15000;
+const SELFUPDATE_VERIFY_FALLBACK_STREAK = 3;
+
+// 双腿验证：
+// - 端点腿（主）：自访 /api/version 返回目标版本号，
+//   说明流量确实已由新版代码服务，直接判过。
+// - 端点若明确应答了别的版本号（旧代码还在服务），
+//   那是流量尚未切换的实证，部署确认腿本轮不许判
+//   过，继续等。
+// - 部署确认腿（兜底）：端点不可达（非 200、非
+//   JSON、网络失败——自访自身域名可能根本拿不到应
+//   答）时，若 deployments 连续多轮读到新版已是当
+//   前部署且切换已过一段传播时间，判过。deployments
+//   回读的历史问题是滞后报旧（假旧），从未在切换未
+//   发生时报新，故持续报新可信。
+// 两腿在整个窗口内都不成立才判失败（回滚逻辑不变）。
+async function selfUpdateVerify(env, origin, scriptName, newVersionId, targetTag) {
+  const startedAt = Date.now();
+  let activeStreak = 0;
+
+  for (const delay of SELFUPDATE_VERIFY_DELAYS_MS) {
     if (delay) {
       await sleep(delay);
     }
@@ -15199,8 +15269,14 @@ async function selfUpdateVerify(env, origin, scriptName, newVersionId, targetTag
         (await selfUpdateActiveVersion(env, scriptName)) ===
         newVersionId;
     } catch (_) {
-      // 回读失败不中断轮询，靠版本端点兜底判定。
+      // 回读失败不中断轮询，连续计数随之清零。
     }
+
+    activeStreak = activeOk ? activeStreak + 1 : 0;
+
+    // endpointState: 'target' 目标版本在服务；
+    // 'other' 端点明确应答了别的版本号；'down' 不可达。
+    let endpointState = 'down';
 
     try {
       const res = await fetch(`${origin}/api/version`, {
@@ -15210,21 +15286,30 @@ async function selfUpdateVerify(env, origin, scriptName, newVersionId, targetTag
       if (res.ok) {
         const data = await res.json().catch(() => null);
 
-        versionOk = data?.version === targetTag;
+        if (data && typeof data.version === 'string') {
+          endpointState =
+            data.version === targetTag ? 'target' : 'other';
+        }
       }
     } catch (_) {
-      // 自访失败不中断轮询。
+      // 自访失败按不可达处理，不中断轮询。
     }
 
-    if (versionOk && activeOk) {
+    if (endpointState === 'target') {
+      return true;
+    }
+
+    if (
+      endpointState !== 'other' &&
+      activeStreak >= SELFUPDATE_VERIFY_FALLBACK_STREAK &&
+      Date.now() - startedAt >=
+        SELFUPDATE_VERIFY_FALLBACK_MIN_MS
+    ) {
       return true;
     }
   }
 
-  // 流量实际已由新版代码服务时以 /api/version 为准：
-  // deployments 回读在平台侧有已知延迟（外部部署多次
-  // 遇到误报），不能因回读滞后把健康的新版回滚掉。
-  return versionOk;
+  return false;
 }
 
 async function selfUpdateDeployTo(env, scriptName, versionId, message) {
