@@ -96,13 +96,13 @@ const DEFAULTS = {
   pause_warn_text:
     '编辑或贴反应转发失败，请稍后再试',
   block_notice_text:
-    '🚫 对方已将机器人拉黑，后续消息将无法送达。',
+    '🚫 对方已拉黑机器人，后续消息将无法送达。',
   unblock_notice_text:
-    '✅ 对方已解除对机器人的拉黑，可以继续正常收发消息。',
+    '✅ 对方已解除拉黑，可以继续正常收发消息。',
   visitor_blocked_text:
-    '⚠️ 您已被管理员封禁，无法继续发送消息。',
+    '⚠️ 您已被管理员拉黑，无法继续发送消息。',
   visitor_unblocked_text:
-    '✅ 管理员已解除对您的封禁，现在可以继续发送消息。',
+    '✅ 管理员已为您除黑，现在可以继续发送消息。',
   keyword_hit_text:
     '⚠️ 您的消息触发了关键词过滤器 ' +
     '({count}/{threshold} 次)，消息已丢弃。',
@@ -226,11 +226,11 @@ async function ensureBotCommands(env) {
   const topicCommands = [
     {
       command: 'ban',
-      description: '封禁当前话题访客'
+      description: '拉黑当前话题访客'
     },
     {
       command: 'unban',
-      description: '解除当前话题访客封禁'
+      description: '为当前话题访客除黑'
     },
     {
       command: 'delete',
@@ -3181,8 +3181,8 @@ function getInfoCardButtons(
     [
       {
         text: isBlocked
-          ? '✅ 解除屏蔽'
-          : '🚫 屏蔽访客',
+          ? '✅ 除黑访客'
+          : '🚫 拉黑访客',
         callback_data:
           `${isBlocked ? 'unblock' : 'block'}:` +
           `${userId}`
@@ -3202,16 +3202,21 @@ function getInfoCardButtons(
   // （写入时两标记同动，见 trust 回调与列表 trust 动作）。
   const trustOn = isTrusted || isExempt;
 
-  rows.push([
-    {
-      text: trustOn
-        ? '↩️ 取消信任'
-        : '🤝 设为信任',
-      callback_data:
-        `${trustOn ? 'untrust' : 'trust'}:` +
-        `${userId}`
-    }
-  ]);
+  // 封禁中且未信任：设为信任会被回调拒绝（须先解封），
+  // 不渲染这一行免得留一颗点了必报错的按钮；已信任者
+  // 的「取消信任」在封禁中照常可执行，保留。
+  if (trustOn || !isBlocked) {
+    rows.push([
+      {
+        text: trustOn
+          ? '↩️ 取消信任'
+          : '🤝 设为信任',
+        callback_data:
+          `${trustOn ? 'untrust' : 'trust'}:` +
+          `${userId}`
+      }
+    ]);
+  }
 
   const profileUrl =
     getProfileUrl(usernameRaw);
@@ -8764,7 +8769,7 @@ function buildPassPage(params) {
           bad_signature: '通行证无效或已过期，请联系管理员重新发放。',
           bad_initdata: '验证信息已失效或无法确认身份，请关闭本页，回到与机器人的对话里重新点开通行证。',
           used_or_invalid: '这张通行证已使用或已失效，请联系管理员重新发放。',
-          blocked: '账号已被封禁，通行证无法使用，请联系管理员。'
+          blocked: '账号已被管理员拉黑，通行证无法使用，请联系管理员。'
         };
         st.textContent = msgs[d.error] || ('确认失败：' + (d.error || '未知错误'));
       }
@@ -11006,7 +11011,7 @@ async function handleAdminCommand(
 
     await sendEphemeralTopicNotice(
       message,
-      `🚫 已封禁访客 ${userId}。`,
+      `🚫 已拉黑访客 ${userId}。`,
       env,
       ctx
     );
@@ -11037,7 +11042,7 @@ async function handleAdminCommand(
 
     await sendEphemeralTopicNotice(
       message,
-      `✅ 已解除访客 ${userId} 的封禁。`,
+      `✅ 已为访客 ${userId} 除黑。`,
       env,
       ctx
     );
@@ -12150,7 +12155,7 @@ async function handleUserCardCallback(
         await answerCallback(
           callbackQuery.id,
           env,
-          '⚠️ 对方已被封禁，请先解封再设为信任。',
+          '⚠️ 对方已被拉黑，请先除黑再设为信任。',
           true
         );
 
@@ -12318,11 +12323,11 @@ async function handleUserCardCallback(
     let toast = '✅ 操作成功。';
 
     if (action === 'block') {
-      toast = '🚫 已屏蔽该访客。';
+      toast = '🚫 已拉黑该访客。';
     }
 
     if (action === 'unblock') {
-      toast = '✅ 已解除屏蔽。';
+      toast = '✅ 已为该访客除黑。';
     }
 
     await answerCallback(
@@ -12518,6 +12523,39 @@ async function noteBotBlocked(
     );
   }
 
+  // 拉黑即重置（-v170b4）：就在这次被屏蔽跃迁的收口
+  // 处处理——已验证访客改回待验证、信任双清，收尾与
+  // 「重置验证」（列表 reset / /reverify）同口径：作
+  // 废待用通行证与在途顺序点击题；验证提示与欢迎回
+  // 执槽位同既有重置一样不碰。管理员封禁者绝不降级
+  // （封禁标记优先）；待验证 / 未开始者无动作。重置
+  // 只认这次跃迁（占用成功才走到这里），解除拉黑不
+  // 做任何恢复。与话题 / 提醒开关无关：没话题或提醒
+  // 关着，重置照常发生，只是无从在提醒里写明。
+  let blockResetHadTrust = null;
+
+  if (
+    !user.is_blocked &&
+    user.user_state === USER_STATE.VERIFIED
+  ) {
+    blockResetHadTrust = isTrustedRow(user);
+
+    await dbUserUpdate(
+      userId,
+      {
+        user_state: USER_STATE.PENDING,
+        is_trusted: 0,
+        relay_exempt: 0
+      },
+      env,
+      { touchActivity: false }
+    );
+
+    await voidUserPass(env, userId);
+
+    await dbConfigDelete(`seq:${userId}`, env);
+  }
+
   if (user.is_blocked || !user.topic_id) {
     return;
   }
@@ -12532,6 +12570,17 @@ async function noteBotBlocked(
     return;
   }
 
+  let noticeText = await textConfig(
+    'block_notice_text',
+    env
+  );
+
+  if (blockResetHadTrust !== null) {
+    noticeText += blockResetHadTrust
+      ? '\n已同步重置为待验证，信任已撤销。'
+      : '\n已同步重置为待验证。';
+  }
+
   let sent = null;
 
   try {
@@ -12542,7 +12591,7 @@ async function noteBotBlocked(
         chat_id: env.ADMIN_GROUP_ID,
         message_thread_id:
           Number(user.topic_id),
-        text: await textConfig('block_notice_text', env),
+        text: noticeText,
         reply_markup: SYS_TAG_MARKUP
       }
     );
@@ -14133,7 +14182,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.7.0';
+const BOT_VERSION = 'v1.7.1';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -17360,6 +17409,34 @@ async function handleUserListApi(request, env) {
     }
   }
 
+  // 本页访客的被屏蔽（对方拉黑机器人）标志：与通行证
+  // 同款批量 IN 查 config 精确键，值 '1' 才算（与筛选 /
+  // 统计共用同一记账口径）。列表页据此不给被屏蔽者
+  // 渲染注定送达不了的通行证按钮。
+  const botBlockedIds = new Set();
+
+  const bbKeys = rows.map(
+    (user) => `botblocked:${user.user_id}`
+  );
+
+  if (bbKeys.length) {
+    const bbResult = await env.TG_BOT_DB.prepare(
+      'SELECT key, value FROM config WHERE key IN (' +
+        bbKeys.map(() => '?').join(',') +
+        ')'
+    )
+      .bind(...bbKeys)
+      .all();
+
+    for (const row of bbResult?.results || []) {
+      if (String(row.value) === '1') {
+        botBlockedIds.add(
+          String(row.key).slice('botblocked:'.length)
+        );
+      }
+    }
+  }
+
   const users = rows.map((user) => {
     const info = parseUserInfoForList(user);
 
@@ -17379,6 +17456,7 @@ async function handleUserListApi(request, env) {
       note: user.admin_note || '',
       passExp:
         passExpById.get(String(user.user_id)) || 0,
+      botblocked: botBlockedIds.has(String(user.user_id)),
       trusted: Boolean(user.is_trusted),
       exempt: Boolean(user.relay_exempt)
     };
@@ -17900,7 +17978,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">让某人重新验证：</b>打开他的话题，发送 <code>/reverify</code>，他下一次发消息前要重新过一遍验证。</li>
       <li><b class=\"k\">自己先试一遍：</b>私聊发送 <code>/testverify</code> 会拿到一个测试验证链接，点开能看到访客眼中的验证页长什么样；测试模式只是看看样子，不会真的放行或记录任何人。</li>
       <li><b class=\"k\">🎫 一次性通行证（救济通道）：</b>个别访客怎么也过不了验证（比如网络连不上验证服务）时，在访客列表里他那一行点「🎫 通行证」，机器人会私聊发给他一条带通行证链接的消息（默认 30 分钟内有效，有效期可在管理台「基础配置」里改），他点开链接、在确认页点一下即通过验证。通行证链接必须本人点开才有效，转发给别人没用，用过即作废；不依赖 Turnstile 配置，没配密钥也能发。</li>
-      <li><b class=\"k\">🤝 信任：</b>熟人可以免掉验证：在访客列表他那一行点「🤝 信任」，或在他话题的资料卡上点「设为信任」，他立即通过验证（会收到欢迎消息，就是验证成功时发的那句问候）。信任只有一个开关，开启后一并免验证、免转发限流、免类型过滤、免超时清理（删档版与温和版都免）；屏蔽关键词与关键词自动封禁也一并豁免——他发的话、改的话带着关键词也照常送达、不计数。点「取消信任」收回。注意：对他「重置验证」或在话题里发 /reverify 会连信任一起撤销；被封禁的人要先解封才能设信任；资料卡上的信任按钮只有主管理员能操作。</li>
+      <li><b class=\"k\">🤝 信任：</b>熟人可以免掉验证：在访客列表他那一行点「🤝 信任」，或在他话题的资料卡上点「设为信任」，他立即通过验证（会收到欢迎消息，就是验证成功时发的那句问候）。信任只有一个开关，开启后一并免验证、免转发限流、免类型过滤、免超时清理（删档版与温和版都免）；屏蔽关键词与关键词自动拉黑也一并豁免——他发的话、改的话带着关键词也照常送达、不计数。点「取消信任」收回。注意：对他「重置验证」或在话题里发 /reverify 会连信任一起撤销；已拉黑的人要先除黑才能设信任；资料卡上的信任按钮只有主管理员能操作。</li>
       <li><b class=\"k\">验证消息会自己清理：</b>验证提示、通行证和「🎉 验证成功」（即欢迎消息）这类流程消息，用完后会被机器人自动删掉，不在访客对话里堆积：反复索要验证只留最新一条提示；访客自己发的那条 /start，机器人在应答时就顺手删掉，私聊里不留这条命令消息；通过验证时提示会一并清掉，成功提示在他发出第一条消息、刚进入处理时就清掉（那条消息就算被关键词、类型过滤或限流拦下也照清）；过期没用的通行证会在他下次来发消息时清扫。</li>
     </ul>
   </section>
@@ -17908,14 +17986,14 @@ function buildGuidePage(pageCtx = {}) {
   <section id=\"g-chat\">
     <h2>💬 接待日常</h2>
     <ul>
-      <li><b class=\"k\">资料卡：</b>每个话题顶部都钉着访客的资料卡（名字、ID、状态、你的备注）。卡片不见了就在话题里发 <code>/card</code> 重新生成；卡片上的按钮可以直接屏蔽 / 解除屏蔽、设为信任、刷新。</li>
+      <li><b class=\"k\">资料卡：</b>每个话题顶部都钉着访客的资料卡（名字、ID、状态、你的备注）。卡片不见了就在话题里发 <code>/card</code> 重新生成；卡片上的按钮可以直接拉黑 / 除黑、设为信任、刷新。</li>
       <li><b class=\"k\">引用回复会跟着走：</b>你在话题里引用某条消息再回复，访客那边看到的也是引用着他原话的回复；访客引用着回复你时同理，连他框选一小段文字的「部分引用」都会原样带过去。</li>
       <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，被改好的那条消息下方会出现一颗「✍🏼已编辑」标记按钮（点它不会有任何反应，只是标记）。Telegram 不给机器人提供官方的「已编辑」标记，这颗按钮就是补这个用的；它和普通聊天里的编辑一样安静——不会有新消息、不会弹窗提醒，没留意的话可能根本发现不了对方改过。访客编辑他的消息时，你这边也一样。这是写死的固定行为：两个方向的编辑都会自动附上标记，管理台里没有它的开关。只有原地改不动的极少数情况例外（比如转发配对已过期被清理、原地修改被拒绝）：这时机器人会以「回复旧副本」的形式补发一条只含新内容的消息，下方照样附「✍🏼已编辑」标记，原来的副本保留不动——这种时候才会多出一条新消息，顺着回复关系就能对上是哪条被改了。</li>
-      <li><b class=\"k\">自动消息带「系统提示」牌：</b>机器人自动发出的提示消息（欢迎消息、验证提示、自动回复、熔断期间的回复、拉黑 / 解封通知这类），只要本身没有功能按钮，下方都会带一颗「系统提示」按钮，用来和真人发送的消息区分，点它不会有任何动作；验证按钮、通行证、资料卡、主菜单这些本来就带按钮的消息不再另加；主菜单有个例外：按钮被全部关掉后，菜单没了按钮，就会带上这颗牌子。消息被原地改写时牌子也在，靠改写出现的报告也会补上——比如熔断恢复后，「请稍后再试」会原地改成「✅ 服务已恢复」，下方的「系统提示」照样保留；/clear 的确认卡点下后会原地改写成进度与结果报告，下方同样带这颗牌子。</li>
+      <li><b class=\"k\">自动消息带「系统提示」牌：</b>机器人自动发出的提示消息（欢迎消息、验证提示、自动回复、熔断期间的回复、拉黑提醒、拉黑 / 除黑通知这类），只要本身没有功能按钮，下方都会带一颗「系统提示」按钮，用来和真人发送的消息区分，点它不会有任何动作；验证按钮、通行证、资料卡、主菜单这些本来就带按钮的消息不再另加；主菜单有个例外：按钮被全部关掉后，菜单没了按钮，就会带上这颗牌子。消息被原地改写时牌子也在，靠改写出现的报告也会补上——比如熔断恢复后，「请稍后再试」会原地改成「✅ 服务已恢复」，下方的「系统提示」照样保留；/clear 的确认卡点下后会原地改写成进度与结果报告，下方同样带这颗牌子。</li>
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。注意：访客私聊那边的原消息只能删 48 小时以内的，超了删不掉时会在话题里留一行说明。</li>
       <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，欢迎消息、验证卡这类机器人单独记账的流程消息、还有熔断期间发出的回复卡也一并删掉（访客发的那条 /start 在机器人应答时就已删掉，不会留到清空时才发现删不掉），话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。这个操作只有主管理员能做，协管员发命令或点确认都会被拦下。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
-      <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在；发出 ✅ 提醒的同时，之前那条 🚫 提醒会被一并删掉，话题里只留最新状态。</li>
+      <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在；发出 ✅ 提醒的同时，之前那条 🚫 提醒会被一并删掉，话题里只留最新状态。如果他拉黑之前已经通过验证，拉黑的那一刻验证会被一并重置：改回待验证、信任一并撤销、没用掉的通行证作废，🚫 提醒里会写明已经重置。他之后解除拉黑也不会自动恢复，回来发消息时要重新过一遍验证。已经被你拉黑的人不受这条影响，不会因为拉黑机器人被改成待验证。</li>
       <li><b class=\"k\">转发失败有提醒：</b>投票、位置、游戏这类本体转不过来的消息，会在话题里落一张占位卡、访客那边也会收到一句提示（见文末「不支持清单」）；其他复制失败会在话题里留一行 ⚠️ 提醒你留意；要是在群里手动关闭了某个话题，访客再发消息时机器人会先把话题重新打开再投递，不会另建新话题；访客短时间内发得太频繁时，超出部分会被限流丢弃，并在话题里提醒一次。</li>
       <li><b class=\"k\">命令回执不留痕：</b>你在话题里发出的命令消息，会在处理后立即被撤回；/note 的查看与保存、/notedelete、/reverify、/ban、/unban、/card 重建、话题里 /pause 与 /resume 的结果提示，还有打错命令时的「未识别的命令」提示，都是短暂显示，约 5 秒后自动删除，话题里不会堆积这类回执。例外：/note 保存失败（比如备注超长）时，命令原文会保留下来，方便你照着改短了重发。</li>
       <li><b class=\"k\">被轰炸时先开启服务熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客新发的消息会被机器人当场删除、不补送——消息发出去就消失，就是还在暂停的信号；对熔断前已送达消息的编辑和反应同样会被拒收、不再同步到话题副本（编辑能把旧消息整段换成新内容，放行等于绕过暂停发新消息）；开启服务熔断回复时，被拒的访客会收到一张警告，每位访客每轮暂停至多一张，恢复服务时警告会自动删除（关闭熔断回复时完全静默，警告也不发），被拒的编辑不会在恢复后补同步，记得提醒对方恢复后重新编辑或重发；这句警告可以在管理台「文案与呈现」里改成自己的说法；开启服务熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息；恢复服务时，那条「请稍后再试」会自动改成「✅ 服务已恢复」，访客一看便知；这条恢复提示会在访客下一次发消息时自动撤回（暂停期间收到这条回复的人很多时，会在恢复后的头几条消息里分批改完）。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
@@ -17926,8 +18004,8 @@ function buildGuidePage(pageCtx = {}) {
     <h2>⌨️ 命令速查</h2>
     <p>命令菜单按身份显示：访客在私聊里点开菜单，只看得到 /start；管理员命令只出现在主管理员自己的私聊菜单里，话题命令只出现在接待群里，访客看不到。</p>
     <p>下面这些命令都在<b class=\"k\">访客的话题里</b>发送（在私聊里发没用）：</p>
-    <div class=\"cmd\"><code>/ban</code><div>封禁这位访客：他再发来的消息会被当场删掉、不再转进来，他会收到一条「⚠️ 您已被管理员封禁，无法继续发送消息。」的通知。</div></div>
-    <div class=\"cmd\"><code>/unban</code><div>解除封禁：他会收到一条「✅ 管理员已解除对您的封禁，现在可以继续发送消息。」，之后恢复正常转发。</div></div>
+    <div class=\"cmd\"><code>/ban</code><div>拉黑这位访客：他再发来的消息会被当场删掉、不再转进来，他会收到一条「⚠️ 您已被管理员拉黑，无法继续发送消息。」的通知。</div></div>
+    <div class=\"cmd\"><code>/unban</code><div>除黑：他会收到一条「✅ 管理员已为您除黑，现在可以继续发送消息。」，之后恢复正常转发。</div></div>
     <div class=\"cmd\"><code>/delete</code><div>先回复选中一条消息、再发这条命令：双向删除那条消息。</div></div>
     <div class=\"cmd\"><code>/terminate</code><div>结束会话并删掉整个话题（删了找不回来，谨慎用）。</div></div>
     <div class=\"cmd\"><code>/clear</code><div>清空和这位访客的整段聊天记录：话题里的转发副本和访客私聊里的副本一起删（会先弹确认按钮），私聊里的欢迎消息、验证卡与熔断回复卡也一并删掉，话题和访客档案保留；私聊里 48 小时前的消息删不掉，清完会报告条数。</div></div>
@@ -17949,11 +18027,11 @@ function buildGuidePage(pageCtx = {}) {
     <ul>
       <li><b class=\"k\">基础配置：</b>欢迎消息、验证方式与题目、已验证超时清理（两种）。删档版填一个天数（比如 90），长期没动静的访客会被自动清除并释放位置；填 0 表示永不自动清。注意：被清掉的人下次再来会新建一个话题，老话题会留着当存档。另有温和版「改回待验证」：同样在基础配置里填天数，到期只把人改回待验证，档案、备注与话题都留着，对方回来重新验证后还在原话题继续聊；两种可以同时开，一般温和版的天数设得更小。这一区还管参数与开关：转发限流的强度、通行证与验证链接的有效期、问答锁定的次数与时长、命令回执停留几秒（数字都带安全范围，填超了不保存），以及功能开关：反应同步、转发失败提醒、拉黑提醒，用不上哪个就关掉。（编辑标记不在开关之列：编辑同步成功就自动在被改消息下方附上「✍🏼已编辑」标记，两个方向都一样。）</li>
       <li><b class=\"k\">类型过滤：</b>不想转发的消息类型（贴纸、语音、视频等）在这里关掉，对方发了也不会过到对面去。</li>
-      <li><b class=\"k\">屏蔽关键词：</b>访客的话里出现关键词会被拦下并记一次数，次数达到你设的阈值就自动封禁他，口径与手动封禁完全一致（新消息即删、同样发送封禁通知）。已信任的访客不在此列：对他们不拦截、不计数、不自动封禁。不会写正则表达式也没关系，直接填普通词句就行。</li>
+      <li><b class=\"k\">屏蔽关键词：</b>访客的话里出现关键词会被拦下并记一次数，次数达到你设的阈值就自动拉黑他，口径与手动拉黑完全一致（新消息即删、同样发送拉黑通知）。已信任的访客不在此列：对他们不拦截、不计数、不自动拉黑。不会写正则表达式也没关系，直接填普通词句就行。</li>
       <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
       <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到访客列表；这一区还有一份「成员看门狗豁免名单」，把合法的其他机器人或账号 ID 填进去，它们进管理群时就不会触发成员告警。</li>
       <li><b class=\"k\">服务熔断：</b>被消息轰炸时在这里一键暂停机器人（或用 /pause 命令），可设定暂停时长、到期自动恢复；还能设置暂停期间给访客的回复语句，或关掉回复保持完全静默。</li>
-      <li><b class=\"k\">文案与呈现：</b>机器人对访客说的话大多能改成你自己的口气：管理台可配文案共 19 项，欢迎消息在「基础配置」、熔断期间回复在「服务熔断」，其余都在这一区——答错提示与锁定提示、人机验证卡正文、通行证送达、熔断恢复、熔断编辑警告、拉黑 / 解封提醒、发给访客的封禁 / 解封通知、关键词命中与类型过滤的拒绝提示（类型过滤分发送类与转发类两条模板）、特殊类型无法转达提示；话题名的样式（备注在前还是名字在前、带不带 ID）、主菜单上显示哪些按钮、访客列表默认排序与每页条数、时间显示的时区（默认 Asia/Singapore），也都在这里。</li>
+      <li><b class=\"k\">文案与呈现：</b>机器人对访客说的话大多能改成你自己的口气：管理台可配文案共 19 项，欢迎消息在「基础配置」、熔断期间回复在「服务熔断」，其余都在这一区——答错提示与锁定提示、人机验证卡正文、通行证送达、熔断恢复、熔断编辑警告、拉黑 / 解除拉黑提醒、发给访客的拉黑 / 除黑通知、关键词命中与类型过滤的拒绝提示（类型过滤分发送类与转发类两条模板）、特殊类型无法转达提示；话题名的样式（备注在前还是名字在前、带不带 ID）、主菜单上显示哪些按钮、访客列表默认排序与每页条数、时间显示的时区（默认 Asia/Singapore），也都在这里。</li>
       <li><b class=\"k\">安全与审计：</b>网页链接万一泄露（截图、转发、浏览器历史都可能漏出去），可以在这里一键让访客列表 / 网页管理台 / 新手引导某一页的已发链接全部失效，再重新发送 /start 换新链接；谁在什么时候做过删除、发通行证、改配置这类敏感操作，这里也留有一份审计记录可查（保留 90 天）。吊销只影响网页链接，验证链接与一次性通行证不受影响；若怀疑签名密钥泄露，仅吊销不够，需要到 Cloudflare 换掉 LINK_SECRET（未设置时为 WEBHOOK_SECRET）并用新值重跑一次 setWebhook，旧签名才会全部作废。</li>
     </ul>
     <div class=\"tip\">${pageCtx.appMode ? '你现在是在小程序里打开管理台：登录会话有效 6 小时，外壳会在到期前自动换新；万一页面提示失效，关掉小程序重新打开、或点小程序顶部的「重新进入」即可。' : '管理台的网页链接 10 分钟过期；剩不到 2 分钟时，页面顶部会先亮一条横幅提醒；打开时、或者开着页面闲置超时后保存时，都会提示过期，重新发送 /start、在新主菜单上重新打开就行。'}</div>
@@ -17963,10 +18041,10 @@ function buildGuidePage(pageCtx = {}) {
     <h2>📋 访客列表与数据统计</h2>
     <ul>
       <li><b class=\"k\">两个标签页：</b>「访客列表」和「数据统计」，默认打开列表页，点顶部标签切换。</li>
-      <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。这组按钮可以长按拖动摆放：按住任意一颗拖动、松手吸附到屏幕左侧或右侧，觉得挡住列表就把它挪开；展开搜索时它回到输入法上方（靠左时搜索框改为向右展开），收起回到放它的位置，拖回右下角原位会恢复自动避让分页条；关掉页面再打开则回到原位。页眉下方的「全部 / 已验证 / 待验证 / 已屏蔽 / 被屏蔽」是快速筛选（「被屏蔽」列的是拉黑了机器人的人）；筛选下方的一行按钮管排序——左半选按最后活跃还是首次来访（第一次与机器人互动的时间）排，右半选倒序还是正序。在列表上左右滑动，也能在五个筛选和「数据统计」之间切换。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
+      <li><b class=\"k\">找人：</b>页面右下角有一组浮动按钮：点放大镜会展开搜索框，可以按名字、用户名、数字 ID、甚至你写的备注来搜，搜索词生效时收起的按钮上会亮蓝点提醒；列表往下翻一段后，组里还会出现一个回顶按钮。这组按钮可以长按拖动摆放：按住任意一颗拖动、松手吸附到屏幕左侧或右侧，觉得挡住列表就把它挪开；展开搜索时它回到输入法上方（靠左时搜索框改为向右展开），收起回到放它的位置，拖回右下角原位会恢复自动避让分页条；关掉页面再打开则回到原位。页眉下方的「全部 / 已验证 / 待验证 / 已拉黑 / 被拉黑」是快速筛选（「被拉黑」列的是拉黑了机器人的人）；筛选下方的一行按钮管排序——左半选按最后活跃还是首次来访（第一次与机器人互动的时间）排，右半选倒序还是正序。在列表上左右滑动，也能在五个筛选和「数据统计」之间切换。翻页除了点上一页 / 下一页，分页条上的页码下拉可以直接跳到任意一页。</li>
       <li><b class=\"k\">位置会记住：</b>每个筛选与搜索组合下翻到的页码和滚动位置都会被记住，切去别处再切回来，会自动回到离开时的位置（内容是重新拉取的新数据）；手动更换排序会清掉全部位置记忆，各视图都从第一页重新开始。</li>
-      <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里的欢迎消息、验证卡与熔断回复卡也一并删掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词封禁对他同样无效）和「🚫 屏蔽 / ✅ 解封」（与 /ban、/unban 同一套封禁：屏蔽后他再发来的新消息会被立即删掉；解封时他会收到一条解除通知）；设为信任的人行上会挂「🤝 已信任」徽标，屏蔽中的人挂「已屏蔽」徽标。</li>
-      <li><b class=\"k\">统计页：</b>总览一排九个数字，排在前面的是和列表筛选对应的五个：访客总数、已验证、待验证、已屏蔽、被屏蔽，后面是未开始、已信任、建有专属话题的人数和没用掉的通行证数；再往下是过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃（活跃还分新客和老客）、收发了多少条消息。这九个数字都能点：前五个点开会直接切到访客列表并选中对应筛选；后四个在列表里没有单独的筛选，点开会整页推入一个只属于这批人的名单页——顶部是返回箭头、人群名和紧跟在名字后面的人数，名单上方有和访客列表同一条排序栏（按最后活跃或首次来访、正序或倒序），两边共用一份排序设置：在这边改了排序，回到访客列表也是这个顺序，反过来也一样；点返回箭头回到统计页。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
+      <li><b class=\"k\">对某个人操作：</b>每行的按钮按对方当前的状态显示，用不上的就不出现。「备注」和「删除」一直都在：「备注」写一句只有管理员看得到的话，会同步显示到他的资料卡上；「删除」里“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动，“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里的欢迎消息、验证卡与熔断回复卡也一并删掉，私聊里 48 小时前的消息删不掉，清完会报告条数。有话题时还有「话题」，一键跳到话题群里和他的对话。「重置验证」（让他重新验证）只在对方已验证时出现：还没验证的人点它没有意义，还可能误伤他没用掉的通行证，所以不显示。「🎫 通行证」只在对方还没通过验证、没有被你拉黑、也没有拉黑机器人时出现：给他发一张一次性通行证，他点开确认即可通过。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。「🤝 信任」只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词自动拉黑对他同样无效。对方已被你拉黑时要先除黑才能设信任，所以拉黑中又还没设信任的人不显示这颗按钮；已经设了信任的人，仍可点「↩️ 取消信任」收回。「🚫 拉黑 / ✅ 除黑」与 /ban、/unban 同一套拉黑：拉黑后他再发来的新消息会被立即删掉；除黑时他会收到一条除黑通知。设为信任的人行上会挂「🤝 已信任」徽标，拉黑中的人挂「已拉黑」徽标。</li>
+      <li><b class=\"k\">统计页：</b>总览一排九个数字，排在前面的是和列表筛选对应的五个：访客总数、已验证、待验证、已拉黑、被拉黑，后面是未开始、已信任、建有专属话题的人数和没用掉的通行证数；再往下是过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃（活跃还分新客和老客）、收发了多少条消息。这九个数字都能点：前五个点开会直接切到访客列表并选中对应筛选；后四个在列表里没有单独的筛选，点开会整页推入一个只属于这批人的名单页——顶部是返回箭头、人群名和紧跟在名字后面的人数，名单上方有和访客列表同一条排序栏（按最后活跃或首次来访、正序或倒序），两边共用一份排序设置：在这边改了排序，回到访客列表也是这个顺序，反过来也一样；点返回箭头回到统计页。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
     </ul>
   </section>
 
@@ -18199,7 +18277,7 @@ function buildPanelPage(pageCtx = {}) {
     <button class="save" data-k="verified_ttl_days" data-t="f_ttl">保存</button>
     <label>已验证改回待验证（天，0 = 关闭）</label>
     <input type="number" id="f_rvttl" min="0" max="3650" step="1">
-    <div class="hint">温和版：超过该天数无活跃的已验证访客只改回待验证，档案、备注与话题都保留，对方回来重新验证后还在原话题里聊。被封禁 / 信任的访客不改。可与上面的删档清理同时开：一般把这个天数设得更小（先改回待验证）；删档天数从最后一次活动算起继续计时，满了照样删档。</div>
+    <div class="hint">温和版：超过该天数无活跃的已验证访客只改回待验证，档案、备注与话题都保留，对方回来重新验证后还在原话题里聊。已拉黑 / 信任的访客不改。可与上面的删档清理同时开：一般把这个天数设得更小（先改回待验证）；删档天数从最后一次活动算起继续计时，满了照样删档。</div>
     <button class="save" data-k="reverify_ttl_days" data-t="f_rvttl">保存</button>
     <h2>⚙️ 参数与开关</h2>
     <div class="hint">说明：把问答「连错锁定次数」调小后，之前已答错多次的访客会按新次数提前锁定；已经在锁定期内的访客按落锁时的时长走完。验证链接与通行证的有效期调短，不影响已经发出去的（按发出时的时长到期）。</div>
@@ -18230,7 +18308,7 @@ function buildPanelPage(pageCtx = {}) {
     <label>转发失败提醒（话题 ⚠️ 与管理员告警）</label>
     <select id="t_relayfail"><option value="true">开启</option><option value="false">关闭</option></select>
     <button class="save" data-k="relay_fail_notice_enabled" data-t="t_relayfail">保存</button>
-    <label>拉黑 / 解封提醒</label>
+    <label>拉黑 / 解除拉黑提醒</label>
     <select id="t_blocknotice"><option value="true">开启</option><option value="false">关闭</option></select>
     <button class="save" data-k="block_notice_enabled" data-t="t_blocknotice">保存</button>
     <div class="hint">数字参数都带安全范围，超出范围会报错不保存；开关关掉后对应功能整体停用，随时可以再打开。</div>
@@ -18244,7 +18322,7 @@ function buildPanelPage(pageCtx = {}) {
 
   <section id="sec-keyword" hidden>
     <h2>🚫 屏蔽关键词</h2>
-    <label>自动封禁阈值（命中次数，1～100）</label>
+    <label>自动拉黑阈值（命中次数，1～100）</label>
     <input type="number" id="f_threshold" min="1" max="100" step="1">
     <button class="save" data-k="block_threshold" data-t="f_threshold">保存</button>
     <label>关键词列表（支持正则表达式）</label>
@@ -18295,7 +18373,7 @@ function buildPanelPage(pageCtx = {}) {
     <textarea id="f_pausereply" rows="2"></textarea>
     <button class="save" data-k="pause_reply_text" data-t="f_pausereply">保存</button>
     </div>
-    <div class="hint">暂停期间访客新发的消息会被删除、不转发，恢复后不会补送，请提醒对方重发重要内容；对已送达消息的编辑与表情反应也会被拒收、不再同步，上面开启回复时，被拒的访客每轮至多收到一张警告（文案在「文案与呈现」里改），恢复服务时警告自动删除；关闭回复时完全静默，警告也不发。已被封禁的访客不会收到回复。暂停到期会自动恢复，也可随时恢复；到期时不会立刻发通知，恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的。</div>
+    <div class="hint">暂停期间访客新发的消息会被删除、不转发，恢复后不会补送，请提醒对方重发重要内容；对已送达消息的编辑与表情反应也会被拒收、不再同步，上面开启回复时，被拒的访客每轮至多收到一张警告（文案在「文案与呈现」里改），恢复服务时警告自动删除；关闭回复时完全静默，警告也不发。已拉黑的访客不会收到回复。暂停到期会自动恢复，也可随时恢复；到期时不会立刻发通知，恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的。</div>
   </section>
   <section id="sec-style" hidden>
     <h2>🎨 文案与呈现</h2>
@@ -18323,18 +18401,18 @@ function buildPanelPage(pageCtx = {}) {
     <label>拉黑提醒（发到访客的话题里）</label>
     <textarea id="s_block" rows="2"></textarea>
     <button class="save" data-k="block_notice_text" data-t="s_block">保存</button>
-    <label>解封提醒（发到访客的话题里）</label>
+    <label>解除拉黑提醒（发到访客的话题里）</label>
     <textarea id="s_unblock" rows="2"></textarea>
     <button class="save" data-k="unblock_notice_text" data-t="s_unblock">保存</button>
-    <label>封禁通知（发给被封禁的访客）</label>
+    <label>拉黑通知（发给已拉黑的访客）</label>
     <textarea id="s_vblocked" rows="2"></textarea>
     <button class="save" data-k="visitor_blocked_text" data-t="s_vblocked">保存</button>
-    <label>解封通知（发给被解封的访客）</label>
+    <label>除黑通知（发给已除黑的访客）</label>
     <textarea id="s_vunblocked" rows="2"></textarea>
     <button class="save" data-k="visitor_unblocked_text" data-t="s_vunblocked">保存</button>
     <label>关键词命中提示（访客消息命中屏蔽关键词时发出）</label>
     <textarea id="s_kwhit" rows="2"></textarea>
-    <div class="hint">{count} 会替换成当前命中次数、{threshold} 替换成自动封禁的阈值；不写占位符就按原文发送。</div>
+    <div class="hint">{count} 会替换成当前命中次数、{threshold} 替换成自动拉黑的阈值；不写占位符就按原文发送。</div>
     <button class="save" data-k="keyword_hit_text" data-t="s_kwhit">保存</button>
     <label>类型过滤拒绝提示 · 发送类（发给访客）</label>
     <textarea id="s_fsend" rows="2"></textarea>
@@ -18399,7 +18477,7 @@ function buildPanelPage(pageCtx = {}) {
     <button class="save danger" id="revoke_panel">吊销管理台链接（本页也会失效）</button>
     <div class="hint">吊销只让已发出的对应网页链接失效；验证链接与一次性通行证不受影响。若怀疑签名密钥泄露，仅吊销不够：请到 Cloudflare 把 LINK_SECRET（未设置 LINK_SECRET 时为 WEBHOOK_SECRET）换成新值，并用新值重跑一次 setWebhook，之后所有旧签名（含验证与通行证链接）全部作废。</div>
     <label>管理操作审计（每页 100 条，保留 90 天）</label>
-    <div class="hint">删除访客、发通行证、改信任与屏蔽、改配置、吊销链接的成功与失败都会记在这里。只记谁在何时对谁做了什么，不记备注内容与配置值。</div>
+    <div class="hint">删除访客、发通行证、改信任与拉黑、改配置、吊销链接的成功与失败都会记在这里。只记谁在何时对谁做了什么，不记备注内容与配置值。</div>
     <input type="text" id="audit_f_admin" placeholder="按管理员 ID 筛选（可空）">
     <input type="text" id="audit_f_action" placeholder="按动作筛选，如 delete / config_set（可空）">
     <input type="text" id="audit_f_target" placeholder="按目标筛选，子串匹配（可空）">
@@ -19052,7 +19130,7 @@ document.getElementById('revoke_panel').onclick = function () { revokeLinks('pan
 document.getElementById('revoke_usrlist').onclick = function () { revokeLinks('usrlist', '访客列表'); };
 document.getElementById('revoke_guide').onclick = function () { revokeLinks('guide', '新手引导'); };
 
-var AUDIT_ACTION = { config_set: '改配置', delete: '删除访客', pass: '发通行证', trust: '信任变更', block: '屏蔽变更', revoke_links: '吊销链接' };
+var AUDIT_ACTION = { config_set: '改配置', delete: '删除访客', pass: '发通行证', trust: '信任变更', block: '拉黑变更', revoke_links: '吊销链接' };
 var auditCursor = null;
 function auditUrl(cursor) {
   var q = new URLSearchParams(qs.toString());
@@ -21048,7 +21126,7 @@ async function handleUserListAction(request, env) {
       return Response.json(
         {
           ok: false,
-          error: '对方已被封禁，请先解封再设为信任'
+          error: '对方已被拉黑，请先除黑再设为信任'
         },
         { status: 400 }
       );
@@ -21329,7 +21407,7 @@ async function handleUserListAction(request, env) {
       );
 
       return Response.json(
-        { ok: false, error: '对方已被封禁，请先解封再发放' },
+        { ok: false, error: '对方已被拉黑，请先除黑再发放' },
         { status: 400 }
       );
     }
@@ -21586,8 +21664,8 @@ function buildUserListPage(pageCtx = {}) {
   <button class="chip on" data-f="all">全部</button>
   <button class="chip" data-f="verified">已验证</button>
   <button class="chip" data-f="pending">待验证</button>
-  <button class="chip" data-f="blocked">已屏蔽</button>
-  <button class="chip" data-f="botblocked">被屏蔽</button>
+  <button class="chip" data-f="blocked">已拉黑</button>
+  <button class="chip" data-f="botblocked">被拉黑</button>
 </div>
 <div id="uscroll">
 <main>
@@ -21641,7 +21719,7 @@ var booted = false;
 // 不许被领养无声覆写（第十轮审计·低3）。
 var sortTouched = false;
 var curCursor = '', cursorStack = [], nextCursor = null;
-var LABEL = { verified: '已验证', pending_verification: '待验证', blocked: '已屏蔽' };
+var LABEL = { verified: '已验证', pending_verification: '待验证', blocked: '已拉黑' };
 var CLS = { verified: 'b-ok', pending_verification: 'b-pend', blocked: 'b-ban' };
 
 function toast(msg) {
@@ -22244,7 +22322,7 @@ function render() {
       };
       ops.appendChild(jb);
     }
-    if (u.state !== 'verified') {
+    if (u.state !== 'verified' && u.state !== 'blocked' && !u.botblocked) {
       var pb = document.createElement('button');
       pb.className = 'ntb';
       var passLive = u.passExp && u.passExp > Date.now();
@@ -22271,7 +22349,7 @@ function render() {
     var tb = document.createElement('button');
     tb.className = 'ntb';
     tb.textContent = tOn ? '↩️ 取消信任' : '🤝 信任';
-    tb.title = '🤝 信任：免验证、免限流与类型过滤、免超时清理（关键词封禁同样豁免）';
+    tb.title = '🤝 信任：免验证、免限流与类型过滤、免超时清理（关键词自动拉黑同样豁免）';
     tb.onclick = function () {
       tb.disabled = true;
       act(u.id, 'trust', false, undefined, { trust: !tOn }).then(function (d) {
@@ -22285,12 +22363,12 @@ function render() {
         } else toast('操作失败：' + (d.error || ''));
       });
     };
-    ops.appendChild(tb);
+    if (!(u.state === 'blocked' && !tOn)) ops.appendChild(tb);
     var bOn = u.state === 'blocked';
     var bb = document.createElement('button');
     bb.className = 'ntb';
-    bb.textContent = bOn ? '✅ 解封' : '🚫 屏蔽';
-    bb.title = '屏蔽后对方发来的新消息会被立即删掉并丢弃，不再转发';
+    bb.textContent = bOn ? '✅ 除黑' : '🚫 拉黑';
+    bb.title = '拉黑后对方发来的新消息会被立即删掉并丢弃，不再转发';
     bb.onclick = function () {
       bb.disabled = true;
       act(u.id, 'block', false, undefined, { block: !bOn }).then(function (d) {
@@ -22298,13 +22376,13 @@ function render() {
         if (d.ok) {
           if (!bOn) { u._st = u.state; u.state = 'blocked'; }
           else { u.state = u._st || (u.passExp ? 'pending_verification' : 'verified'); delete u._st; }
-          toast(!bOn ? '已屏蔽该访客' : '已解除屏蔽');
+          toast(!bOn ? '已拉黑该访客' : '已为该访客除黑');
           render();
         } else toast('操作失败：' + (d.error || ''));
       });
     };
     ops.appendChild(bb);
-    ops.appendChild(rb);
+    if (u.state === 'verified') ops.appendChild(rb);
     var db = document.createElement('button');
     db.className = 'del';
     db.textContent = '🗑 删除';
@@ -23603,8 +23681,8 @@ function loadStats() {
         stile(d.users.total, '访客总数', null, 'all'),
         stile(d.users.verified, '已验证', null, 'verified'),
         stile(d.users.pending, '待验证', null, 'pending'),
-        stile(d.users.blocked, '已屏蔽', null, 'blocked'),
-        stile(d.users.botBlocked, '被屏蔽', null, 'botblocked'),
+        stile(d.users.blocked, '已拉黑', null, 'blocked'),
+        stile(d.users.botBlocked, '被拉黑', null, 'botblocked'),
         stile(d.users.fresh, '未开始', null, 'fresh'),
         stile(d.users.trusted, '已信任', null, 'trusted'),
         stile(d.users.withTopic, '有话题', null, 'topic'),
