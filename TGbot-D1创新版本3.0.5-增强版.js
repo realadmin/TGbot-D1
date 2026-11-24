@@ -14183,7 +14183,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.7.3';
+const BOT_VERSION = 'v1.7.4';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -14824,7 +14824,7 @@ async function handleUpdateCheckCallback(
 
   if (confirming) {
     text +=
-      `\n⏳ 更新确认中：已切换到 ${escapeHtml(suPending.target || '')}，正在确认是否生效…`;
+      `\n⏳ 更新确认中：已切换到 ${escapeHtml(suPending.target || '')}，确认尚未完成。给机器人发任意一条消息，或稍后再打开本卡，即可完成确认。`;
   }
 
   const keyboard = [];
@@ -15259,6 +15259,12 @@ async function selfUpdateCardState(env, cache) {
 // 底腿禁行；端点不可达时 deployments 持续报新版
 // 可兜底（回读的历史故障形态是滞后报旧、从未假
 // 报新，持续报新可信）。
+// -v173b10 补强：接力只挂后续请求，闲置即断粮
+// （2026-11-24 实机：切换成功后主人只是看着卡片，
+// 接力一步没再走、确认永不落定）——发起调用改为
+// 在宽限内自跑两步探测、当场落定（见
+// selfUpdateInCallConfirm），接力退为兜底；确认期
+// 文案同步改实，不再承诺「自动完成」。
 const SELFUPDATE_CONFIRM_WINDOW_MS = 150 * 1000;
 
 // 部署确认腿的门槛：deployments 连续读到新版为当前
@@ -15576,7 +15582,7 @@ async function selfUpdateAdvance(env, origin, pending, say) {
       await touch();
 
       await say(
-        `⏳ 已切换到 ${pending.target}，确认中…\n确认会在后续几分钟内自动完成，也可以稍后打开「检查更新」查看结果。`
+        `⏳ 已切换到 ${pending.target}，确认中…`
       );
     }
   } catch (error) {
@@ -15612,6 +15618,75 @@ async function runSelfUpdate(env, origin, pending) {
   // 形下，发起调用内就能当场落定；没落定也无妨，后
   // 续请求继续接力。
   await selfUpdateRelayStep(env, origin);
+
+  // 再在同一条 waitUntil 链内自跑两步探测，尽量当
+  // 场落定（接力断粮的补强，见 selfUpdateInCallConfirm）。
+  await selfUpdateInCallConfirm(env, origin, pending, say);
+}
+
+// 调用内自跑探测的步间延时（毫秒）：两步 [+5s,
+// +11s]——第二步落在切换后约 16 秒，刚好攒满部署
+// 确认腿的 3 轮 streak 并越过其 15 秒门槛，整条链
+// 连同部署流水线仍在 waitUntil 约 30 秒宽限内（留
+// 有余量，不贴上限）。可由 SELFUPDATE_INCALL_DELAYS_MS
+// （逗号分隔的毫秒数）覆盖，口径同 EPHEMERAL_NOTICE_MS。
+const SELFUPDATE_INCALL_DELAYS_MS = [5000, 11000];
+
+function selfUpdateInCallDelays(env) {
+  const parts = String(env?.SELFUPDATE_INCALL_DELAYS_MS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s !== '')
+    .map((s) => Number(s))
+    .filter((n) => Number.isFinite(n) && n >= 0 && n <= 60000);
+
+  return parts.length
+    ? parts.slice(0, 3)
+    : SELFUPDATE_INCALL_DELAYS_MS;
+}
+
+// 自跑主体：每步先回读 pending——记录已清（已落
+// 定）、已标结论、已换了一轮、或还没切到
+// 'switched'，都立即收手；其余步数复用接力步
+// （记录内 CAS 占用、双腿判据、逐步落盘的语义全
+// 不变），任一步落定即由回读守卫退出。自跑途中被
+// 平台掐断也无妨：每步已落盘，pending 与现状一样
+// 可被后续接力续跑。自跑结束仍未落定且仍在已切换
+// 待确认，把卡面换成实话文案：确认不会随时间自动
+// 完成，需要主人后续任意一次互动（给机器人发一条
+// 消息，或打开「检查更新」）触发接力步补完。
+async function selfUpdateInCallConfirm(env, origin, pending, say) {
+  for (const delay of selfUpdateInCallDelays(env)) {
+    const current = await readSelfUpdatePending(env);
+
+    if (
+      !current ||
+      current.concluded ||
+      current.nonce !== pending.nonce ||
+      current.stage !== 'switched'
+    ) {
+      return;
+    }
+
+    if (delay > 0) {
+      await sleep(delay);
+    }
+
+    await selfUpdateRelayStep(env, origin);
+  }
+
+  const left = await readSelfUpdatePending(env);
+
+  if (
+    left &&
+    !left.concluded &&
+    left.nonce === pending.nonce &&
+    left.stage === 'switched'
+  ) {
+    await say(
+      `⏳ 已切换到 ${pending.target}，确认尚未完成。\n给机器人发任意一条消息，或打开「检查更新」，即可完成确认。`
+    );
+  }
 }
 
 async function runSelfRollback(env, pending) {
@@ -18503,7 +18578,7 @@ function buildGuidePage(pageCtx = {}) {
     <ul>
       <li>主菜单顶部、标题下面有一行当前版本号；有新版本时，那一行会变成可以点开的链接，机器人也会私聊通知主管理员一次（只通知一次，不刷屏）。</li>
       <li>想手动确认时，点主菜单的「🔄 检查更新」；查太勤会被限速（5 分钟最多查一次），这是故意的，防止白白消耗额度。检查走的是仓库网页通道，不再依赖容易被限流的接口；万一检查失败，卡上会把失败原因一并写明，不会只剩一句失败。</li>
-      <li><b class=\"k\">一键自更新（可选）：</b>启用后，检查更新卡上会多一行「自更新：就绪」；发现新版时还会多一颗「🆙 一键更新到 vX.Y.Z」按钮——点它、再确认一次，机器人就自己把新版拉下来换上，换上后卡片会先显示「已切换，确认中」，确认妥当后自动落定为更新完成，不用守着——中途关掉聊天也没关系，下次打开机器人时会自动补完，不会卡住；确认没通过会自动换回上一版，卡上的「↩️ 回滚到上一版」也能随时手动退回。全程在手机上点两下就行，不用开电脑。没启用时卡上只显示「自更新：未配置」，其他功能完全不受影响。</li>
+      <li><b class=\"k\">一键自更新（可选）：</b>启用后，检查更新卡上会多一行「自更新：就绪」；发现新版时还会多一颗「🆙 一键更新到 vX.Y.Z」按钮——点它、再确认一次，机器人就自己把新版拉下来换上，换上后卡片会先显示「已切换，确认中」，确认通常当场完成、卡片随即变成更新完成；万一没完成，给机器人发任意一条消息或打开「检查更新」即可完成确认，不会卡住；确认没通过会自动换回上一版，卡上的「↩️ 回滚到上一版」也能随时手动退回。全程在手机上点两下就行，不用开电脑。没启用时卡上只显示「自更新：未配置」，其他功能完全不受影响。</li>
       <li><b class=\"k\">怎么启用一键自更新：</b>给这个 Worker 加三个绑定（Cloudflare 控制台 → 这个 Worker → 设置 → 变量和机密）：两个普通变量 CF_ACCOUNT_ID（你的 Cloudflare 账号 ID，控制台首页或任意域名的概览页就能看到）和 CF_WORKER_ID（这个 Worker 的 ID，用下面这枚令牌查一次账号下的 Worker 列表，就能看到每个 Worker 的名字与 ID）；再加一个机密 CF_API_TOKEN，值是你在 Cloudflare「我的个人资料 → API 令牌」里新建的一枚令牌——用「编辑 Cloudflare Workers」模板、账户范围只选你自己这一个账号。三项都配齐后，打开检查更新卡看到「自更新：就绪」就是启用成功；若显示「自更新：令牌不可用」，多半是令牌填错或权限不够，回去核对令牌。</li>
       <li>升级不丢东西：访客、配置、备注都存在数据库里，按项目仓库里的部署教程、换上新版文件重新部署即可。</li>
     </ul>
