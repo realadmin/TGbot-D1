@@ -8379,6 +8379,60 @@ function bootApp() {
     }
   });
 }
+// 链接打开中继（-v174b11 引入，-v174b12 回执诚实
+// 化）：内嵌页（iframe 子页）自带的 Telegram SDK
+// 够不到客户端桥——桥只注入顶层帧，子页调
+// openTelegramLink 发出的事件到不了客户端（访客列
+// 表「话题」按钮在小程序里点了没反应就是这个断
+// 点）。子页改把要打开的链接用 postMessage 递上
+// 来，外壳在顶层帧代为打开并回执。只认自家 iframe
+// 发来、形态合格且 https://t.me/ 开头的请求，其余
+// 一律静默忽略。
+// -v174b12 审计四修：①回执带结果 opened——SDK 组
+// 件加载失败（__tgSdkFailed 已置位）时不走 SDK；
+// window.open 被弹窗策略拦截返回 null 算没打开，
+// 回 opened:false 让子页立即兜底，不再装作成功。
+// ②请求带每击唯一 id 与发送时刻，ack 回显 id，子
+// 页只认领自己的回执；消息在途超过 900ms（子页兜
+// 底多半已触发）跳过打开、回 opened:false 标
+// stale，防双重打开。③两路都没打开时留痕：
+// window.__tgRelayFailCount 计数 + console 标记，
+// 供排障读取。④同 url 800ms 内去重，防连点连开
+// （子页侧另有在途守卫，双保险）。
+var tgRelayLastUrl = '', tgRelayLastAt = 0, tgRelayLastOpened = false;
+window.addEventListener('message', function (ev) {
+  try {
+    if (!ev || ev.origin !== location.origin) return;
+    if (ev.source !== frame.contentWindow) return;
+    var d = ev.data;
+    if (!d || typeof d !== 'object' || d.type !== 'tg-open-link') return;
+    var relayUrl = String(d.url || '');
+    if (relayUrl.indexOf('https://t.me/') !== 0) return;
+    var relayNow = Date.now();
+    function relayAck(opened, stale) {
+      try { ev.source.postMessage({ type: 'tg-open-link-ack', id: d.id, opened: !!opened, stale: !!stale }, ev.origin); } catch (e) {}
+    }
+    if (typeof d.ts === 'number' && relayNow - d.ts > 900) { relayAck(false, true); return; }
+    if (relayUrl === tgRelayLastUrl && relayNow - tgRelayLastAt < 800) { relayAck(tgRelayLastOpened, false); return; }
+    var relayOpened = false;
+    if (!window.__tgSdkFailed) {
+      try {
+        if (window.Telegram && Telegram.WebApp && Telegram.WebApp.openTelegramLink) { Telegram.WebApp.openTelegramLink(relayUrl); relayOpened = true; }
+      } catch (e) {}
+    }
+    if (!relayOpened) {
+      var relayWin = null;
+      try { relayWin = window.open(relayUrl, '_blank'); } catch (e) {}
+      relayOpened = !!relayWin;
+    }
+    tgRelayLastUrl = relayUrl; tgRelayLastAt = relayNow; tgRelayLastOpened = relayOpened;
+    if (!relayOpened) {
+      window.__tgRelayFailCount = (window.__tgRelayFailCount || 0) + 1;
+      try { console.warn('[tg-open-link] relay failed to open: ' + relayUrl); } catch (e) {}
+    }
+    relayAck(relayOpened, false);
+  } catch (e) {}
+});
 applyTheme();
 bootApp();
 </script>
@@ -14183,7 +14237,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.7.4';
+const BOT_VERSION = 'v1.7.5';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -22226,6 +22280,68 @@ var rows = [], filt = 'all', query = '', sortMode = '';
 var listTotal = 0;
 var GROUP_C = '';
 var PAGE = 15;
+// 话题跳转的打开方式（-v174b11 引入中继，-v174b12
+// 回执诚实化）：本页在小程序外壳里时是 iframe 子
+// 页，自带 SDK 够不到客户端桥（桥只注入顶层帧），
+// 直接调 openTelegramLink 发出的事件会沉没、点了
+// 没反应。壳内改把链接用 postMessage 递给外壳代开
+// 并等回执：请求带每击唯一 id 与发送时刻，回执回
+// 显 id 且带结果 opened，只认领 origin 与 source
+// （须为父窗）都对得上、id 是自己的那一份；opened
+// 为 false 立即自己兜底，约 600ms 没回执（外壳过
+// 旧、没装中继）也兜底；兜底 window.open 被拦返回
+// null 时 toast 提示失败，不再哑巴。每个在途等待
+// 独立计时互不影响；同一按钮在途期间忽略重复点
+// 击，决议后恢复。不在壳内维持旧行为：有本地
+// openTelegramLink 就用它，否则 window.open。
+// 壳内判据（-v174b12 收紧）：必须真被父窗框住才
+// 算在壳内——只带 app 会话串的链接在普通浏览器里
+// 单开时 parent 就是自己，APPMODE 单独成立不算，
+// 否则往自己 postMessage 永远等不到回执、每击白
+// 等 600ms 才走兜底。
+var topicLinkSeq = 0;
+function openTopicLink(url, btn) {
+  var inShell = window.parent !== window;
+  if (!inShell) {
+    if (window.Telegram && Telegram.WebApp && Telegram.WebApp.openTelegramLink) Telegram.WebApp.openTelegramLink(url);
+    else window.open(url, '_blank');
+    return;
+  }
+  if (btn) {
+    if (btn.__tgLinkBusy) return;
+    btn.__tgLinkBusy = true;
+  }
+  var reqId = 'tl' + Date.now().toString(36) + (topicLinkSeq++).toString(36) + Math.floor(Math.random() * 1679616).toString(36);
+  var decided = false;
+  function settle() {
+    window.removeEventListener('message', onAck);
+    if (btn) btn.__tgLinkBusy = false;
+  }
+  function fallback() {
+    var w = null;
+    try { w = window.open(url, '_blank'); } catch (e) {}
+    if (!w) toast('打开话题失败，请重试');
+  }
+  function onAck(ev) {
+    if (!ev || ev.origin !== location.origin) return;
+    if (ev.source !== window.parent) return;
+    var d = ev.data;
+    if (!d || typeof d !== 'object' || d.type !== 'tg-open-link-ack') return;
+    if (d.id !== reqId) return;
+    if (decided) return;
+    decided = true;
+    settle();
+    if (!d.opened) fallback();
+  }
+  window.addEventListener('message', onAck);
+  try { window.parent.postMessage({ type: 'tg-open-link', url: url, id: reqId, ts: Date.now() }, location.origin); } catch (e) {}
+  setTimeout(function () {
+    if (decided) return;
+    decided = true;
+    settle();
+    fallback();
+  }, 600);
+}
 var booted = false;
 // sortTouched：用户在本页亲手点过排序（boot 领养
 // uiDefaults 之前点过也算）。领养只在未点过时回
@@ -22830,9 +22946,7 @@ function render() {
       jb.className = 'ntb';
       jb.textContent = '💬 话题';
       jb.onclick = function () {
-        var url = 'https://t.me/c/' + GROUP_C + '/' + u.topic_id;
-        if (window.Telegram && Telegram.WebApp && Telegram.WebApp.openTelegramLink) Telegram.WebApp.openTelegramLink(url);
-        else window.open(url, '_blank');
+        openTopicLink('https://t.me/c/' + GROUP_C + '/' + u.topic_id, jb);
       };
       ops.appendChild(jb);
     }
