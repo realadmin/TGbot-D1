@@ -15671,7 +15671,7 @@ async function runSelfUpdate(env, origin, pending) {
   // 交棒后顺手跑一轮接力探测：新版已在服务的常见情
   // 形下，发起调用内就能当场落定；没落定也无妨，后
   // 续请求继续接力。
-  await selfUpdateRelayStep(env, origin);
+  await selfUpdateRelayStep(env, origin, false, true);
 
   // 再在同一条 waitUntil 链内自跑两步探测，尽量当
   // 场落定（接力断粮的补强，见 selfUpdateInCallConfirm）。
@@ -15699,6 +15699,128 @@ function selfUpdateInCallDelays(env) {
     : SELFUPDATE_INCALL_DELAYS_MS;
 }
 
+// 失效前预告（-v175b1）：调用内自跑结束仍未落定
+// 时、或发起调用中途被掐断没发成时由后续接力步补
+// 发——给发起更新的管理员会话另发一条独立消息，
+// 把确认截止时刻与逾期后果提前讲明，免得主人对着
+// 「确认中」的卡干等。只发一次：pending.warnedAt
+// 是落盘标记，任何路径发送前先查；已落定、已过死
+// 线（走原失败落定路径）、回滚记录一律不发。发送
+// 失败不落标记，留下一次接力步重试。截止时刻按管
+// 理员侧既有呈现口径（展示时区 + formatTimestamp）。
+async function maybeSendSelfUpdateDeadlineWarn(env) {
+  try {
+    const raw = await dbConfigGet(SELFUPDATE_PENDING_KEY, env);
+
+    if (!raw) {
+      return;
+    }
+
+    let pending = null;
+
+    try {
+      pending = JSON.parse(raw);
+    } catch (_) {
+      pending = null;
+    }
+
+    if (
+      !pending ||
+      pending.concluded ||
+      pending.kind === 'rollback' ||
+      pending.stage !== 'switched' ||
+      pending.warnedAt ||
+      !pending.chatId
+    ) {
+      return;
+    }
+
+    const deadline =
+      Number(pending.deadline) ||
+      (Number(pending.switchedAt) || 0) +
+        SELFUPDATE_CONFIRM_WINDOW_MS;
+
+    if (!deadline || Date.now() >= deadline) {
+      return;
+    }
+
+    const displayTz = await getDisplayTimeZone(env);
+    const deadlineText = formatTimestamp(
+      Math.floor(deadline / 1000),
+      displayTz
+    );
+
+    const sent = await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: pending.chatId,
+        text:
+          `⏳ 更新确认尚未完成：已切换到 ${pending.target}，但还没确认新版在岗。` +
+          `若在 ${deadlineText} 前仍未确认，将判定本次更新失败并自动切回上一版。` +
+          '期间给机器人发任意一条消息，或打开「检查更新」，即可完成确认。',
+        reply_markup: SYS_TAG_MARKUP
+      }
+    )
+      .then(() => true)
+      .catch(() => false);
+
+    if (!sent) {
+      return;
+    }
+
+    // 发送后即落盘标记：以刚读到的原文为基做 CAS，
+    // 避免覆盖接力步刚写回的探测进度；CAS 没赢说明
+    // 记录已被别的步更新，重读后仍未标记才补写（保
+    // 留对方的最新进度，只补 warnedAt 一个字段）。
+    const marked = JSON.stringify({
+      ...pending,
+      warnedAt: Date.now()
+    });
+    const won = await dbConfigPutIfValue(
+      SELFUPDATE_PENDING_KEY,
+      raw,
+      marked,
+      env
+    ).catch(() => false);
+
+    if (!won) {
+      const raw2 = await dbConfigGet(
+        SELFUPDATE_PENDING_KEY,
+        env
+      );
+      let latest = null;
+
+      try {
+        latest = raw2 ? JSON.parse(raw2) : null;
+      } catch (_) {
+        latest = null;
+      }
+
+      if (
+        latest &&
+        !latest.concluded &&
+        latest.nonce === pending.nonce &&
+        !latest.warnedAt
+      ) {
+        latest.warnedAt = Date.now();
+
+        await dbConfigPutIfValue(
+          SELFUPDATE_PENDING_KEY,
+          raw2,
+          JSON.stringify(latest),
+          env
+        ).catch(() => {});
+      }
+    }
+  } catch (error) {
+    console.error(
+      '自更新失效前预告异常：',
+      error?.message || error
+    );
+  }
+}
+
 // 自跑主体：每步先回读 pending——记录已清（已落
 // 定）、已标结论、已换了一轮、或还没切到
 // 'switched'，都立即收手；其余步数复用接力步
@@ -15708,7 +15830,9 @@ function selfUpdateInCallDelays(env) {
 // 可被后续接力续跑。自跑结束仍未落定且仍在已切换
 // 待确认，把卡面换成实话文案：确认不会随时间自动
 // 完成，需要主人后续任意一次互动（给机器人发一条
-// 消息，或打开「检查更新」）触发接力步补完。
+// 消息，或打开「检查更新」）触发接力步补完；改卡同
+// 一刻另发一条失效前预告，把确认截止时刻与逾期后
+// 果讲明（见 maybeSendSelfUpdateDeadlineWarn）。
 async function selfUpdateInCallConfirm(env, origin, pending, say) {
   for (const delay of selfUpdateInCallDelays(env)) {
     const current = await readSelfUpdatePending(env);
@@ -15726,7 +15850,7 @@ async function selfUpdateInCallConfirm(env, origin, pending, say) {
       await sleep(delay);
     }
 
-    await selfUpdateRelayStep(env, origin);
+    await selfUpdateRelayStep(env, origin, false, true);
   }
 
   const left = await readSelfUpdatePending(env);
@@ -15740,6 +15864,10 @@ async function selfUpdateInCallConfirm(env, origin, pending, say) {
     await say(
       `⏳ 已切换到 ${pending.target}，确认尚未完成。\n给机器人发任意一条消息，或打开「检查更新」，即可完成确认。`
     );
+
+    // 改卡同一刻另发失效前预告：截止时刻与逾期后
+    // 果讲明，只发一次（标记在 pending 记录里）。
+    await maybeSendSelfUpdateDeadlineWarn(env);
   }
 }
 
@@ -16052,7 +16180,7 @@ async function selfUpdateProbeStep(env, origin, pending) {
 // pending 时顺手自愈卡死残留；有 pending 时先用
 // CAS 在记录内占下本步（stepClaim，带 TTL），保证
 // 并发步只有一个推进、终局只收尾一次。
-async function selfUpdateRelayStep(env, origin, heal = false) {
+async function selfUpdateRelayStep(env, origin, heal = false, inCall = false) {
   try {
     const raw = await dbConfigGet(SELFUPDATE_PENDING_KEY, env);
 
@@ -16128,6 +16256,14 @@ async function selfUpdateRelayStep(env, origin, heal = false) {
 
     if (stage === 'switched' || stage === 'verifying') {
       await selfUpdateProbeStep(env, origin, pending);
+
+      // 失效前预告补发：发起调用若中途被掐断、自跑
+      // 收尾没来得及发，后续接力步在本步探测后补上
+      // （已落定/已过死线时助手自会收手）。调用内自
+      // 跑路径不走这里：由自跑收尾在改卡同一刻发。
+      if (!inCall) {
+        await maybeSendSelfUpdateDeadlineWarn(env);
+      }
 
       return;
     }
@@ -18632,7 +18768,7 @@ function buildGuidePage(pageCtx = {}) {
     <ul>
       <li>主菜单顶部、标题下面有一行当前版本号；有新版本时，那一行会变成可以点开的链接，机器人也会私聊通知主管理员一次（只通知一次，不刷屏）。</li>
       <li>想手动确认时，点主菜单的「🔄 检查更新」；查太勤会被限速（5 分钟最多查一次），这是故意的，防止白白消耗额度。检查走的是仓库网页通道，不再依赖容易被限流的接口；万一检查失败，卡上会把失败原因一并写明，不会只剩一句失败。</li>
-      <li><b class=\"k\">一键自更新（可选）：</b>启用后，检查更新卡上会多一行「自更新：就绪」；发现新版时还会多一颗「🆙 一键更新到 vX.Y.Z」按钮——点它、再确认一次，机器人就自己把新版拉下来换上，换上后卡片会先显示「已切换，确认中」，确认通常当场完成、卡片随即变成更新完成；万一没完成，给机器人发任意一条消息或打开「检查更新」即可完成确认，不会卡住；确认没通过会自动换回上一版，卡上的「↩️ 回滚到上一版」也能随时手动退回。全程在手机上点两下就行，不用开电脑。没启用时卡上只显示「自更新：未配置」，其他功能完全不受影响。</li>
+      <li><b class=\"k\">一键自更新（可选）：</b>启用后，检查更新卡上会多一行「自更新：就绪」；发现新版时还会多一颗「🆙 一键更新到 vX.Y.Z」按钮——点它、再确认一次，机器人就自己把新版拉下来换上，换上后卡片会先显示「已切换，确认中」，确认通常当场完成、卡片随即变成更新完成；万一没完成，给机器人发任意一条消息或打开「检查更新」即可完成确认，不会卡住；当场没确认完时，机器人还会另发一条消息，讲明最晚要在什么时间前确认、逾期仍未确认就判定本次更新失败；确认没通过会自动换回上一版，卡上的「↩️ 回滚到上一版」也能随时手动退回。全程在手机上点两下就行，不用开电脑。没启用时卡上只显示「自更新：未配置」，其他功能完全不受影响。</li>
       <li><b class=\"k\">怎么启用一键自更新：</b>给这个 Worker 加三个绑定（Cloudflare 控制台 → 这个 Worker → 设置 → 变量和机密）：两个普通变量 CF_ACCOUNT_ID（你的 Cloudflare 账号 ID，控制台首页或任意域名的概览页就能看到）和 CF_WORKER_ID（这个 Worker 的 ID，用下面这枚令牌查一次账号下的 Worker 列表，就能看到每个 Worker 的名字与 ID）；再加一个机密 CF_API_TOKEN，值是你在 Cloudflare「我的个人资料 → API 令牌」里新建的一枚令牌——用「编辑 Cloudflare Workers」模板、账户范围只选你自己这一个账号。三项都配齐后，打开检查更新卡看到「自更新：就绪」就是启用成功；若显示「自更新：令牌不可用」，多半是令牌填错或权限不够，回去核对令牌。</li>
       <li>升级不丢东西：访客、配置、备注都存在数据库里，按项目仓库里的部署教程、换上新版文件重新部署即可。</li>
     </ul>
